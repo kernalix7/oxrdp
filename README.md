@@ -1,5 +1,11 @@
 # oxrdp
 
+**English** | [한국어](docs/README.ko.md)
+
+[![license](https://img.shields.io/github/license/kernalix7/oxrdp?style=flat-square&color=blue)](LICENSE)
+[![status](https://img.shields.io/badge/status-pre--alpha-orange?style=flat-square)](#status)
+[![language](https://img.shields.io/badge/rust-stable-DEA584?style=flat-square&logo=rust&logoColor=white)](https://www.rust-lang.org/)
+
 **A memory-safe RDP client written in Rust, built for seamless integration of Windows applications into the Linux desktop.**
 
 oxrdp connects to a Windows RDP server and renders remote apps as native Linux windows via RAIL / RemoteApp — real titles, real `WM_CLASS`, pinnable and alt-tabbable — prioritizing Rust's safety guarantees, minimal resource usage, and high performance.

@@ -1,0 +1,67 @@
+name: CI
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      # Pre-alpha guard: until the Cargo workspace lands (M0), there is nothing to
+      # build/lint. Skip cleanly so CI stays green instead of red-X'ing every push.
+      - id: guard
+        run: |
+          if [ -f Cargo.toml ]; then echo "go=1" >> "$GITHUB_OUTPUT"; else echo "no Cargo workspace yet — skipping"; echo "go=0" >> "$GITHUB_OUTPUT"; fi
+      - if: steps.guard.outputs.go == '1'
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+      - if: steps.guard.outputs.go == '1'
+        run: cargo fmt --all -- --check
+      - if: steps.guard.outputs.go == '1'
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+  test:
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      matrix:
+        runner: ["ubuntu-latest", "ubuntu-24.04-arm"]
+    steps:
+      - uses: actions/checkout@v5
+      - id: guard
+        run: |
+          if [ -f Cargo.toml ]; then echo "go=1" >> "$GITHUB_OUTPUT"; else echo "no Cargo workspace yet — skipping"; echo "go=0" >> "$GITHUB_OUTPUT"; fi
+      - if: steps.guard.outputs.go == '1'
+        uses: dtolnay/rust-toolchain@stable
+      # System libs the display/render/input shells need to build (X11, Wayland,
+      # xkbcommon, VA-API). Harmless no-op for the pure core crates.
+      - if: steps.guard.outputs.go == '1'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libxkbcommon-dev libwayland-dev libx11-dev libxcb1-dev libva-dev
+      - if: steps.guard.outputs.go == '1'
+        run: cargo build --workspace
+      - if: steps.guard.outputs.go == '1'
+        run: cargo test --workspace
+
+  audit:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - id: guard
+        run: |
+          if [ -f Cargo.toml ]; then echo "go=1" >> "$GITHUB_OUTPUT"; else echo "no Cargo workspace yet — skipping"; echo "go=0" >> "$GITHUB_OUTPUT"; fi
+      - if: steps.guard.outputs.go == '1'
+        uses: dtolnay/rust-toolchain@stable
+      - if: steps.guard.outputs.go == '1'
+        run: cargo install cargo-audit
+      - if: steps.guard.outputs.go == '1'
+        run: cargo audit
+        continue-on-error: true
