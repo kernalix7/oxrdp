@@ -16,6 +16,7 @@
 #![forbid(unsafe_code)]
 
 mod codec;
+pub mod connect;
 mod cursor;
 mod error;
 pub mod nego;
@@ -23,6 +24,7 @@ pub mod tpkt;
 pub mod x224;
 
 pub use codec::{decode, encode_vec, Decode, Encode};
+pub use connect::{ConnectionConfirm, ConnectionRequest, NegotiationConfirm};
 pub use cursor::{ReadCursor, WriteCursor};
 pub use error::{DecodeError, DecodeResult, EncodeError, EncodeResult};
 pub use nego::{NegotiationFailure, NegotiationRequest, NegotiationResponse};

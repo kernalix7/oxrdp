@@ -35,5 +35,9 @@ behind winpodx, with the v0 goal of drop-in equivalence with winpodx's FreeRDP p
   bounds-checked `ReadCursor`/`WriteCursor` that never panic on malformed/truncated server
   input, with typed `DecodeError`/`EncodeError`. First framing PDUs: `TpktHeader` (RFC 1006)
   and `X224DataHeader`. Zero external dependencies. 9 unit tests.
+- **M0 — connection-setup PDUs.** RDP security negotiation (`NegotiationRequest` /
+  `NegotiationResponse` / `NegotiationFailure`, MS-RDPBCGR 2.2.1.1.1 / 2.2.1.2.x) and the
+  X.224 Connection Request / Confirm TPDUs (`ConnectionRequest` / `ConnectionConfirm`)
+  carrying the negotiation and the `mstshash` routing cookie. 19 unit tests total.
 
 [Unreleased]: https://github.com/kernalix7/oxrdp/commits/main

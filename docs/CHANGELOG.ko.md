@@ -37,5 +37,9 @@ oxrdp의 모든 주목할 만한 변경 사항이 여기에 기록됩니다. 형
   서버 입력에 절대 panic하지 않는 bounds-checked `ReadCursor`/`WriteCursor`, 타입드
   `DecodeError`/`EncodeError`. 첫 프레이밍 PDU: `TpktHeader`(RFC 1006), `X224DataHeader`.
   외부 의존성 0. 단위 테스트 9개.
+- **M0 — 연결 설정 PDU.** RDP 보안 협상(`NegotiationRequest`/`NegotiationResponse`/
+  `NegotiationFailure`, MS-RDPBCGR 2.2.1.1.1/2.2.1.2.x)과, 협상 및 `mstshash` 라우팅 쿠키를
+  실어 나르는 X.224 Connection Request/Confirm TPDU(`ConnectionRequest`/`ConnectionConfirm`).
+  누적 단위 테스트 19개.
 
 [Unreleased]: https://github.com/kernalix7/oxrdp/commits/main
