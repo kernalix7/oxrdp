@@ -41,5 +41,8 @@ oxrdp의 모든 주목할 만한 변경 사항이 여기에 기록됩니다. 형
   `NegotiationFailure`, MS-RDPBCGR 2.2.1.1.1/2.2.1.2.x)과, 협상 및 `mstshash` 라우팅 쿠키를
   실어 나르는 X.224 Connection Request/Confirm TPDU(`ConnectionRequest`/`ConnectionConfirm`).
   누적 단위 테스트 19개.
+- **M0 — MCS 도메인 PDU.** PER 인코딩된 `ErectDomainRequest`, `AttachUserRequest` /
+  `AttachUserConfirm`, `ChannelJoinRequest` / `ChannelJoinConfirm` (T.125 / MS-RDPBCGR
+  2.2.1.3–2.2.1.8). MCS 사용자 채널 base-1001 initiator 오프셋 포함. 누적 단위 테스트 25개.
 
 [Unreleased]: https://github.com/kernalix7/oxrdp/commits/main

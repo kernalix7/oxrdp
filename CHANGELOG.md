@@ -39,5 +39,9 @@ behind winpodx, with the v0 goal of drop-in equivalence with winpodx's FreeRDP p
   `NegotiationResponse` / `NegotiationFailure`, MS-RDPBCGR 2.2.1.1.1 / 2.2.1.2.x) and the
   X.224 Connection Request / Confirm TPDUs (`ConnectionRequest` / `ConnectionConfirm`)
   carrying the negotiation and the `mstshash` routing cookie. 19 unit tests total.
+- **M0 — MCS domain PDUs.** PER-encoded `ErectDomainRequest`, `AttachUserRequest` /
+  `AttachUserConfirm`, `ChannelJoinRequest` / `ChannelJoinConfirm` (T.125 / MS-RDPBCGR
+  2.2.1.3–2.2.1.8), including the MCS user-channel base-1001 initiator offset. 25 unit
+  tests total.
 
 [Unreleased]: https://github.com/kernalix7/oxrdp/commits/main

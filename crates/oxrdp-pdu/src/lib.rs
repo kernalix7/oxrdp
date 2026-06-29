@@ -19,6 +19,7 @@ mod codec;
 pub mod connect;
 mod cursor;
 mod error;
+pub mod mcs;
 pub mod nego;
 pub mod tpkt;
 pub mod x224;
@@ -27,6 +28,10 @@ pub use codec::{decode, encode_vec, Decode, Encode};
 pub use connect::{ConnectionConfirm, ConnectionRequest, NegotiationConfirm};
 pub use cursor::{ReadCursor, WriteCursor};
 pub use error::{DecodeError, DecodeResult, EncodeError, EncodeResult};
+pub use mcs::{
+    AttachUserConfirm, AttachUserRequest, ChannelJoinConfirm, ChannelJoinRequest,
+    ErectDomainRequest, MCS_USERCHANNEL_BASE,
+};
 pub use nego::{NegotiationFailure, NegotiationRequest, NegotiationResponse};
 pub use tpkt::TpktHeader;
 pub use x224::X224DataHeader;
