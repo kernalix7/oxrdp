@@ -31,5 +31,9 @@ behind winpodx, with the v0 goal of drop-in equivalence with winpodx's FreeRDP p
   `oxrdp-render`, `oxrdp-input`, the `oxrdp` facade, and the `oxrdp-cli` binary) as
   buildable skeletons; pure core crates `#![forbid(unsafe_code)]`. `cargo build/test/
   clippy/fmt` all green.
+- **M0 — `oxrdp-pdu` codec foundation.** Hand-written `Decode`/`Encode` traits over
+  bounds-checked `ReadCursor`/`WriteCursor` that never panic on malformed/truncated server
+  input, with typed `DecodeError`/`EncodeError`. First framing PDUs: `TpktHeader` (RFC 1006)
+  and `X224DataHeader`. Zero external dependencies. 9 unit tests.
 
 [Unreleased]: https://github.com/kernalix7/oxrdp/commits/main

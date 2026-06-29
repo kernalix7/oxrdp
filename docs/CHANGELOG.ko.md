@@ -33,5 +33,9 @@ oxrdp의 모든 주목할 만한 변경 사항이 여기에 기록됩니다. 형
   `oxrdp-render`, `oxrdp-input`, `oxrdp` 파사드, `oxrdp-cli` 바이너리)를 빌드되는
   스켈레톤으로 추가. 순수 코어 크레이트는 `#![forbid(unsafe_code)]`. `cargo build/test/
   clippy/fmt` 모두 통과.
+- **M0 — `oxrdp-pdu` 코덱 토대.** 손수 작성한 `Decode`/`Encode` 트레이트와, 변형/절단된
+  서버 입력에 절대 panic하지 않는 bounds-checked `ReadCursor`/`WriteCursor`, 타입드
+  `DecodeError`/`EncodeError`. 첫 프레이밍 PDU: `TpktHeader`(RFC 1006), `X224DataHeader`.
+  외부 의존성 0. 단위 테스트 9개.
 
 [Unreleased]: https://github.com/kernalix7/oxrdp/commits/main
