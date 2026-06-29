@@ -15,10 +15,12 @@
 //! See [docs/ARCHITECTURE.md](https://github.com/kernalix7/oxrdp/blob/main/docs/ARCHITECTURE.md).
 #![forbid(unsafe_code)]
 
+pub mod ber;
 mod codec;
 pub mod connect;
 mod cursor;
 mod error;
+pub mod gcc;
 pub mod mcs;
 pub mod nego;
 pub mod send_data;
@@ -29,6 +31,7 @@ pub use codec::{decode, encode_vec, Decode, Encode};
 pub use connect::{ConnectionConfirm, ConnectionRequest, NegotiationConfirm};
 pub use cursor::{ReadCursor, WriteCursor};
 pub use error::{DecodeError, DecodeResult, EncodeError, EncodeResult};
+pub use gcc::{ChannelDef, ClientCoreData, ClientNetworkData, ClientSecurityData};
 pub use mcs::{
     AttachUserConfirm, AttachUserRequest, ChannelJoinConfirm, ChannelJoinRequest,
     ErectDomainRequest, MCS_USERCHANNEL_BASE,

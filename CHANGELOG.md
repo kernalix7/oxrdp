@@ -49,5 +49,10 @@ behind winpodx, with the v0 goal of drop-in equivalence with winpodx's FreeRDP p
   IO-free state machine that runs the X.224 negotiation phase: it emits the TPKT-wrapped
   Connection Request, parses the Connection Confirm, and signals the TLS upgrade plus the
   selected protocol. 33 tests across the two crates.
+- **M0 — Connect-Initial foundations.** BER (ASN.1) definite-length / boolean / tag-length
+  primitives (`ber`), and the GCC client user-data blocks `ClientCoreData` (CS_CORE),
+  `ClientSecurityData` (CS_SECURITY), and `ClientNetworkData` (CS_NET) (MS-RDPBCGR
+  2.2.1.3.x). These assemble into the MCS Connect-Initial PDU in a later step. 41 tests
+  across `oxrdp-pdu` + `oxrdp-core`.
 
 [Unreleased]: https://github.com/kernalix7/oxrdp/commits/main

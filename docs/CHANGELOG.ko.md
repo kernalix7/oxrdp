@@ -49,5 +49,9 @@ oxrdp의 모든 주목할 만한 변경 사항이 여기에 기록됩니다. 형
   그리고 `oxrdp-core`의 `ClientConnector` — `step()` 구동 IO-free 상태머신으로 X.224 협상 단계를
   수행: TPKT로 감싼 Connection Request 방출, Connection Confirm 파싱, TLS 업그레이드와 선택된
   프로토콜 신호. 두 크레이트 합쳐 33개 테스트.
+- **M0 — Connect-Initial 토대.** BER(ASN.1) 한정 길이/boolean/tag-length 프리미티브(`ber`),
+  그리고 GCC 클라이언트 user-data 블록 `ClientCoreData`(CS_CORE), `ClientSecurityData`
+  (CS_SECURITY), `ClientNetworkData`(CS_NET) (MS-RDPBCGR 2.2.1.3.x). 이후 단계에서 MCS
+  Connect-Initial PDU로 조립됨. `oxrdp-pdu` + `oxrdp-core` 합쳐 41개 테스트.
 
 [Unreleased]: https://github.com/kernalix7/oxrdp/commits/main
