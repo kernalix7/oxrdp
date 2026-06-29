@@ -1,0 +1,47 @@
+# Build the rustdoc API documentation and deploy it to GitHub Pages.
+#
+# The Rust-native equivalent of winpodx's site deploy: instead of a hand-written landing
+# page, oxrdp publishes its `cargo doc` output. Manual (`workflow_dispatch`) only for now —
+# flip on the `push` trigger below once the repo has Settings -> Pages -> Source =
+# "GitHub Actions" enabled (a one-time UI step), so this never red-X's before then.
+name: Docs site
+on:
+  workflow_dispatch:
+  # push:
+  #   branches: [main]
+  #   paths: ["crates/**", ".github/workflows/pages.yml"]
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+# Never run two deploys at once; let an in-flight one finish.
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Install system libraries
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libxkbcommon-dev libwayland-dev libx11-dev libxcb1-dev libva-dev
+      - name: Build rustdoc
+        run: cargo doc --workspace --no-deps
+      - name: Redirect index.html to the facade crate
+        run: echo '<meta http-equiv="refresh" content="0; url=oxrdp/index.html">' > target/doc/index.html
+      - uses: actions/configure-pages@v5
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: target/doc
+      - id: deployment
+        uses: actions/deploy-pages@v4

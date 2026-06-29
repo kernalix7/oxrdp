@@ -1,0 +1,52 @@
+name: Release
+# Releasing requires pushing a REL-prefixed marker tag pointed at the same commit as the
+# version tag, so the version scheme itself stays clean (SemVer):
+#
+#   git tag v0.1.0
+#   git tag REL-v0.1.0
+#   git push origin v0.1.0 REL-v0.1.0
+#
+# Only the REL- marker triggers a public GitHub release. (oxrdp is pre-alpha; no tags
+# exist yet, so this workflow is dormant. crates.io publishing is intentionally deferred
+# until the crate API stabilizes — see the commented step below.)
+on:
+  push:
+    tags:
+      - "REL-*"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Install system libraries
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libxkbcommon-dev libwayland-dev libx11-dev libxcb1-dev libva-dev
+      - name: Gate
+        run: |
+          cargo build --workspace --release
+          cargo test --workspace
+      - name: Extract the top CHANGELOG section as release notes
+        id: notes
+        run: |
+          # Grab the first "## [..]" section of CHANGELOG.md (the version being released).
+          awk '/^## \[/{n++} n==1{print} n==2{exit}' CHANGELOG.md > RELEASE_NOTES.md
+          echo "Extracted $(wc -l < RELEASE_NOTES.md) lines."
+      - name: Create GitHub release
+        if: startsWith(github.ref, 'refs/tags/REL-')
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          version="${GITHUB_REF_NAME#REL-}"
+          gh release create "$version" --title "$version" --notes-file RELEASE_NOTES.md --verify-tag || \
+          gh release create "$GITHUB_REF_NAME" --title "$version" --notes-file RELEASE_NOTES.md
+      # - name: Publish to crates.io  (deferred until v0 API freeze; multi-crate publish
+      #   needs dependency-ordered `cargo publish` of oxrdp-pdu -> oxrdp-core -> ... -> oxrdp)
+      #   run: cargo publish -p oxrdp-pdu --token ${{ secrets.CARGO_REGISTRY_TOKEN }}
