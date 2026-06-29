@@ -18,12 +18,14 @@
 mod codec;
 mod cursor;
 mod error;
+pub mod nego;
 pub mod tpkt;
 pub mod x224;
 
 pub use codec::{decode, encode_vec, Decode, Encode};
 pub use cursor::{ReadCursor, WriteCursor};
 pub use error::{DecodeError, DecodeResult, EncodeError, EncodeResult};
+pub use nego::{NegotiationFailure, NegotiationRequest, NegotiationResponse};
 pub use tpkt::TpktHeader;
 pub use x224::X224DataHeader;
 
