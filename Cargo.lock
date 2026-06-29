@@ -32,6 +32,9 @@ dependencies = [
 [[package]]
 name = "oxrdp-core"
 version = "0.0.0"
+dependencies = [
+ "oxrdp-pdu",
+]
 
 [[package]]
 name = "oxrdp-crypto"

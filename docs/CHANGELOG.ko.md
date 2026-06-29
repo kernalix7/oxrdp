@@ -44,5 +44,10 @@ oxrdp의 모든 주목할 만한 변경 사항이 여기에 기록됩니다. 형
 - **M0 — MCS 도메인 PDU.** PER 인코딩된 `ErectDomainRequest`, `AttachUserRequest` /
   `AttachUserConfirm`, `ChannelJoinRequest` / `ChannelJoinConfirm` (T.125 / MS-RDPBCGR
   2.2.1.3–2.2.1.8). MCS 사용자 채널 base-1001 initiator 오프셋 포함. 누적 단위 테스트 25개.
+- **M0 — MCS Send Data 래퍼 + sans-io 연결 상태머신.** `SendDataRequest` /
+  `SendDataIndication`(채널조인 이후 모든 PDU가 실리는 MCS 봉투, PER 길이 인코딩) — `oxrdp-pdu`.
+  그리고 `oxrdp-core`의 `ClientConnector` — `step()` 구동 IO-free 상태머신으로 X.224 협상 단계를
+  수행: TPKT로 감싼 Connection Request 방출, Connection Confirm 파싱, TLS 업그레이드와 선택된
+  프로토콜 신호. 두 크레이트 합쳐 33개 테스트.
 
 [Unreleased]: https://github.com/kernalix7/oxrdp/commits/main

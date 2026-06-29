@@ -43,5 +43,11 @@ behind winpodx, with the v0 goal of drop-in equivalence with winpodx's FreeRDP p
   `AttachUserConfirm`, `ChannelJoinRequest` / `ChannelJoinConfirm` (T.125 / MS-RDPBCGR
   2.2.1.3–2.2.1.8), including the MCS user-channel base-1001 initiator offset. 25 unit
   tests total.
+- **M0 — MCS Send Data wrapper + sans-io connection state machine.** `SendDataRequest` /
+  `SendDataIndication` (the MCS envelope every post-join PDU rides in, with PER length
+  encoding) in `oxrdp-pdu`. And `oxrdp-core`'s `ClientConnector` — a `step()`-driven,
+  IO-free state machine that runs the X.224 negotiation phase: it emits the TPKT-wrapped
+  Connection Request, parses the Connection Confirm, and signals the TLS upgrade plus the
+  selected protocol. 33 tests across the two crates.
 
 [Unreleased]: https://github.com/kernalix7/oxrdp/commits/main

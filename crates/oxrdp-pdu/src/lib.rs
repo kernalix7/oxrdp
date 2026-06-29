@@ -21,6 +21,7 @@ mod cursor;
 mod error;
 pub mod mcs;
 pub mod nego;
+pub mod send_data;
 pub mod tpkt;
 pub mod x224;
 
@@ -33,6 +34,7 @@ pub use mcs::{
     ErectDomainRequest, MCS_USERCHANNEL_BASE,
 };
 pub use nego::{NegotiationFailure, NegotiationRequest, NegotiationResponse};
+pub use send_data::{SendDataIndication, SendDataRequest};
 pub use tpkt::TpktHeader;
 pub use x224::X224DataHeader;
 
