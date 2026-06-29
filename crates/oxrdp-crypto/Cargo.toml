@@ -1,0 +1,11 @@
+[package]
+name = "oxrdp-crypto"
+description = "Security glue: rustls TLS and (deferred) sspi-rs NLA/CredSSP."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+
+[lints]
+workspace = true

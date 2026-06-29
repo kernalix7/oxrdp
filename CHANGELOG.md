@@ -26,5 +26,10 @@ behind winpodx, with the v0 goal of drop-in equivalence with winpodx's FreeRDP p
   FreeRDP→oxrdp parity matrix, the crate workspace layout, and the M0–M5 roadmap.
 - Community health files (CODE_OF_CONDUCT, CONTRIBUTING, SECURITY, THIRD_PARTY_LICENSES),
   GitHub issue/PR templates, and a Rust CI workflow.
+- Cargo workspace scaffold — 12 crates (`oxrdp-pdu`, `oxrdp-core`, `oxrdp-graphics`,
+  `oxrdp-channels`, `oxrdp-rail`, `oxrdp-crypto`, `oxrdp-io`, `oxrdp-display`,
+  `oxrdp-render`, `oxrdp-input`, the `oxrdp` facade, and the `oxrdp-cli` binary) as
+  buildable skeletons; pure core crates `#![forbid(unsafe_code)]`. `cargo build/test/
+  clippy/fmt` all green.
 
 [Unreleased]: https://github.com/kernalix7/oxrdp/commits/main

@@ -1,0 +1,19 @@
+[workspace]
+resolver = "2"
+members = ["crates/*"]
+
+[workspace.package]
+version = "0.0.0"
+edition = "2021"
+license = "MIT"
+authors = ["Kim DaeHyun <kernalix7@kodenet.io>"]
+repository = "https://github.com/kernalix7/oxrdp"
+
+# Memory-safety policy: the protocol/RAIL/render logic is safe Rust. Shell crates
+# may opt into `unsafe` for FFI, each with a `// SAFETY:` justification. Pure crates
+# additionally `#![forbid(unsafe_code)]` in their lib.rs.
+[workspace.lints.rust]
+unsafe_code = "warn"
+
+[workspace.lints.clippy]
+all = { level = "warn", priority = -1 }

@@ -1,0 +1,23 @@
+[package]
+name = "oxrdp"
+description = "Memory-safe RDP client engine — high-level Session API (facade over the oxrdp workspace crates)."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+
+[dependencies]
+oxrdp-pdu = { path = "../oxrdp-pdu" }
+oxrdp-core = { path = "../oxrdp-core" }
+oxrdp-graphics = { path = "../oxrdp-graphics" }
+oxrdp-channels = { path = "../oxrdp-channels" }
+oxrdp-rail = { path = "../oxrdp-rail" }
+oxrdp-crypto = { path = "../oxrdp-crypto" }
+oxrdp-io = { path = "../oxrdp-io" }
+oxrdp-display = { path = "../oxrdp-display" }
+oxrdp-render = { path = "../oxrdp-render" }
+oxrdp-input = { path = "../oxrdp-input" }
+
+[lints]
+workspace = true

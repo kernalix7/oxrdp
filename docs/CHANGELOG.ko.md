@@ -28,5 +28,10 @@ oxrdp의 모든 주목할 만한 변경 사항이 여기에 기록됩니다. 형
   동등성 매트릭스, 크레이트 워크스페이스 구성, M0–M5 로드맵.
 - 커뮤니티 헬스 파일(CODE_OF_CONDUCT, CONTRIBUTING, SECURITY, THIRD_PARTY_LICENSES),
   GitHub 이슈/PR 템플릿, Rust CI 워크플로.
+- Cargo 워크스페이스 스캐폴드 — 12개 크레이트(`oxrdp-pdu`, `oxrdp-core`, `oxrdp-graphics`,
+  `oxrdp-channels`, `oxrdp-rail`, `oxrdp-crypto`, `oxrdp-io`, `oxrdp-display`,
+  `oxrdp-render`, `oxrdp-input`, `oxrdp` 파사드, `oxrdp-cli` 바이너리)를 빌드되는
+  스켈레톤으로 추가. 순수 코어 크레이트는 `#![forbid(unsafe_code)]`. `cargo build/test/
+  clippy/fmt` 모두 통과.
 
 [Unreleased]: https://github.com/kernalix7/oxrdp/commits/main
