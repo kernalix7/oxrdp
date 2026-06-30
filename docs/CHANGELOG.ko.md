@@ -53,5 +53,9 @@ oxrdp의 모든 주목할 만한 변경 사항이 여기에 기록됩니다. 형
   그리고 GCC 클라이언트 user-data 블록 `ClientCoreData`(CS_CORE), `ClientSecurityData`
   (CS_SECURITY), `ClientNetworkData`(CS_NET) (MS-RDPBCGR 2.2.1.3.x). 이후 단계에서 MCS
   Connect-Initial PDU로 조립됨. `oxrdp-pdu` + `oxrdp-core` 합쳐 41개 테스트.
+- **M0 — MCS DomainParameters + 서버 GCC 블록.** BER `DomainParameters` SEQUENCE
+  (target/minimum/maximum 세트, 양수 부호 바이트 포함 최소 정수 인코딩)와, MCS Connect-Response에
+  실리는 서버 측 GCC user-data 블록 `ServerCoreData`(SC_CORE)·`ServerNetworkData`(SC_NET).
+  `oxrdp-pdu` + `oxrdp-core` 합쳐 50개 테스트.
 
 [Unreleased]: https://github.com/kernalix7/oxrdp/commits/main

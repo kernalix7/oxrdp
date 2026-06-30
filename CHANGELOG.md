@@ -54,5 +54,10 @@ behind winpodx, with the v0 goal of drop-in equivalence with winpodx's FreeRDP p
   `ClientSecurityData` (CS_SECURITY), and `ClientNetworkData` (CS_NET) (MS-RDPBCGR
   2.2.1.3.x). These assemble into the MCS Connect-Initial PDU in a later step. 41 tests
   across `oxrdp-pdu` + `oxrdp-core`.
+- **M0 — MCS DomainParameters + server GCC blocks.** The BER `DomainParameters` SEQUENCE
+  (target / minimum / maximum sets, with minimal unsigned-integer encoding incl. the
+  positive sign byte) and the server-side GCC user-data blocks `ServerCoreData` (SC_CORE)
+  and `ServerNetworkData` (SC_NET) carried in the MCS Connect-Response. 50 tests across
+  `oxrdp-pdu` + `oxrdp-core`.
 
 [Unreleased]: https://github.com/kernalix7/oxrdp/commits/main
