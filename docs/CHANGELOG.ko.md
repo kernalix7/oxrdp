@@ -57,5 +57,11 @@ oxrdp의 모든 주목할 만한 변경 사항이 여기에 기록됩니다. 형
   (target/minimum/maximum 세트, 양수 부호 바이트 포함 최소 정수 인코딩)와, MCS Connect-Response에
   실리는 서버 측 GCC user-data 블록 `ServerCoreData`(SC_CORE)·`ServerNetworkData`(SC_NET).
   `oxrdp-pdu` + `oxrdp-core` 합쳐 50개 테스트.
+- **M0 — MCS Connect-Initial / Connect-Response (Basic Settings Exchange).**
+  `ConnectInitial::to_bytes()`가 GCC Conference Create Request(T.124 OID, `Duca` H.221
+  클라이언트 키, target/minimum/maximum `DomainParameters`)를 감싼 BER MCS Connect-Initial을
+  클라이언트 데이터 블록과 함께 빌드(MS-RDPBCGR 2.2.1.3). `ConnectResponse::from_bytes()`가
+  서버 Connect-Response를 파싱해 `McDn` 서버 키 뒤의 서버 core/network 데이터(MCS 채널 ID)를
+  추출. `oxrdp-pdu` + `oxrdp-core` 합쳐 56개 테스트.
 
 [Unreleased]: https://github.com/kernalix7/oxrdp/commits/main

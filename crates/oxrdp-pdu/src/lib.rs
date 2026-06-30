@@ -18,6 +18,8 @@
 pub mod ber;
 mod codec;
 pub mod connect;
+pub mod connect_initial;
+pub mod connect_response;
 mod cursor;
 pub mod domain_params;
 mod error;
@@ -31,6 +33,8 @@ pub mod x224;
 
 pub use codec::{decode, encode_vec, Decode, Encode};
 pub use connect::{ConnectionConfirm, ConnectionRequest, NegotiationConfirm};
+pub use connect_initial::ConnectInitial;
+pub use connect_response::ConnectResponse;
 pub use cursor::{ReadCursor, WriteCursor};
 pub use domain_params::DomainParameters;
 pub use error::{DecodeError, DecodeResult, EncodeError, EncodeResult};

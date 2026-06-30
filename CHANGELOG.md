@@ -59,5 +59,12 @@ behind winpodx, with the v0 goal of drop-in equivalence with winpodx's FreeRDP p
   positive sign byte) and the server-side GCC user-data blocks `ServerCoreData` (SC_CORE)
   and `ServerNetworkData` (SC_NET) carried in the MCS Connect-Response. 50 tests across
   `oxrdp-pdu` + `oxrdp-core`.
+- **M0 — MCS Connect-Initial / Connect-Response (Basic Settings Exchange).**
+  `ConnectInitial::to_bytes()` builds the BER MCS Connect-Initial wrapping a GCC Conference
+  Create Request — the T.124 object identifier, the `Duca` H.221 client key, and the
+  target/minimum/maximum `DomainParameters` — around the concatenated client data blocks
+  (MS-RDPBCGR 2.2.1.3). `ConnectResponse::from_bytes()` parses the server's Connect-Response
+  and extracts the server core/network data (the MCS channel IDs) past the `McDn` server
+  key. 56 tests across `oxrdp-pdu` + `oxrdp-core`.
 
 [Unreleased]: https://github.com/kernalix7/oxrdp/commits/main
