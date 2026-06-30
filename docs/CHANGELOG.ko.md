@@ -63,5 +63,10 @@ oxrdp의 모든 주목할 만한 변경 사항이 여기에 기록됩니다. 형
   클라이언트 데이터 블록과 함께 빌드(MS-RDPBCGR 2.2.1.3). `ConnectResponse::from_bytes()`가
   서버 Connect-Response를 파싱해 `McDn` 서버 키 뒤의 서버 core/network 데이터(MCS 채널 ID)를
   추출. `oxrdp-pdu` + `oxrdp-core` 합쳐 56개 테스트.
+- **M0 — 전체 연결 시퀀스 상태머신.** `oxrdp-core`의 `ClientConnector`가 이제 RDP 연결 시퀀스
+  전체를 sans-io `step()` 머신으로 구동: X.224 협상 → TLS 업그레이드 신호 → MCS Connect-Initial
+  → Connect-Response(서버 채널 ID 추출) → Erect Domain + Attach User → Channel Join 루프 →
+  `Connected`. `oxrdp-pdu::frame`(TPKT + X.224 data 감싸기/벗기기) 추가. 전체 핸드셰이크 시뮬
+  테스트로 connector를 끝까지 구동. 57개 테스트.
 
 [Unreleased]: https://github.com/kernalix7/oxrdp/commits/main

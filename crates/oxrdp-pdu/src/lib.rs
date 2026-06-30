@@ -23,6 +23,7 @@ pub mod connect_response;
 mod cursor;
 pub mod domain_params;
 mod error;
+pub mod frame;
 pub mod gcc;
 pub mod gcc_server;
 pub mod mcs;
@@ -38,6 +39,7 @@ pub use connect_response::ConnectResponse;
 pub use cursor::{ReadCursor, WriteCursor};
 pub use domain_params::DomainParameters;
 pub use error::{DecodeError, DecodeResult, EncodeError, EncodeResult};
+pub use frame::{mcs_payload, wrap_mcs};
 pub use gcc::{ChannelDef, ClientCoreData, ClientNetworkData, ClientSecurityData};
 pub use gcc_server::{ServerCoreData, ServerNetworkData};
 pub use mcs::{

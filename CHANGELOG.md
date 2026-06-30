@@ -66,5 +66,11 @@ behind winpodx, with the v0 goal of drop-in equivalence with winpodx's FreeRDP p
   (MS-RDPBCGR 2.2.1.3). `ConnectResponse::from_bytes()` parses the server's Connect-Response
   and extracts the server core/network data (the MCS channel IDs) past the `McDn` server
   key. 56 tests across `oxrdp-pdu` + `oxrdp-core`.
+- **M0 — full connection-sequence state machine.** `oxrdp-core`'s `ClientConnector` now
+  drives the entire RDP connection sequence as a sans-io `step()` machine: X.224 negotiation
+  → TLS-upgrade signal → MCS Connect-Initial → Connect-Response (extracting the server
+  channel IDs) → Erect Domain + Attach User → the Channel Join loop → `Connected`. Adds
+  `oxrdp-pdu::frame` (TPKT + X.224 data wrap/unwrap). A full simulated-handshake test drives
+  the connector end to end. 57 tests.
 
 [Unreleased]: https://github.com/kernalix7/oxrdp/commits/main
