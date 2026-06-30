@@ -68,5 +68,10 @@ oxrdp의 모든 주목할 만한 변경 사항이 여기에 기록됩니다. 형
   → Connect-Response(서버 채널 ID 추출) → Erect Domain + Attach User → Channel Join 루프 →
   `Connected`. `oxrdp-pdu::frame`(TPKT + X.224 data 감싸기/벗기기) 추가. 전체 핸드셰이크 시뮬
   테스트로 connector를 끝까지 구동. 57개 테스트.
+- **M0 — TLS 설정 + 비동기 프레이밍 (impure 셸 시작).** `oxrdp-crypto`가 협상 이후 TLS
+  업그레이드용 rustls `ClientConfig`를 제공 — trust-on-first-use 인증서 검증자(`TofuVerifier`,
+  FreeRDP `/cert:tofu` 자세). 기밀성은 보장하나 MITM 방어는 아님(피닝은 예정 강화). `oxrdp-io`에
+  tokio 스트림 위 비동기 TPKT 프레임 코덱(`read_frame`/`write_frame`) 추가. 첫 외부 의존성:
+  `rustls`(ring 프로바이더), `tokio`. 62개 테스트.
 
 [Unreleased]: https://github.com/kernalix7/oxrdp/commits/main

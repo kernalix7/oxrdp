@@ -72,5 +72,11 @@ behind winpodx, with the v0 goal of drop-in equivalence with winpodx's FreeRDP p
   channel IDs) → Erect Domain + Attach User → the Channel Join loop → `Connected`. Adds
   `oxrdp-pdu::frame` (TPKT + X.224 data wrap/unwrap). A full simulated-handshake test drives
   the connector end to end. 57 tests.
+- **M0 — TLS config + async framing (the impure shells begin).** `oxrdp-crypto` provides a
+  rustls `ClientConfig` with a trust-on-first-use certificate verifier (`TofuVerifier`,
+  FreeRDP `/cert:tofu` posture) for the post-negotiation TLS upgrade — confidentiality
+  without MITM protection; pinning is a planned hardening. `oxrdp-io` gains an async TPKT
+  frame codec (`read_frame` / `write_frame`) over a tokio stream. First external
+  dependencies: `rustls` (ring provider) and `tokio`. 62 tests.
 
 [Unreleased]: https://github.com/kernalix7/oxrdp/commits/main
