@@ -9,6 +9,23 @@ oxrdp의 모든 주목할 만한 변경 사항이 여기에 기록됩니다. 형
 
 ## [Unreleased]
 
+### 방향 전환 (2026-07-02)
+
+oxrdp가 "더 나은 RDP **클라이언트**"에서 **RDP 자체를 대체**하는 목적형 저지연 remote-app
+프로토콜(RustDesk/Moonlight식)로 전환. Windows 게스트 **에이전트**가 개별 앱 창을 캡처해
+Linux **클라이언트**로 커스텀 프로토콜(QUIC, TCP 폴백)로 스트리밍. 근거: RDP는 구조적 지연
+한계(기본 TCP head-of-line 블로킹, 대역폭 최적화 버퍼링, 범용 오버헤드)가 있어 목적형
+프로토콜이 이길 수 있음. 실 Windows로 MCS 채널조인까지 검증한 기존 RDP 클라이언트 작업은
+git 히스토리에 남기고 **셸빙**; 클라 셸(TLS·전송·wgpu 디코드·창매핑·입력)과 코덱 토대는 재활용.
+새 에이전트: Rust+windows-rs · Windows.Graphics.Capture · 런타임 HW/SW 인코드 · QUIC+TCP.
+
+- **P0 — `oxproto`.** 새 프로토콜의 sans-io wire 메시지: `Message` envelope(ClientHello /
+  ServerHello / WindowCreated / WindowClosed / FrameData / PointerEvent), oxrdp-pdu 코덱 재활용. 7 테스트.
+- **P1 준비 — 크로스컴파일 파이프라인 + `oxagent` 골격.** Windows 게스트 에이전트를 리눅스에서
+  `x86_64-pc-windows-gnu`(mingw-w64)로 크로스컴파일 — `oxagent.exe`가 windows-rs 0.58(WGC +
+  Media Foundation + Win32 창열거) 링크. Windows deps는 `cfg(windows)` 게이트라 리눅스에선
+  스텁으로 빌드되어 CI green 유지 — 에이전트를 게스트 내 툴체인 없이 리눅스에서 개발·빌드.
+
 ### Highlights
 
 **프로젝트 부트스트랩.** oxrdp는 winpodx 뒤에서 동작하는 독립형, 처음부터 작성한 Rust RDP

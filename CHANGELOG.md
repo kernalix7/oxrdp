@@ -24,6 +24,12 @@ HW/SW encode, QUIC+TCP transport.
 - **P0 — `oxproto`.** The new protocol's sans-io wire messages: a `Message` envelope with
   ClientHello / ServerHello / WindowCreated / WindowClosed / FrameData / PointerEvent, built on
   the reused `oxrdp-pdu` codec. 7 tests.
+- **P1 setup — cross-compile pipeline + `oxagent` skeleton.** The Windows guest agent
+  cross-compiles from Linux to `x86_64-pc-windows-gnu` (mingw-w64): a `oxagent.exe` that links
+  `windows-rs` 0.58 with Windows.Graphics.Capture + Media Foundation + Win32 window
+  enumeration. The Windows deps are `cfg(windows)`-gated, so the workspace still builds
+  `oxagent` as a stub on Linux and CI stays green — the agent is developed and built entirely
+  from the Linux host, no in-guest toolchain needed.
 
 ### Highlights (RDP-client era — shelved)
 
