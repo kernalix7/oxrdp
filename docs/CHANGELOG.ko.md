@@ -79,5 +79,10 @@ oxrdp의 모든 주목할 만한 변경 사항이 여기에 기록됩니다. 형
   반환. `oxrdp` CLI가 이제 실행 가능 — `oxrdp <host[:port]> [username]`이 핸드셰이크를 수행하고
   협상된 채널을 보고. connect seam은 실서버로 검증하며, 이후 단계(보안/라이선싱/능력, 그래픽,
   RAIL)는 아직 미구현.
+- **M0 — Client Info PDU + 보안 헤더.** `oxrdp-pdu::client_info`가 RDP Client Info
+  PDU(TS_INFO_PACKET, MS-RDPBCGR 2.2.1.11.1.1)를 빌드: 로그온 플래그, 도메인/사용자/비밀번호/
+  대체셸/작업디렉터리(UTF-16LE), 확장 정보(클라이언트 주소, 172바이트 타임존, 세션 ID, 성능
+  플래그) — 채널 조인 이후 보내는 자격증명. `security::SecurityHeader`는 이 MCS 페이로드를 감싸는
+  Basic Security Header(`SEC_INFO_PKT`/`SEC_LICENSE_PKT` 플래그). 67개 테스트.
 
 [Unreleased]: https://github.com/kernalix7/oxrdp/commits/main

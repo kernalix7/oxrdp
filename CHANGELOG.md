@@ -85,5 +85,11 @@ behind winpodx, with the v0 goal of drop-in equivalence with winpodx's FreeRDP p
   `oxrdp <host[:port]> [username]` performs the handshake and reports the negotiated channels.
   The connect seam is validated against a live server; post-connection phases
   (security/licensing/capabilities, graphics, RAIL) are not implemented yet.
+- **M0 — Client Info PDU + security header.** `oxrdp-pdu::client_info` builds the RDP Client
+  Info PDU (TS_INFO_PACKET, MS-RDPBCGR 2.2.1.11.1.1): logon flags, domain / username /
+  password / alternate-shell / working-dir as UTF-16LE, and the extended info (client
+  address, 172-byte time zone, session id, performance flags) — the credentials sent after
+  channel join. `security::SecurityHeader` is the Basic Security Header (`SEC_INFO_PKT` /
+  `SEC_LICENSE_PKT` flags) that prefixes these MCS payloads. 67 tests.
 
 [Unreleased]: https://github.com/kernalix7/oxrdp/commits/main

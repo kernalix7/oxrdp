@@ -16,6 +16,7 @@
 #![forbid(unsafe_code)]
 
 pub mod ber;
+pub mod client_info;
 mod codec;
 pub mod connect;
 pub mod connect_initial;
@@ -28,10 +29,12 @@ pub mod gcc;
 pub mod gcc_server;
 pub mod mcs;
 pub mod nego;
+pub mod security;
 pub mod send_data;
 pub mod tpkt;
 pub mod x224;
 
+pub use client_info::{ClientInfo, ExtendedInfo};
 pub use codec::{decode, encode_vec, Decode, Encode};
 pub use connect::{ConnectionConfirm, ConnectionRequest, NegotiationConfirm};
 pub use connect_initial::ConnectInitial;
@@ -47,6 +50,7 @@ pub use mcs::{
     ErectDomainRequest, MCS_USERCHANNEL_BASE,
 };
 pub use nego::{NegotiationFailure, NegotiationRequest, NegotiationResponse};
+pub use security::SecurityHeader;
 pub use send_data::{SendDataIndication, SendDataRequest};
 pub use tpkt::TpktHeader;
 pub use x224::X224DataHeader;
