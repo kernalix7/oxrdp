@@ -27,10 +27,12 @@ mod error;
 pub mod frame;
 pub mod gcc;
 pub mod gcc_server;
+pub mod license;
 pub mod mcs;
 pub mod nego;
 pub mod security;
 pub mod send_data;
+pub mod share;
 pub mod tpkt;
 pub mod x224;
 
@@ -45,6 +47,7 @@ pub use error::{DecodeError, DecodeResult, EncodeError, EncodeResult};
 pub use frame::{mcs_payload, wrap_mcs};
 pub use gcc::{ChannelDef, ClientCoreData, ClientNetworkData, ClientSecurityData};
 pub use gcc_server::{ServerCoreData, ServerNetworkData};
+pub use license::LicensePdu;
 pub use mcs::{
     AttachUserConfirm, AttachUserRequest, ChannelJoinConfirm, ChannelJoinRequest,
     ErectDomainRequest, MCS_USERCHANNEL_BASE,
@@ -52,6 +55,7 @@ pub use mcs::{
 pub use nego::{NegotiationFailure, NegotiationRequest, NegotiationResponse};
 pub use security::SecurityHeader;
 pub use send_data::{SendDataIndication, SendDataRequest};
+pub use share::{ShareControlHeader, ShareDataHeader};
 pub use tpkt::TpktHeader;
 pub use x224::X224DataHeader;
 

@@ -84,5 +84,9 @@ oxrdp의 모든 주목할 만한 변경 사항이 여기에 기록됩니다. 형
   대체셸/작업디렉터리(UTF-16LE), 확장 정보(클라이언트 주소, 172바이트 타임존, 세션 ID, 성능
   플래그) — 채널 조인 이후 보내는 자격증명. `security::SecurityHeader`는 이 MCS 페이로드를 감싸는
   Basic Security Header(`SEC_INFO_PKT`/`SEC_LICENSE_PKT` 플래그). 67개 테스트.
+- **M0 — share 프레이밍 + 라이선싱.** `oxrdp-pdu::share`가 능력교환·데이터 PDU를 감싸는
+  `ShareControlHeader`·`ShareDataHeader`(TS_SHARECONTROLHEADER / TS_SHAREDATAHEADER) 추가.
+  `oxrdp-pdu::license`가 라이선싱 PDU를 파싱해 흔한 "valid client — 라이선스 없이 진행" 경로
+  (ERROR_ALERT / STATUS_VALID_CLIENT)를 감지. 71개 테스트.
 
 [Unreleased]: https://github.com/kernalix7/oxrdp/commits/main

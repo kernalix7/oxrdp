@@ -91,5 +91,10 @@ behind winpodx, with the v0 goal of drop-in equivalence with winpodx's FreeRDP p
   address, 172-byte time zone, session id, performance flags) — the credentials sent after
   channel join. `security::SecurityHeader` is the Basic Security Header (`SEC_INFO_PKT` /
   `SEC_LICENSE_PKT` flags) that prefixes these MCS payloads. 67 tests.
+- **M0 — share framing + licensing.** `oxrdp-pdu::share` adds the `ShareControlHeader` and
+  `ShareDataHeader` (TS_SHARECONTROLHEADER / TS_SHAREDATAHEADER) that frame the capability
+  exchange and data PDUs. `oxrdp-pdu::license` parses the licensing PDU enough to detect the
+  common "valid client — proceed without a license" path (ERROR_ALERT / STATUS_VALID_CLIENT).
+  71 tests.
 
 [Unreleased]: https://github.com/kernalix7/oxrdp/commits/main
