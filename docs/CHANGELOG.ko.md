@@ -92,5 +92,9 @@ oxrdp의 모든 주목할 만한 변경 사항이 여기에 기록됩니다. 형
   `default_client_capabilities` 번들을 추가. `oxrdp-pdu::active`가 서버 Demand Active PDU를
   파싱(shareId 추출)하고 클라이언트 Confirm Active PDU(능력 세트 포함)를 빌드. (증분 — 완전한
   Windows 상호운용엔 능력 세트 추가 필요.) 78개 테스트.
+- **M0 — 최종화 PDU.** `oxrdp-pdu::finalize`가 연결 최종화 데이터 PDU 본문을 추가: Client
+  Synchronize, Control(cooperate / request-control), Font List. 연결 시퀀스 PDU 세트 완성 —
+  connector의 post-connection 시퀀스(Client Info → 라이선싱 → 능력교환 → 최종화)에 배선하는
+  것이 다음. 81개 테스트.
 
 [Unreleased]: https://github.com/kernalix7/oxrdp/commits/main

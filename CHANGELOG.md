@@ -101,5 +101,10 @@ behind winpodx, with the v0 goal of drop-in equivalence with winpodx's FreeRDP p
   Demand Active PDU (for the shareId) and builds the client's Confirm Active PDU carrying its
   capability sets. (An incremental capability set — more sets will be added for full Windows
   interop.) 78 tests.
+- **M0 — finalization PDUs.** `oxrdp-pdu::finalize` adds the connection-finalization
+  data-PDU bodies: Client Synchronize, Control (cooperate / request-control), and Font List.
+  This completes the connection-sequence PDU set; wiring them into the connector's
+  post-connection sequence (Client Info → licensing → capability exchange → finalization)
+  is next. 81 tests.
 
 [Unreleased]: https://github.com/kernalix7/oxrdp/commits/main
