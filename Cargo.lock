@@ -48,6 +48,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "68ab91017fe16c622486840e4c83c9a37afeff978bd239b5293d61ece587de66"
 
 [[package]]
+name = "log"
+version = "0.4.33"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "0ceec5bc11778974d1bcb055b18002eba7f4b3518b6a0081b3af5f21666da9ad"
+
+[[package]]
 name = "mio"
 version = "1.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -88,7 +94,10 @@ version = "0.0.0"
 name = "oxrdp-cli"
 version = "0.0.0"
 dependencies = [
- "oxrdp",
+ "oxrdp-core",
+ "oxrdp-io",
+ "oxrdp-pdu",
+ "tokio",
 ]
 
 [[package]]
@@ -121,8 +130,11 @@ version = "0.0.0"
 name = "oxrdp-io"
 version = "0.0.0"
 dependencies = [
+ "oxrdp-core",
+ "oxrdp-crypto",
  "oxrdp-pdu",
  "tokio",
+ "tokio-rustls",
 ]
 
 [[package]]
@@ -181,6 +193,7 @@ version = "0.23.41"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "6b92b125634d9b795e7beca796cc790df15a7fb38323bf3196fda83292d06b1f"
 dependencies = [
+ "log",
  "once_cell",
  "ring",
  "rustls-pki-types",
@@ -266,6 +279,16 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn",
+]
+
+[[package]]
+name = "tokio-rustls"
+version = "0.26.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1729aa945f29d91ba541258c8df89027d5792d85a8841fb65e8bf0f4ede4ef61"
+dependencies = [
+ "rustls",
+ "tokio",
 ]
 
 [[package]]

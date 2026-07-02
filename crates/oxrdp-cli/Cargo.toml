@@ -12,7 +12,10 @@ name = "oxrdp"
 path = "src/main.rs"
 
 [dependencies]
-oxrdp = { path = "../oxrdp" }
+tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
+oxrdp-io = { path = "../oxrdp-io" }
+oxrdp-core = { path = "../oxrdp-core" }
+oxrdp-pdu = { path = "../oxrdp-pdu" }
 
 [lints]
 workspace = true

@@ -78,5 +78,12 @@ behind winpodx, with the v0 goal of drop-in equivalence with winpodx's FreeRDP p
   without MITM protection; pinning is a planned hardening. `oxrdp-io` gains an async TPKT
   frame codec (`read_frame` / `write_frame`) over a tokio stream. First external
   dependencies: `rustls` (ring provider) and `tokio`. 62 tests.
+- **M0 — connection driver + runnable `oxrdp` binary.** `oxrdp-io::connect()` assembles the
+  transport end to end: TCP → X.224 negotiation → TLS upgrade (`tokio-rustls`) → MCS
+  Connect-Initial through channel join, driving the sans-io `ClientConnector` and returning a
+  `Session` (the TLS stream + negotiated channel IDs). The `oxrdp` CLI is now runnable —
+  `oxrdp <host[:port]> [username]` performs the handshake and reports the negotiated channels.
+  The connect seam is validated against a live server; post-connection phases
+  (security/licensing/capabilities, graphics, RAIL) are not implemented yet.
 
 [Unreleased]: https://github.com/kernalix7/oxrdp/commits/main

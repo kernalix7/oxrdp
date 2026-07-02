@@ -9,7 +9,10 @@ repository.workspace = true
 
 [dependencies]
 tokio = { version = "1", features = ["io-util", "net", "rt", "macros"] }
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12", "logging"] }
 oxrdp-pdu = { path = "../oxrdp-pdu" }
+oxrdp-core = { path = "../oxrdp-core" }
+oxrdp-crypto = { path = "../oxrdp-crypto" }
 
 [lints]
 workspace = true

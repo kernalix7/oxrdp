@@ -6,6 +6,8 @@
 //!
 //! Part of the [oxrdp](https://github.com/kernalix7/oxrdp) workspace. Pre-alpha.
 
+pub mod connect;
 pub mod frame;
 
+pub use connect::{connect, Session};
 pub use frame::{read_frame, write_frame};
