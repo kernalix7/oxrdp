@@ -106,5 +106,14 @@ behind winpodx, with the v0 goal of drop-in equivalence with winpodx's FreeRDP p
   This completes the connection-sequence PDU set; wiring them into the connector's
   post-connection sequence (Client Info → licensing → capability exchange → finalization)
   is next. 81 tests.
+- **M0 — first live handshake against real Windows. ✅** Validated `oxrdp-cli` against a
+  running Windows RDP server: the full connection sequence — X.224 negotiation → TLS → MCS
+  Connect-Initial / Connect-Response → Erect Domain → Attach User → channel-join loop —
+  completes and the client reaches the negotiated MCS channels. This proves the BER / GCC /
+  MCS / DomainParameters byte encoding is correct against real Windows. Fix surfaced by the
+  test: CS_CORE now carries the **extended fields** (`highColorDepth` / `supportedColorDepths`
+  / `earlyCapabilityFlags`, a 216-byte block) that modern Windows requires — a minimal
+  8bpp-only core was silently dropped. Connect-driver phase/hex logging is gated behind
+  `OXRDP_DEBUG`.
 
 [Unreleased]: https://github.com/kernalix7/oxrdp/commits/main

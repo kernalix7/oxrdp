@@ -40,15 +40,20 @@ pub struct ClientCoreData {
     pub ime_file_name: [u8; 64],
 }
 
+/// Total on-wire length of the (extended) CS_CORE block: 4-byte TS_UD header + 128 bytes of
+/// mandatory fields + 84 bytes of the standard extended fields.
+const CS_CORE_LEN: u16 = 216;
+
 impl Encode for ClientCoreData {
     fn size(&self) -> usize {
-        132
+        CS_CORE_LEN as usize
     }
 
     fn encode(&self, dst: &mut WriteCursor<'_>) -> EncodeResult<()> {
         const CTX: &str = "GCC CS_CORE";
         dst.write_u16_le(CS_CORE, CTX)?;
-        dst.write_u16_le(132, CTX)?;
+        dst.write_u16_le(CS_CORE_LEN, CTX)?;
+        // Mandatory fields (128 bytes).
         dst.write_u32_le(self.version, CTX)?;
         dst.write_u16_le(self.desktop_width, CTX)?;
         dst.write_u16_le(self.desktop_height, CTX)?;
@@ -61,6 +66,18 @@ impl Encode for ClientCoreData {
         dst.write_u32_le(self.keyboard_subtype, CTX)?;
         dst.write_u32_le(self.keyboard_function_key, CTX)?;
         dst.write_slice(&self.ime_file_name, CTX)?;
+        // Extended fields (84 bytes). Every real client sends these; modern Windows
+        // rejects an 8bpp-only client that omits highColorDepth / supportedColorDepths.
+        dst.write_u16_le(self.color_depth, CTX)?; // postBeta2ColorDepth
+        dst.write_u16_le(1, CTX)?; // clientProductId
+        dst.write_u32_le(0, CTX)?; // serialNumber
+        dst.write_u16_le(0x0018, CTX)?; // highColorDepth = 24bpp
+        dst.write_u16_le(0x0007, CTX)?; // supportedColorDepths = 24/16/15bpp
+        dst.write_u16_le(0x0001, CTX)?; // earlyCapabilityFlags = SUPPORT_ERRINFO_PDU
+        dst.write_slice(&[0u8; 64], CTX)?; // clientDigProductId
+        dst.write_u8(0, CTX)?; // connectionType
+        dst.write_u8(0, CTX)?; // pad1octet
+        dst.write_u32_le(0x0000_0001, CTX)?; // serverSelectedProtocol = PROTOCOL_SSL
         Ok(())
     }
 }
@@ -69,10 +86,10 @@ impl<'de> Decode<'de> for ClientCoreData {
     fn decode(src: &mut ReadCursor<'de>) -> DecodeResult<Self> {
         const CTX: &str = "GCC CS_CORE";
         let len = read_ud_header(src, CS_CORE, CTX)?;
-        if len != 132 {
+        if len < 132 {
             return Err(DecodeError::InvalidLength {
                 context: CTX,
-                reason: "expected CS_CORE block length of 132 bytes",
+                reason: "CS_CORE block shorter than the 132-byte mandatory part",
             });
         }
         let version = src.read_u32_le(CTX)?;
@@ -87,6 +104,12 @@ impl<'de> Decode<'de> for ClientCoreData {
         let keyboard_subtype = src.read_u32_le(CTX)?;
         let keyboard_function_key = src.read_u32_le(CTX)?;
         let ime_file_name = src.read_array::<64>(CTX)?;
+        // Consume any extended fields (postBeta2ColorDepth .. serverSelectedProtocol);
+        // they are re-emitted as standard constants on encode, so we don't retain them.
+        let extended = len as usize - 132;
+        if extended > 0 {
+            src.read_slice(extended, CTX)?;
+        }
         Ok(Self {
             version,
             desktop_width,
@@ -260,23 +283,26 @@ mod tests {
             ime_file_name: [0u8; 64],
         };
         let bytes = encode_vec(&core).unwrap();
-        let mut e = Vec::new();
-        e.extend_from_slice(&[0x01, 0xC0]); // CS_CORE
-        e.extend_from_slice(&132u16.to_le_bytes());
-        e.extend_from_slice(&0x0008_0004u32.to_le_bytes());
-        e.extend_from_slice(&1024u16.to_le_bytes());
-        e.extend_from_slice(&768u16.to_le_bytes());
-        e.extend_from_slice(&0xCA01u16.to_le_bytes());
-        e.extend_from_slice(&0xAA03u16.to_le_bytes());
-        e.extend_from_slice(&0x0000_0409u32.to_le_bytes());
-        e.extend_from_slice(&2600u32.to_le_bytes());
-        e.extend_from_slice(&name32("oxrdp"));
-        e.extend_from_slice(&4u32.to_le_bytes());
-        e.extend_from_slice(&0u32.to_le_bytes());
-        e.extend_from_slice(&12u32.to_le_bytes());
-        e.extend_from_slice(&[0u8; 64]);
-        assert_eq!(bytes, e);
-        assert_eq!(bytes.len(), 132);
+        // Extended CS_CORE: 4-byte header + 128 mandatory + 84 extended = 216 bytes.
+        assert_eq!(bytes.len(), 216);
+        assert_eq!(&bytes[0..2], &[0x01, 0xC0]); // CS_CORE type
+        assert_eq!(&bytes[2..4], &216u16.to_le_bytes()); // length
+        assert_eq!(&bytes[4..8], &0x0008_0004u32.to_le_bytes()); // version
+                                                                 // The mandatory prefix (bytes 4..132) matches the hand-built expectation.
+        let mut mandatory = Vec::new();
+        mandatory.extend_from_slice(&0x0008_0004u32.to_le_bytes());
+        mandatory.extend_from_slice(&1024u16.to_le_bytes());
+        mandatory.extend_from_slice(&768u16.to_le_bytes());
+        mandatory.extend_from_slice(&0xCA01u16.to_le_bytes());
+        mandatory.extend_from_slice(&0xAA03u16.to_le_bytes());
+        mandatory.extend_from_slice(&0x0000_0409u32.to_le_bytes());
+        mandatory.extend_from_slice(&2600u32.to_le_bytes());
+        mandatory.extend_from_slice(&name32("oxrdp"));
+        mandatory.extend_from_slice(&4u32.to_le_bytes());
+        mandatory.extend_from_slice(&0u32.to_le_bytes());
+        mandatory.extend_from_slice(&12u32.to_le_bytes());
+        mandatory.extend_from_slice(&[0u8; 64]);
+        assert_eq!(&bytes[4..132], &mandatory[..]);
         assert_eq!(decode::<ClientCoreData>(&bytes).unwrap(), core);
     }
 

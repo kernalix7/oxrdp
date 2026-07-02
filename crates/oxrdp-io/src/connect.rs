@@ -47,6 +47,7 @@ pub async fn connect(
     server_name: &str,
     config: ConnectorConfig,
 ) -> io::Result<Session> {
+    let debug = std::env::var_os("OXRDP_DEBUG").is_some();
     let mut tcp = TcpStream::connect(addr).await?;
     let mut connector = ClientConnector::new(config);
 
@@ -58,6 +59,13 @@ pub async fn connect(
     }
 
     let cc = read_frame(&mut tcp).await?;
+    if debug {
+        let cc_hex: String = cc.iter().map(|b| format!("{b:02x}")).collect();
+        eprintln!(
+            "[oxrdp] <- Connection Confirm ({} bytes): {cc_hex}",
+            cc.len()
+        );
+    }
     let mut upgrade = false;
     for out in connector.step(&cc).map_err(core_err)? {
         match out {
@@ -77,14 +85,30 @@ pub async fn connect(
     let tls_connector = TlsConnector::from(tls_client_config());
     let name = ServerName::try_from(server_name.to_string())
         .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "invalid server name"))?;
+    if debug {
+        eprintln!("[oxrdp] negotiation done; starting TLS handshake");
+    }
     let mut stream = tls_connector.connect(name, tcp).await?;
+    if debug {
+        eprintln!("[oxrdp] TLS established");
+    }
 
     // Phase 3+ — MCS Connect-Initial through channel join, over TLS.
     let mut outputs = connector.resume_after_tls().map_err(core_err)?;
     loop {
         for out in outputs.drain(..) {
             match out {
-                CoreOutput::SendData(bytes) => write_frame(&mut stream, &bytes).await?,
+                CoreOutput::SendData(bytes) => {
+                    if debug {
+                        let hex: String = bytes.iter().map(|b| format!("{b:02x}")).collect();
+                        eprintln!(
+                            "[oxrdp] -> {} bytes (state={:?}): {hex}",
+                            bytes.len(),
+                            connector.state()
+                        );
+                    }
+                    write_frame(&mut stream, &bytes).await?;
+                }
                 CoreOutput::UpgradeToTls => {
                     return Err(io::Error::new(
                         io::ErrorKind::InvalidData,
@@ -106,6 +130,13 @@ pub async fn connect(
             }
         }
         let frame = read_frame(&mut stream).await?;
+        if debug {
+            eprintln!(
+                "[oxrdp] <- {} bytes (state={:?})",
+                frame.len(),
+                connector.state()
+            );
+        }
         outputs = connector.step(&frame).map_err(core_err)?;
     }
 }

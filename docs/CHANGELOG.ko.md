@@ -96,5 +96,12 @@ oxrdp의 모든 주목할 만한 변경 사항이 여기에 기록됩니다. 형
   Synchronize, Control(cooperate / request-control), Font List. 연결 시퀀스 PDU 세트 완성 —
   connector의 post-connection 시퀀스(Client Info → 라이선싱 → 능력교환 → 최종화)에 배선하는
   것이 다음. 81개 테스트.
+- **M0 — 실 Windows 대상 첫 실접속 핸드셰이크. ✅** 동작 중인 Windows RDP 서버로 `oxrdp-cli`
+  검증: 전체 연결 시퀀스(X.224 협상 → TLS → MCS Connect-Initial/Response → Erect Domain →
+  Attach User → 채널조인 루프)가 완료되고 협상된 MCS 채널에 도달. BER/GCC/MCS/DomainParameters
+  바이트 인코딩이 실 Windows에 대해 정확함을 입증. 검증으로 드러난 수정: CS_CORE에 모던 Windows가
+  요구하는 **확장 필드**(`highColorDepth`/`supportedColorDepths`/`earlyCapabilityFlags`,
+  216바이트) 추가 — 8bpp-only 미니멀 코어는 조용히 드롭됨. connect 드라이버 로깅은 `OXRDP_DEBUG`
+  뒤로.
 
 [Unreleased]: https://github.com/kernalix7/oxrdp/commits/main
