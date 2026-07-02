@@ -88,5 +88,9 @@ oxrdp의 모든 주목할 만한 변경 사항이 여기에 기록됩니다. 형
   `ShareControlHeader`·`ShareDataHeader`(TS_SHARECONTROLHEADER / TS_SHAREDATAHEADER) 추가.
   `oxrdp-pdu::license`가 라이선싱 PDU를 파싱해 흔한 "valid client — 라이선스 없이 진행" 경로
   (ERROR_ALERT / STATUS_VALID_CLIENT)를 감지. 71개 테스트.
+- **M0 — 능력 교환.** `oxrdp-pdu::caps`가 General / Bitmap / Input 능력 세트와
+  `default_client_capabilities` 번들을 추가. `oxrdp-pdu::active`가 서버 Demand Active PDU를
+  파싱(shareId 추출)하고 클라이언트 Confirm Active PDU(능력 세트 포함)를 빌드. (증분 — 완전한
+  Windows 상호운용엔 능력 세트 추가 필요.) 78개 테스트.
 
 [Unreleased]: https://github.com/kernalix7/oxrdp/commits/main

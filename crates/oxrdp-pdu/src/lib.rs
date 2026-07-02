@@ -15,7 +15,9 @@
 //! See [docs/ARCHITECTURE.md](https://github.com/kernalix7/oxrdp/blob/main/docs/ARCHITECTURE.md).
 #![forbid(unsafe_code)]
 
+pub mod active;
 pub mod ber;
+pub mod caps;
 pub mod client_info;
 mod codec;
 pub mod connect;
@@ -36,6 +38,10 @@ pub mod share;
 pub mod tpkt;
 pub mod x224;
 
+pub use active::{build_confirm_active, DemandActive};
+pub use caps::{
+    default_client_capabilities, BitmapCapabilitySet, GeneralCapabilitySet, InputCapabilitySet,
+};
 pub use client_info::{ClientInfo, ExtendedInfo};
 pub use codec::{decode, encode_vec, Decode, Encode};
 pub use connect::{ConnectionConfirm, ConnectionRequest, NegotiationConfirm};

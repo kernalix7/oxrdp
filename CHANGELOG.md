@@ -96,5 +96,10 @@ behind winpodx, with the v0 goal of drop-in equivalence with winpodx's FreeRDP p
   exchange and data PDUs. `oxrdp-pdu::license` parses the licensing PDU enough to detect the
   common "valid client — proceed without a license" path (ERROR_ALERT / STATUS_VALID_CLIENT).
   71 tests.
+- **M0 — capability exchange.** `oxrdp-pdu::caps` adds the General / Bitmap / Input capability
+  sets and a `default_client_capabilities` bundle. `oxrdp-pdu::active` parses the server's
+  Demand Active PDU (for the shareId) and builds the client's Confirm Active PDU carrying its
+  capability sets. (An incremental capability set — more sets will be added for full Windows
+  interop.) 78 tests.
 
 [Unreleased]: https://github.com/kernalix7/oxrdp/commits/main
