@@ -10,6 +10,10 @@
 
 pub mod message;
 
+/// Codec entry points, re-exported so callers can `oxproto::decode` / `oxproto::encode_vec`
+/// oxproto messages without depending on `oxrdp-pdu` directly.
+pub use oxrdp_pdu::{decode, encode_vec};
+
 pub use message::{
     codec, msg_type, ClientHello, FrameData, Message, PointerEvent, ServerHello, WindowCreated,
 };

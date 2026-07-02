@@ -30,6 +30,11 @@ HW/SW encode, QUIC+TCP transport.
   enumeration. The Windows deps are `cfg(windows)`-gated, so the workspace still builds
   `oxagent` as a stub on Linux and CI stays green — the agent is developed and built entirely
   from the Linux host, no in-guest toolchain needed.
+- **P1 — window enumeration + async transport.** `oxagent` enumerates visible top-level
+  windows (`EnumWindows` → handle / title / geometry), cross-compile-validated to windows-gnu.
+  `oxtransport` frames oxproto messages over any tokio stream (`read_message_bytes` /
+  `write_message`, 64 MiB guard). `oxproto` re-exports the `decode` / `encode_vec` codec entry
+  points. 90 tests.
 
 ### Highlights (RDP-client era — shelved)
 

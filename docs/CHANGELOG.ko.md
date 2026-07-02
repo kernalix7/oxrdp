@@ -25,6 +25,10 @@ git 히스토리에 남기고 **셸빙**; 클라 셸(TLS·전송·wgpu 디코드
   `x86_64-pc-windows-gnu`(mingw-w64)로 크로스컴파일 — `oxagent.exe`가 windows-rs 0.58(WGC +
   Media Foundation + Win32 창열거) 링크. Windows deps는 `cfg(windows)` 게이트라 리눅스에선
   스텁으로 빌드되어 CI green 유지 — 에이전트를 게스트 내 툴체인 없이 리눅스에서 개발·빌드.
+- **P1 — 창 열거 + 비동기 전송.** `oxagent`가 보이는 최상위 창을 열거(`EnumWindows` →
+  핸들/제목/좌표), windows-gnu 크로스컴파일 검증. `oxtransport`가 tokio 스트림 위로 oxproto
+  메시지를 프레이밍(`read_message_bytes`/`write_message`, 64 MiB 가드). `oxproto`가
+  `decode`/`encode_vec` 코덱 진입점을 re-export. 90 테스트.
 
 ### Highlights
 

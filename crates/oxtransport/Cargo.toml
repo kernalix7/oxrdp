@@ -1,0 +1,16 @@
+[package]
+name = "oxtransport"
+description = "Async oxproto message transport over tokio streams (TCP now, QUIC later). Shared by the client and the Windows agent."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+
+[dependencies]
+tokio = { version = "1", features = ["io-util", "net", "rt", "macros"] }
+oxproto = { path = "../oxproto" }
+oxrdp-pdu = { path = "../oxrdp-pdu" }
+
+[lints]
+workspace = true
