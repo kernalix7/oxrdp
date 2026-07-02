@@ -1,0 +1,14 @@
+[package]
+name = "oxproto"
+description = "The oxrdp custom low-latency remote-app protocol: sans-io wire messages shared by client and agent."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+
+[dependencies]
+oxrdp-pdu = { path = "../oxrdp-pdu" }
+
+[lints]
+workspace = true

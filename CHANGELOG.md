@@ -8,7 +8,24 @@ All notable changes to oxrdp are documented here. The format is based on
 
 ## [Unreleased]
 
-### Highlights
+### Direction change (2026-07-02)
+
+oxrdp pivots from "a better RDP **client**" to **replacing RDP itself** with a purpose-built,
+low-latency remote-app protocol (RustDesk / Moonlight-style): a Windows guest **agent**
+captures individual application windows and streams them to the Linux **client** over a custom
+protocol (QUIC, TCP fallback). Rationale: RDP has structural latency limits (TCP head-of-line
+blocking by default, bandwidth-optimized buffering, general-purpose overhead) that a
+purpose-built protocol can beat. The prior RDP-client work — validated end-to-end through MCS
+channel join against a real Windows guest — is retained in git history but **shelved**; its
+client shells (TLS, transport, wgpu decode, window mapping, input) and the bounds-checked codec
+base carry over. New agent architecture: Rust + `windows-rs`, Windows.Graphics.Capture, runtime
+HW/SW encode, QUIC+TCP transport.
+
+- **P0 — `oxproto`.** The new protocol's sans-io wire messages: a `Message` envelope with
+  ClientHello / ServerHello / WindowCreated / WindowClosed / FrameData / PointerEvent, built on
+  the reused `oxrdp-pdu` codec. 7 tests.
+
+### Highlights (RDP-client era — shelved)
 
 **Project bootstrap.** oxrdp is split out as the standalone, from-scratch Rust RDP engine
 behind winpodx, with the v0 goal of drop-in equivalence with winpodx's FreeRDP path.
