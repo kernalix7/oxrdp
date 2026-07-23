@@ -9,3 +9,7 @@
 .vscode/
 *.swp
 .DS_Store
+
+# dev orchestration usage log
+dev/.cloud-usage.tsv
+**/.cloud-usage.tsv

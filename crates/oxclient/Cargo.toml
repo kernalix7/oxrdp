@@ -1,0 +1,16 @@
+[package]
+name = "oxclient"
+description = "Linux client session: connects to the oxagent, performs the oxproto handshake, and yields window/frame events."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+
+[dependencies]
+tokio = { version = "1", features = ["io-util", "net", "rt", "macros"] }
+oxproto = { path = "../oxproto" }
+oxtransport = { path = "../oxtransport" }
+
+[lints]
+workspace = true

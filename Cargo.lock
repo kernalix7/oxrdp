@@ -79,6 +79,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "oxclient"
+version = "0.0.0"
+dependencies = [
+ "oxproto",
+ "oxtransport",
+ "tokio",
+]
+
+[[package]]
 name = "oxproto"
 version = "0.0.0"
 dependencies = [
