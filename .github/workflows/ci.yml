@@ -51,17 +51,35 @@ jobs:
       - if: steps.guard.outputs.go == '1'
         run: cargo test --workspace
 
+  # The Windows guest agent is the component that matters most and never builds on a Linux
+  # runner's default target — without this job it can break while CI stays green.
+  agent-windows:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-gnu
+          components: clippy
+      - name: Install the mingw-w64 cross toolchain
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends mingw-w64
+      - run: cargo build -p oxagent --target x86_64-pc-windows-gnu
+      - run: cargo clippy -p oxagent --target x86_64-pc-windows-gnu --all-targets -- -D warnings
+
   audit:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
-      - id: guard
-        run: |
-          if [ -f Cargo.toml ]; then echo "go=1" >> "$GITHUB_OUTPUT"; else echo "no Cargo workspace yet — skipping"; echo "go=0" >> "$GITHUB_OUTPUT"; fi
-      - if: steps.guard.outputs.go == '1'
-        uses: dtolnay/rust-toolchain@stable
-      - if: steps.guard.outputs.go == '1'
-        run: cargo install cargo-audit
-      - if: steps.guard.outputs.go == '1'
-        run: cargo audit
-        continue-on-error: true
+      - uses: rustsec/audit-check@v2
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+  deny:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          command: check bans licenses sources

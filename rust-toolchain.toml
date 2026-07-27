@@ -1,0 +1,6 @@
+# Pin the toolchain so local development, CI, and the Windows cross-build agree.
+# `targets` makes the Windows agent's target available automatically after a checkout.
+[toolchain]
+channel = "stable"
+components = ["clippy", "rustfmt"]
+targets = ["x86_64-pc-windows-gnu"]

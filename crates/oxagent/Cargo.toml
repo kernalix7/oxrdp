@@ -12,15 +12,31 @@ oxproto = { path = "../oxproto" }
 
 [target.'cfg(windows)'.dependencies]
 windows = { version = "0.58", features = [
-    "Win32_Foundation",
-    "Win32_UI_WindowsAndMessaging",
+    # WinRT surface used by Windows.Graphics.Capture
+    "Foundation",
+    "Graphics",
+    "Graphics_Capture",
+    "Graphics_DirectX",
+    "Graphics_DirectX_Direct3D11",
+    # D3D11 device + staging-texture readback
+    "Win32_Graphics_Direct3D",
     "Win32_Graphics_Direct3D11",
     "Win32_Graphics_Dxgi",
     "Win32_Graphics_Dxgi_Common",
-    "Win32_Media_MediaFoundation",
-    "Graphics_Capture",
-    "Graphics_DirectX_Direct3D11",
+    # WinRT <-> Win32 interop (capture item from an HWND, D3D device bridging)
+    "Win32_System_WinRT",
+    "Win32_System_WinRT_Direct3D11",
     "Win32_System_WinRT_Graphics_Capture",
+    "Win32_System_Com",
+    # Window enumeration / geometry / DPI
+    "Win32_Foundation",
+    "Win32_UI_WindowsAndMessaging",
+    "Win32_UI_HiDpi",
+    "Win32_Graphics_Dwm",
+    # Input injection (P3)
+    "Win32_UI_Input_KeyboardAndMouse",
+    # Encoding (P5)
+    "Win32_Media_MediaFoundation",
 ] }
 
 [lints]
