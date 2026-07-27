@@ -75,6 +75,8 @@ name = "oxagent"
 version = "0.0.0"
 dependencies = [
  "oxproto",
+ "oxtransport",
+ "tokio",
  "windows",
 ]
 

@@ -9,6 +9,8 @@ repository.workspace = true
 
 [dependencies]
 oxproto = { path = "../oxproto" }
+oxtransport = { path = "../oxtransport" }
+tokio = { version = "1", features = ["io-util", "net", "rt-multi-thread", "macros", "sync", "time"] }
 
 [target.'cfg(windows)'.dependencies]
 windows = { version = "0.58", features = [
