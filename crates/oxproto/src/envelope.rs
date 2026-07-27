@@ -87,13 +87,11 @@ impl<'de> Decode<'de> for ChunkHeader {
         let channel = src.read_u16_le("chunk channel")?;
         let length = src.read_u32_le("chunk length")?;
 
-        if flags & !chunk_flags::KNOWN != 0 {
-            return Err(DecodeError::InvalidField {
-                context: "oxproto chunk",
-                field: "flags",
-                reason: "reserved flag bits must be zero",
-            });
-        }
+        // Reserved bits are *ignored*, not rejected: a sender must clear them, but a
+        // receiver that hard-failed on an unknown bit would break the day a future version
+        // starts using one — the opposite of the forward compatibility §17 promises. New
+        // behaviour is gated by feature negotiation, so ignoring an unnegotiated bit is safe.
+        let flags = flags & chunk_flags::KNOWN;
         if length as usize > MAX_CHUNK_PAYLOAD {
             return Err(DecodeError::InvalidLength {
                 context: "oxproto chunk",
@@ -108,6 +106,20 @@ impl<'de> Decode<'de> for ChunkHeader {
         })
     }
 }
+
+/// Most channels that may hold a partially reassembled message at once.
+///
+/// Reassembly state is allocated *before* authentication (the handshake itself arrives through
+/// it), so without this a peer could open partial fragment sequences on thousands of distinct
+/// channel ids and pin memory without ever presenting a token. Legitimate traffic needs only a
+/// handful: control, input, cursor, window, and one video channel per shared window.
+pub const MAX_PENDING_CHANNELS: usize = 64;
+
+/// Total bytes buffered across all partially reassembled messages.
+///
+/// The per-type limit bounds one message; this bounds the sum, so many channels each holding a
+/// legal-but-large partial message cannot add up to an unbounded total.
+pub const MAX_PENDING_BYTES: usize = 64 * 1024 * 1024;
 
 /// Maximum size of a fully reassembled message of this type (`OXPROTO.md` §16).
 ///
@@ -169,6 +181,7 @@ pub fn fragment(msg_type: u8, channel: u16, payload: &[u8]) -> EncodeResult<Vec<
 #[derive(Debug, Default)]
 pub struct Reassembler {
     pending: HashMap<u16, Pending>,
+    pending_bytes: usize,
 }
 
 #[derive(Debug)]
@@ -186,6 +199,11 @@ impl Reassembler {
     /// How many channels currently have a partial message.
     pub fn pending_channels(&self) -> usize {
         self.pending.len()
+    }
+
+    /// Bytes currently buffered across all partially reassembled messages.
+    pub fn pending_bytes(&self) -> usize {
+        self.pending_bytes
     }
 
     /// Feed one chunk. Returns the complete `(msg_type, payload)` once the final chunk of a
@@ -207,6 +225,20 @@ impl Reassembler {
             }));
         }
 
+        let is_new_channel = !self.pending.contains_key(&header.channel);
+        if is_new_channel && self.pending.len() >= MAX_PENDING_CHANNELS {
+            return Err(DecodeError::InvalidLength {
+                context: "oxproto reassembly",
+                reason: "too many channels with a partially reassembled message",
+            });
+        }
+        if self.pending_bytes + payload.len() > MAX_PENDING_BYTES {
+            return Err(DecodeError::InvalidLength {
+                context: "oxproto reassembly",
+                reason: "total buffered reassembly bytes exceeded",
+            });
+        }
+
         let entry = self
             .pending
             .entry(header.channel)
@@ -215,7 +247,8 @@ impl Reassembler {
                 buf: Vec::new(),
             });
         if entry.msg_type != header.msg_type {
-            self.pending.remove(&header.channel);
+            let dropped = self.pending.remove(&header.channel);
+            self.pending_bytes -= dropped.map(|p| p.buf.len()).unwrap_or(0);
             return Err(DecodeError::InvalidField {
                 context: "oxproto reassembly",
                 field: "type",
@@ -225,18 +258,26 @@ impl Reassembler {
 
         // Grow with the data that actually arrived — never to a declared size.
         if let Err(e) = check_len(header.msg_type, entry.buf.len() + payload.len()) {
-            self.pending.remove(&header.channel);
+            let dropped = self.pending.remove(&header.channel);
+            self.pending_bytes -= dropped.map(|p| p.buf.len()).unwrap_or(0);
             return Err(e);
         }
         entry.buf.extend_from_slice(payload);
+        self.pending_bytes += payload.len();
 
         if header.has_more() {
             return Ok(None);
         }
+        // NOTE: the wire format cannot distinguish "final chunk of the sequence in flight" from
+        // "a fresh unfragmented message that happens to share this channel and type" — a sender
+        // that abandons a fragment sequence and reuses the channel gets its leftover bytes
+        // spliced onto the next message. That is a sender bug, and it gains a hostile peer
+        // nothing it could not achieve by concatenating the bytes itself.
         let done = self
             .pending
             .remove(&header.channel)
             .expect("entry was just inserted or updated");
+        self.pending_bytes -= done.buf.len();
         Ok(Some(Message {
             msg_type: done.msg_type,
             payload: done.buf,
@@ -293,12 +334,74 @@ mod tests {
     }
 
     #[test]
-    fn rejects_reserved_flags() {
-        let bytes = [msg_type::PING, 0x80, 0, 0, 0, 0, 0, 0];
+    fn reserved_flags_are_ignored_not_rejected() {
+        // Forward compatibility: a future version may define one of these bits, and a current
+        // receiver must not hard-fail the connection over it.
+        let bytes = [
+            msg_type::PING,
+            0x80 | chunk_flags::FRAG_MORE,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+        ];
+        let h = decode::<ChunkHeader>(&bytes).unwrap();
+        assert_eq!(
+            h.flags,
+            chunk_flags::FRAG_MORE,
+            "unknown bits are masked off"
+        );
+        assert!(h.has_more());
+    }
+
+    #[test]
+    fn caps_the_number_of_pending_channels() {
+        // A peer must not be able to pin memory on thousands of channels before authenticating.
+        let mut r = Reassembler::new();
+        let chunk = vec![0u8; 16];
+        for ch in 0..MAX_PENDING_CHANNELS as u16 {
+            let h = ChunkHeader {
+                msg_type: msg_type::FRAME_DATA,
+                flags: chunk_flags::FRAG_MORE,
+                channel: channel::VIDEO_BASE + ch,
+                length: chunk.len() as u32,
+            };
+            assert!(r.push(&h, &chunk).unwrap().is_none());
+        }
+        assert_eq!(r.pending_channels(), MAX_PENDING_CHANNELS);
+
+        let overflow = ChunkHeader {
+            msg_type: msg_type::FRAME_DATA,
+            flags: chunk_flags::FRAG_MORE,
+            channel: 60000,
+            length: chunk.len() as u32,
+        };
         assert!(matches!(
-            decode::<ChunkHeader>(&bytes),
-            Err(DecodeError::InvalidField { field: "flags", .. })
+            r.push(&overflow, &chunk),
+            Err(DecodeError::InvalidLength { .. })
         ));
+    }
+
+    #[test]
+    fn pending_bytes_are_tracked_and_released() {
+        let mut r = Reassembler::new();
+        let body = vec![3u8; MAX_CHUNK_PAYLOAD + 1];
+        let frames = fragment(msg_type::FRAME_DATA, channel::VIDEO_BASE, &body).unwrap();
+
+        let (h0, b0) = parse(&frames[0]);
+        r.push(&h0, &b0).unwrap();
+        assert_eq!(r.pending_bytes(), MAX_CHUNK_PAYLOAD);
+
+        let (h1, b1) = parse(&frames[1]);
+        r.push(&h1, &b1).unwrap().expect("completes");
+        assert_eq!(
+            r.pending_bytes(),
+            0,
+            "a completed message releases its buffer"
+        );
+        assert_eq!(r.pending_channels(), 0);
     }
 
     #[test]

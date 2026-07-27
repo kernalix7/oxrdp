@@ -14,15 +14,6 @@
 
 use std::collections::VecDeque;
 
-/// What the capture loop should do with a freshly captured frame.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Pace {
-    /// Send it; the returned id must be carried in `FrameData.frame_id`.
-    Send(u64),
-    /// The budget is full and nothing could be discarded — skip this capture entirely.
-    Skip,
-}
-
 /// Tracks unacknowledged frames for one window and decides whether to send or skip.
 #[derive(Debug)]
 pub struct FrameBudget {
@@ -45,25 +36,23 @@ impl FrameBudget {
         }
     }
 
-    /// Decide what to do with a newly captured frame.
+    /// Admit a newly captured frame, returning the id to carry in `FrameData.frame_id`.
     ///
-    /// If the budget is full, the oldest unacknowledged frame is abandoned to make room — the
-    /// client will simply never see it, which is correct: by the time it could be delivered it
-    /// would already be stale.
-    pub fn on_captured(&mut self) -> Pace {
+    /// A capture is *always* admitted: when the budget is full the oldest unacknowledged frame
+    /// is abandoned to make room. That is the point — the newest content wins, because by the
+    /// time a displaced frame could be delivered its pixels are already wrong.
+    #[must_use]
+    pub fn on_captured(&mut self) -> u64 {
         if self.in_flight.len() >= self.max_in_flight {
             // Abandon the oldest in-flight frame rather than queueing behind it.
-            if self.in_flight.pop_front().is_some() {
-                self.dropped += 1;
-            } else {
-                return Pace::Skip;
-            }
+            self.in_flight.pop_front();
+            self.dropped += 1;
         }
         let id = self.next_frame_id;
         self.next_frame_id += 1;
         self.in_flight.push_back(id);
         self.sent += 1;
-        Pace::Send(id)
+        id
     }
 
     /// Record an acknowledgement. Acks are cumulative: acknowledging a frame also retires
@@ -117,8 +106,8 @@ mod tests {
     #[test]
     fn sends_while_there_is_headroom() {
         let mut b = FrameBudget::new(2);
-        assert_eq!(b.on_captured(), Pace::Send(1));
-        assert_eq!(b.on_captured(), Pace::Send(2));
+        assert_eq!(b.on_captured(), 1);
+        assert_eq!(b.on_captured(), 2);
         assert_eq!(b.in_flight(), 2);
         assert!(!b.has_headroom());
     }
@@ -126,10 +115,10 @@ mod tests {
     #[test]
     fn drops_the_oldest_instead_of_queueing() {
         let mut b = FrameBudget::new(2);
-        b.on_captured();
-        b.on_captured();
+        let _ = b.on_captured();
+        let _ = b.on_captured();
         // Budget is full: the third capture still sends, displacing frame 1.
-        assert_eq!(b.on_captured(), Pace::Send(3));
+        assert_eq!(b.on_captured(), 3);
         assert_eq!(b.in_flight(), 2, "in-flight never exceeds the budget");
         assert_eq!(b.dropped(), 1);
     }
@@ -138,7 +127,7 @@ mod tests {
     fn acks_are_cumulative() {
         let mut b = FrameBudget::new(4);
         for _ in 0..4 {
-            b.on_captured();
+            let _ = b.on_captured();
         }
         assert_eq!(b.in_flight(), 4);
         // Acking frame 3 retires 1, 2 and 3.
@@ -152,7 +141,7 @@ mod tests {
     #[test]
     fn a_stale_or_unknown_ack_is_harmless() {
         let mut b = FrameBudget::new(2);
-        b.on_captured();
+        let _ = b.on_captured();
         b.on_ack(999); // far in the future: retires everything known
         assert_eq!(b.in_flight(), 0);
         b.on_ack(1); // already retired
@@ -162,17 +151,11 @@ mod tests {
     #[test]
     fn frame_ids_stay_monotonic_across_drops_and_restarts() {
         let mut b = FrameBudget::new(1);
-        let Pace::Send(first) = b.on_captured() else {
-            panic!("expected a send")
-        };
-        let Pace::Send(second) = b.on_captured() else {
-            panic!("expected a send")
-        };
+        let first = b.on_captured();
+        let second = b.on_captured();
         assert!(second > first);
         b.restart();
-        let Pace::Send(third) = b.on_captured() else {
-            panic!("expected a send")
-        };
+        let third = b.on_captured();
         assert!(third > second, "ids must not rewind after a restart");
         assert_eq!(b.in_flight(), 1);
     }
@@ -183,7 +166,7 @@ mod tests {
         // keeps sending fresh frames and abandoning stale ones rather than growing a queue.
         let mut b = FrameBudget::new(2);
         for _ in 0..1000 {
-            assert!(matches!(b.on_captured(), Pace::Send(_)));
+            let _ = b.on_captured();
             assert!(b.in_flight() <= 2);
         }
         assert_eq!(b.dropped(), 998);
@@ -193,7 +176,7 @@ mod tests {
     #[test]
     fn zero_budget_is_clamped_to_one() {
         let mut b = FrameBudget::new(0);
-        assert!(matches!(b.on_captured(), Pace::Send(_)));
+        assert_eq!(b.on_captured(), 1);
         assert_eq!(b.in_flight(), 1);
     }
 }

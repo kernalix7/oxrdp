@@ -316,6 +316,16 @@ Exceeding a limit is `Error { TOO_LARGE }` followed by disconnect. Reassembly bu
 bounded by the same table, and a receiver must not pre-allocate the declared size — it grows
 the buffer as chunks actually arrive.
 
+Two further bounds apply to reassembly *state*, because it is allocated before authentication
+(the handshake itself arrives through it):
+
+- at most **64 channels** may hold a partially reassembled message at once — legitimate traffic
+  needs control, input, cursor, window and one video channel per shared window;
+- at most **64 MiB** may be buffered across all of them combined.
+
+Without these, a peer could open partial fragment sequences on thousands of channel ids and pin
+memory without ever presenting a token.
+
 ## 17. Versioning
 
 `PROTOCOL_VERSION` is the current version; `MIN_SUPPORTED_VERSION` the oldest accepted. The

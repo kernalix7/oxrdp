@@ -77,11 +77,24 @@ impl Default for AgentConfig {
     }
 }
 
+/// A path value that must not be empty — an empty one would otherwise surface much later as an
+/// opaque "file not found" instead of a config error pointing at the offending line.
+fn non_empty_path(value: &str, key: &'static str, line: usize) -> Result<PathBuf, ConfigError> {
+    if value.is_empty() {
+        return Err(ConfigError::Value { key, line });
+    }
+    Ok(PathBuf::from(value))
+}
+
 impl AgentConfig {
     /// Parse configuration from the text of a config file.
     pub fn parse(text: &str) -> Result<Self, ConfigError> {
         let mut cfg = AgentConfig::default();
         let mut token_path_seen = false;
+
+        // Windows editors routinely prepend a UTF-8 BOM. It is not Unicode whitespace, so
+        // without this the first key silently becomes an unknown key and its line is ignored.
+        let text = text.strip_prefix('\u{FEFF}').unwrap_or(text);
 
         for (idx, raw_line) in text.lines().enumerate() {
             let line_no = idx + 1;
@@ -99,9 +112,12 @@ impl AgentConfig {
             let value = value.trim();
 
             match key {
+                // A wildcard bind is refused outright, not merely defaulted away from: this
+                // agent shares screen content and injects input, so exposing it on every
+                // interface must be a deliberate act outside this config, never a typo in it.
                 "bind" => match value.parse::<SocketAddr>() {
-                    Ok(addr) => cfg.bind = addr,
-                    Err(_) => {
+                    Ok(addr) if !addr.ip().is_unspecified() => cfg.bind = addr,
+                    _ => {
                         return Err(ConfigError::Value {
                             key: "bind",
                             line: line_no,
@@ -109,11 +125,11 @@ impl AgentConfig {
                     }
                 },
                 "token_path" => {
-                    cfg.token_path = PathBuf::from(value);
+                    cfg.token_path = non_empty_path(value, "token_path", line_no)?;
                     token_path_seen = true;
                 }
-                "cert_path" => cfg.cert_path = PathBuf::from(value),
-                "key_path" => cfg.key_path = PathBuf::from(value),
+                "cert_path" => cfg.cert_path = non_empty_path(value, "cert_path", line_no)?,
+                "key_path" => cfg.key_path = non_empty_path(value, "key_path", line_no)?,
                 "target_fps" => match value.parse::<u16>() {
                     Ok(fps) if (1..=240).contains(&fps) => cfg.target_fps = fps,
                     _ => {
@@ -222,6 +238,40 @@ max_frames_in_flight = 3
                 line: 2
             })
         ));
+    }
+
+    #[test]
+    fn rejects_a_wildcard_bind() {
+        for addr in ["0.0.0.0:7644", "[::]:7644"] {
+            let text = format!("token_path = t\nbind = {addr}\n");
+            assert!(
+                matches!(
+                    AgentConfig::parse(&text),
+                    Err(ConfigError::Value {
+                        key: "bind",
+                        line: 2
+                    })
+                ),
+                "{addr} must be refused"
+            );
+        }
+    }
+
+    #[test]
+    fn rejects_empty_path_values() {
+        assert!(matches!(
+            AgentConfig::parse("token_path =\n"),
+            Err(ConfigError::Value {
+                key: "token_path",
+                line: 1
+            })
+        ));
+    }
+
+    #[test]
+    fn tolerates_a_utf8_bom() {
+        let cfg = AgentConfig::parse("\u{FEFF}token_path = t\n").unwrap();
+        assert_eq!(cfg.token_path, PathBuf::from("t"));
     }
 
     #[test]
