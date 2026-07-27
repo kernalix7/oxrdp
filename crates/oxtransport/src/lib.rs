@@ -1,9 +1,10 @@
-//! `oxtransport` — async framing for the oxproto protocol over tokio streams.
+//! `oxtransport` — async chunk IO for the oxproto protocol over tokio streams.
 //!
-//! Reads/writes whole `oxproto::Message` envelopes on any `AsyncRead`/`AsyncWrite`. Used by
-//! both the Linux client and the Windows agent. TCP today; QUIC is planned.
+//! Moves oxproto chunks on any `AsyncRead`/`AsyncWrite` and reassembles them per channel.
+//! Used by both the Linux client and the Windows agent. TCP today; QUIC planned, where each
+//! oxproto channel becomes an independent stream.
 #![forbid(unsafe_code)]
 
 pub mod stream;
 
-pub use stream::{read_message_bytes, write_message};
+pub use stream::{read_message, read_reassembled, write_message, write_raw};

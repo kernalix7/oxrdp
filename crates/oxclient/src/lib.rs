@@ -1,10 +1,9 @@
 //! `oxclient` — the Linux client session for the oxproto protocol.
 //!
-//! Connects to the Windows `oxagent`, performs the ClientHello/ServerHello handshake, and
-//! exposes received window-lifecycle and frame events for the display/render layer to
-//! consume.
+//! Connects to the Windows `oxagent`, performs the handshake, answers protocol housekeeping,
+//! and surfaces window-lifecycle, frame and cursor events for the display/render layer.
 #![forbid(unsafe_code)]
 
 pub mod session;
 
-pub use session::{ClientEvent, ClientSession};
+pub use session::{ClientEvent, ClientSession, SessionConfig};
