@@ -2,6 +2,15 @@
 
 **English** | [한국어](RELEASE_TESTING.ko.md)
 
+> [!IMPORTANT]
+> **Superseded (2026-07-02).** This document describes the original design, in which oxrdp was
+> an RDP *client*. The project has since pivoted to **replacing RDP** with a custom low-latency
+> protocol (a Windows guest agent streaming individual app windows to a Linux client). Current
+> state: [`docs/HANDOFF.md`](HANDOFF.md) · protocol: [`docs/design/OXPROTO.md`](design/OXPROTO.md)
+> · gaps: [`docs/design/AUDIT-2026-07.md`](design/AUDIT-2026-07.md). Kept for the parts that
+> still apply (the client shells, the codec base) and for history.
+
+
 > **Status: planned.** oxrdp is pre-alpha; there are no releases to test yet. This page
 > will hold the per-release smoke + verification checklist once the client functions. The
 > outline below records the intent so the checklist can be filled in as capabilities land.

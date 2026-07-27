@@ -8,8 +8,8 @@
 |---------|-----------|
 | Latest  | Yes       |
 
-oxrdp is pre-alpha; only the latest `main` is supported. Once releases begin, this table
-will track supported release lines.
+oxrdp is pre-alpha; only the latest `main` is supported. Once releases begin, this table will
+track supported release lines.
 
 ## Reporting a Vulnerability
 
@@ -21,16 +21,12 @@ Please report security vulnerabilities through GitHub Security Advisories:
 
 ### What to Include
 
-- **Description**: A clear description of the vulnerability
-- **Steps to Reproduce**: Detailed steps to reproduce the issue
-- **Impact**: The potential impact of the vulnerability
-- **Affected Components**: Which crate(s) or module(s) are affected
-- **Environment**:
-  - Operating System and version
-  - oxrdp version / commit
-  - Display server (X11 / Wayland) and desktop environment
-  - GPU / VA-API driver (for decode-path issues)
-  - The RDP server / Windows version on the other end
+- **Description** of the vulnerability and its impact
+- **Steps to reproduce**
+- **Affected component**: the Windows agent (`oxagent`), the Linux client (`oxclient`), the
+  protocol (`oxproto` / `oxtransport`), or the shelved RDP client
+- **Environment**: OS and version on both ends, oxrdp version/commit, display server
+  (X11/Wayland), GPU / VA-API driver, Windows build
 
 ## Response Timeline
 
@@ -40,56 +36,75 @@ Please report security vulnerabilities through GitHub Security Advisories:
 | Assessment | Within 7 days |
 | Fix | Within 30 days |
 
-## Threat Model
+## Threat model
 
-oxrdp is an RDP **client**. The server it connects to is, from the client's point of
-view, **untrusted network input**. Every byte that crosses the wire — connection-sequence
-PDUs, capability sets, virtual-channel data, GFX/RemoteFX/bitmap codec bitstreams, RAIL
-window metadata, clipboard and drive-redirection payloads — is parsed by oxrdp and must be
-treated as potentially hostile, even when the server is "your own" Windows guest (a guest
-can be compromised through ordinary Windows-side activity).
+oxrdp streams individual Windows application windows from a Windows guest **agent** to a Linux
+**client** over a custom protocol. The security posture is dominated by one fact:
 
-Memory safety is the core defense: the protocol stack, RAIL state machine, and codec
-framing are written in safe Rust, so a malformed PDU yields a typed parse error, not
-memory corruption.
+> **The agent is a server that shares screen content and injects synthetic input into a
+> logged-in interactive Windows desktop.** Anyone who can reach it and authenticate can see and
+> control that session.
+
+This inverts the posture of the project's earlier RDP-client design, where the remote end was
+the powerful party and the client only had to defend its parser. Both directions now matter:
+
+1. **The agent must not serve an unauthenticated peer.** Screen capture plus input injection is
+   equivalent to remote control of the user's Windows session.
+2. **Both ends parse untrusted input.** The agent decodes whatever reaches its socket — before
+   authentication for the handshake message — and the client decodes whatever a (possibly
+   compromised) guest sends.
+3. **Loopback is not a trust boundary.** "It only listens on 127.0.0.1" does not exclude other
+   local users or processes on the host.
+
+### Required controls
+
+These are protocol-level requirements, specified in
+[`docs/design/OXPROTO.md`](docs/design/OXPROTO.md) §2 and §7:
+
+- **Mandatory transport encryption.** The agent presents a self-signed certificate; the client
+  pins its SPKI hash, provisioned out of band by whatever launches both ends. Trust-on-first-use
+  *without* pinning is not acceptable for a peer that can inject input.
+- **Authentication before anything else.** `ClientHello` carries a shared token, compared in
+  constant time. No other message type is processed until it passes, and a failed handshake
+  allocates no per-session state.
+- **Bind explicitly.** The agent binds a specific interface, never `0.0.0.0` by default.
+- **Bounded parsing.** Every message type has a maximum size, enforced from the chunk header
+  before any buffer grows; reassembly buffers grow with arriving data, never to a declared
+  length. See `crates/oxproto/src/envelope.rs`.
+
+### Status
+
+Implementation status is tracked honestly here rather than implied:
+
+- Protocol-level auth token and size limits: **implemented** in `oxproto`.
+- TLS for the new protocol, certificate pinning, and constant-time token comparison in the
+  agent: **not yet wired** — the agent has no listener yet. These must land with the listener
+  (roadmap P1d), not after it.
+- The `TofuVerifier` in `oxrdp-crypto` accepts any certificate and belongs to the shelved RDP
+  client path. It must not be reused for the agent connection as-is.
 
 ## Scope
 
-In scope for security reports:
+In scope:
 
-- **Memory-safety defects** in PDU / channel / RAIL parsing reachable from server input
-  (panics that should be recoverable errors, any `unsafe` that can be driven to UB).
-- **Codec-decode safety** — out-of-bounds or UB in the H.264 / RemoteFX / bitmap decode
-  paths when fed a hostile bitstream (including the FFI boundary to `openh264` / VA-API).
-- **TLS / certificate validation bypass** — accepting a server identity that the
-  configured trust policy (TOFU / pinned / system-CA) should reject.
-- **Credential exposure** — passwords or tokens written to logs, disk, argv, or env in
-  a way that leaks them.
-- **Command / argument injection** in `oxrdp-cli` or the winpodx IPC control channel
-  (server- or guest-derived strings reaching a shell or argv).
-- **Path traversal** in drive redirection (`\\tsclient`) — a server escaping the shared
-  root to read or write arbitrary host paths.
+- **Missing or bypassable authentication/encryption** on the agent's listener.
+- **Memory-safety or panic-on-input defects** in `oxproto` / `oxtransport` decoding (the crates
+  are `#![forbid(unsafe_code)]`; a panic reachable from peer input is still a denial of service).
+- **Resource exhaustion** reachable pre-authentication (unbounded allocation, unbounded
+  reassembly, connection floods).
+- **Unsafe FFI defects** in `oxagent`'s Windows COM/WGC/Media Foundation code.
+- **Input-injection escalation**: an authenticated client reaching windows or privileges beyond
+  what was shared.
+- **Path traversal or arbitrary write** in any future file-transfer/clipboard channel.
+- **Credential or token exposure** in logs, argv, or on disk.
 
-## Out of Scope
+Out of scope:
 
-- Attacks requiring physical access to the machine.
-- Social engineering attacks.
-- Vulnerabilities in third-party dependencies (report these to the upstream project;
-  we will bump the pin once upstream ships a fix).
-- Denial of service from a server you control deliberately misbehaving (resource caps
-  are hardening, not a trust boundary, in the winpodx single-tenant model).
-
-## Security Best Practices
-
-- **Safe-Rust core**: no `unsafe` in the protocol / RAIL / channel logic without a
-  reviewed `// SAFETY:` justification; FFI to codec libraries is isolated and bounds-checked.
-- **Untrusted-server posture**: all server input is size-capped and validated before it
-  can allocate, write to disk, or be interpolated into a command line.
-- **No secrets in code or git**: credentials, tokens, and keys are never committed.
-- **Explicit certificate trust**: TLS certificate handling is explicit (TOFU / pin /
-  system trust), never silently accept-all in default builds.
-- **Argv-only subprocess**: no `shell=true`-style invocation of server- or guest-derived
-  strings.
+- Attacks requiring physical access.
+- Social engineering.
+- Vulnerabilities in third-party dependencies (report upstream; we will bump the pin).
+- A compromised Windows guest attacking its own user — the guest is trusted to the extent that
+  the user runs applications inside it. The client still validates everything the guest sends.
 
 ## Attribution
 

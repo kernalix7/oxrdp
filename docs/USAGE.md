@@ -2,6 +2,15 @@
 
 **English** | [한국어](USAGE.ko.md)
 
+> [!IMPORTANT]
+> **Superseded (2026-07-02).** This document describes the original design, in which oxrdp was
+> an RDP *client*. The project has since pivoted to **replacing RDP** with a custom low-latency
+> protocol (a Windows guest agent streaming individual app windows to a Linux client). Current
+> state: [`docs/HANDOFF.md`](HANDOFF.md) · protocol: [`docs/design/OXPROTO.md`](design/OXPROTO.md)
+> · gaps: [`docs/design/AUDIT-2026-07.md`](design/AUDIT-2026-07.md). Kept for the parts that
+> still apply (the client shells, the codec base) and for history.
+
+
 > **Status: planned — not yet usable.** oxrdp is pre-alpha; the client does not run yet.
 > This page is a placeholder. It will document the `oxrdp-cli` flag surface and the
 > library `Session` API once they exist and work. Until then it deliberately describes no

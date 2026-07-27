@@ -3,10 +3,8 @@
 Snapshot for continuing this project in another tool (e.g. opencode). Everything needed to
 resume is here; the full history is in git (`github.com/kernalix7/oxrdp`, branch `main`).
 
-Last state: **P1 in progress** — see [Roadmap & next steps](#roadmap--next-steps).
-Latest commit at handoff: `5e1cd91` (+ this doc and the `oxclient`/`dev` additions).
-
----
+Last state: **P1 in progress — protocol v1 complete, agent captures, client handshakes.**
+See [Roadmap & next steps](#8-roadmap--next-steps).
 
 ## 1. TL;DR
 
@@ -18,8 +16,12 @@ Latest commit at handoff: `5e1cd91` (+ this doc and the `oxclient`/`dev` additio
 - The earlier **RDP-client** stack was built and **validated end-to-end against a real Windows
   guest** (through MCS channel join) before the pivot. It is **shelved** but kept in git; its
   client shells + codec base are reused.
-- Build is green: `cargo test --workspace` = **90 tests**, `cargo clippy --workspace -- -D warnings`
-  clean, and the Windows agent **cross-compiles from Linux** to `x86_64-pc-windows-gnu`.
+- Build is green: `cargo test --workspace` = **122 tests**, `cargo clippy --workspace -- -D warnings`
+  clean on Linux *and* on the Windows target, and the agent **cross-compiles from Linux** to
+  `x86_64-pc-windows-gnu` (also enforced in CI).
+- A multi-agent **gap audit** (56 verified findings) drove a protocol redesign and a round of
+  hardening. Read [`design/AUDIT-2026-07.md`](design/AUDIT-2026-07.md) before planning work —
+  it is the most useful document in the repo for deciding what to do next.
 
 ## 2. Target architecture (post-pivot)
 
@@ -47,43 +49,51 @@ justified by latency + full control.
   links. TCP is wired first (loopback VM has near-zero net latency).
 - The bounds-checked codec (`Decode`/`Encode` over `ReadCursor`/`WriteCursor`, in `oxrdp-pdu`) is
   reused by the new protocol crate `oxproto`.
+- **Agent runs in the interactive user session**, started by a logon Scheduled Task — *not* as a
+  service. Session 0 cannot capture windows or inject input. Full reasoning and deployment plan:
+  [`design/agent-runtime.md`](design/agent-runtime.md).
+- **Security is part of the protocol, not a later layer**: mandatory TLS, a pinned agent
+  certificate, and an auth token in `ClientHello`. The agent must not open a listener before
+  these are wired — see [`../SECURITY.md`](../SECURITY.md).
 
 ## 4. Crate map (`crates/`)
 
 Active (new direction):
-- `oxproto` — **custom protocol wire messages** (sans-io). `Message` envelope (type u8 + len u32 LE
-  + payload) with `ClientHello / ServerHello / WindowCreated / WindowClosed / FrameData /
-  PointerEvent`. Re-exports `decode`/`encode_vec`. Built on `oxrdp-pdu`'s codec. ✅ 7 tests.
-- `oxtransport` — async framing of `oxproto` messages over any tokio stream
-  (`read_message_bytes` / `write_message`, 64 MiB guard). ✅ 2 tests.
-- `oxagent` — **Windows guest agent** binary. Windows deps are `cfg(windows)`-gated so the
-  workspace builds it as a stub on Linux (CI green) and it **cross-compiles** to windows-gnu.
-  Done: Win32 window enumeration (`EnumWindows` → handle/title/geometry, `src/win.rs`). ⏳ WGC
-  capture + encode + serve next.
-- `oxclient` — **Linux client session** (in progress). `session.rs` currently defines
-  `ClientEvent` + a `ClientSession` params struct; the `connect`/`next_event` loop is TODO (P2).
+- `oxproto` — the protocol: chunk framing (`envelope`), the message registry and all bodies
+  (`message/{control,window,input}.rs`), wire primitives (`wire`). Implements
+  [`design/OXPROTO.md`](design/OXPROTO.md). ✅ 26 unit + 6 robustness tests, plus `fuzz/`.
+- `oxtransport` — async chunk IO over any tokio stream; delegates reassembly to
+  `oxproto::Reassembler`. ✅ 5 tests including an interleaved-channel head-of-line test.
+- `oxclient` — the Linux client session: handshake, feature negotiation, ping/pong housekeeping,
+  and a `ClientEvent` stream. ✅ 3 tests. Next: drive a display backend with it.
+- `oxagent` — the Windows guest agent. Window enumeration (cloaked/tool/child/shell filtered, DWM
+  extended frame bounds) and WGC per-window capture to BGRA. Cross-compiles; **no listener yet**.
 
-Reused shells (from the RDP era, carry over): `oxrdp-crypto` (TLS), `oxrdp-io` (tokio transport),
-`oxrdp-render` (wgpu + VA-API decode — still a skeleton), `oxrdp-display` (X11/Wayland window
-mapping — skeleton), `oxrdp-input` (skeleton).
+Reused shells (still skeletons): `oxrdp-render` (wgpu + VA-API), `oxrdp-display` (X11/Wayland),
+`oxrdp-input`. `oxrdp-crypto` holds the old TLS glue — its `TofuVerifier` accepts any certificate
+and **must not** be reused for the agent connection as-is.
 
-Shelved (RDP-specific, kept in git, not on the new path): `oxrdp-pdu`'s RDP PDUs (nego, mcs, gcc,
-connect_initial/response, capability, finalize, …) — **but its `codec`/`cursor`/`error` are the
-reused base**; `oxrdp-core` (RDP connection state machine); `oxrdp-cli` + `oxrdp-io::connect`
-(the RDP client driver, which reached MCS channel join against real Windows).
+Shelved (RDP-specific, kept in git): `oxrdp-pdu`'s RDP PDUs — **but its `codec`/`cursor`/`error`
+are the reused base for `oxproto`** — plus `oxrdp-core`, `oxrdp-io`, `oxrdp-cli` (the RDP client
+driver that reached MCS channel join against real Windows).
 
 ## 5. Build, test, run
 
 ```bash
 # Linux workspace (agent builds as a stub here)
 cargo build --workspace
-cargo test  --workspace                       # 90 tests
+cargo test  --workspace                       # 122 tests
 cargo clippy --workspace --all-targets -- -D warnings
 cargo fmt --all -- --check
 
 # Cross-compile the Windows agent from Linux (mingw-w64 is installed; rustup target added)
 cargo build -p oxagent --target x86_64-pc-windows-gnu
 #   → target/x86_64-pc-windows-gnu/debug/oxagent.exe   (PE32+, run inside the Windows guest)
+
+cargo clippy -p oxagent --target x86_64-pc-windows-gnu --all-targets -- -D warnings
+
+# Fuzz the protocol decoder (needs nightly; fuzz/ is its own workspace)
+cargo +nightly fuzz run message
 
 # The shelved RDP client (still works, reaches MCS channel join):
 cargo run -p oxrdp-cli -- 127.0.0.1:3390 WPX-User    # OXRDP_DEBUG=1 for phase/hex logging
@@ -123,28 +133,38 @@ model; not used in favor of the leaner `oxgen.sh` REST path.
 ## 8. Roadmap & next steps
 
 ```
-✅ P0  oxproto — protocol messages
-✅ P1a cross-compile pipeline + oxagent skeleton (windows-gnu)
-✅ P1b Win32 window enumeration + oxtransport (async message framing)
-▶  P1c AGENT capture: WGC capture ONE window (D3D11 device → GraphicsCaptureItem from HWND via
-        IGraphicsCaptureItemInterop::CreateForWindow → Direct3D11CaptureFramePool → copy to a
-        CPU-readable staging texture → BGRA bytes). Author directly; cross-compile to validate.
-   P1d AGENT serve: TcpListener → oxproto handshake → send WindowCreated + FrameData(RAW_BGRA)
-        for the captured window, using oxtransport. (Cross-platform; can go to a model.)
-   P2  CLIENT session (oxclient): implement ClientSession over a tokio stream using oxtransport —
-        connect → ClientHello → ServerHello → next_event() → ClientEvent. (Good model task; test
-        with a tokio duplex + canned server messages, like the old connector tests.)
-   P2b CLIENT present: map WindowOpened → a native Linux window (oxrdp-display) and blit
-        FrameData(RAW_BGRA) via oxrdp-render (wgpu). First end-to-end PIXELS.
-   P3  Input round-trip (Linux input → PointerEvent/KeyEvent → agent injects via SendInput).
-   P4  Multi-window: enumerate + per-window capture + window events + z-order sync.
-   P5  Media Foundation H.264 (replace RAW_BGRA); QUIC transport (quinn); clipboard/audio.
+✅ P0  oxproto v1 — framing, channels, 25 message types, size limits, robustness tests, fuzz targets
+✅ P1a cross-compile pipeline + oxagent skeleton (+ CI job that builds/lints it)
+✅ P1b window enumeration (filtered, DWM frame bounds, DPI-aware) + oxtransport
+✅ P1c agent capture — WGC per-window BGRA frames (cross-compile-validated, not yet run in a guest)
+✅ P2a client session — handshake, features, ping/pong, ClientEvent stream
+
+▶  P1d AGENT SERVE. Give oxagent a listener and stream:
+      1. TLS + auth first (SECURITY.md); bind an explicit interface, never 0.0.0.0.
+      2. TcpListener → accept → ClientHello (constant-time token compare) → ServerHello.
+      3. Window-event thread → WindowOpened/Closed/Geometry/Title on channel 3.
+      4. Capture thread per window → FrameData(RAW_BGRA) on its video channel, through a
+         *bounded* channel so a slow network back-pressures capture.
+      5. Honour FrameAck: at most 2 unacked frames per window; drop stale rather than queue.
+      Deps to add: tokio, oxtransport, rustls (server side), and the runtime model in
+      design/agent-runtime.md.
+
+   P2b CLIENT PRESENT. WindowOpened → a native window (oxrdp-display, X11 first),
+      FrameData(RAW_BGRA) → wgpu texture → present (oxrdp-render). **First end-to-end pixels.**
+      Bring-up target is 800x600 @30fps (~460 Mbit/s); RAW_BGRA does not scale past that.
+
+   P3  Input round-trip: Linux input → PointerEvent/KeyEvent/TextInput → SendInput on the guest.
+       Also WindowControl (close/resize/activate), or the native windows stay puppets.
+   P4  Multi-window: SetWinEventHook instead of polling, z-order, icons, app identity → WM_CLASS.
+   P5  Media Foundation H.264 (replace RAW_BGRA), QUIC transport, clipboard/audio.
+   P6  Latency harness: the protocol already carries captured_us/encoded_us and FrameAck —
+       build the measurement rig and publish numbers against FreeRDP. This is the claim the
+       whole pivot rests on; it must be measured, not asserted.
 ```
 
-**Immediate next action (P1c):** write `crates/oxagent/src/win/capture.rs` (or `capture.rs`) that,
-given an HWND from `enumerate_windows()`, captures a single BGRA frame via WGC. Cross-compile
-after each change. Then P1d serve + P2 client to get first pixels end-to-end (run `oxagent.exe` in
-the winpodx guest, `oxclient` on Linux).
+**Before starting P1d**, skim `design/AUDIT-2026-07.md` §agent-capture: it lists the WGC and
+session pitfalls (elevated windows, lock screen, WARP fallback, frame-pool recreation) that will
+otherwise be discovered at runtime in the guest.
 
 ## 9. Key technical learnings (don't relearn these)
 
@@ -162,6 +182,18 @@ the winpodx guest, `oxclient` on Linux).
   before `Duca` is the octet-string length. `connectPDU_len = userData_len + 14`.
 - **Codec reuse:** `oxrdp-pdu`'s `Decode`/`Encode` + bounds-checked `ReadCursor`/`WriteCursor` +
   typed errors are protocol-agnostic — `oxproto` builds directly on them.
+- **windows-rs 0.58 specifics** (cost real time to find): the pixel format constant is
+  `DirectXPixelFormat::B8G8R8A8UIntNormalizedSrgb`, *not* `…UnormSrgb`;
+  `IGraphicsCaptureItemInterop` is a COM struct, so obtain it with
+  `windows::core::factory::<GraphicsCaptureItem, _>()` and pass it by reference rather than
+  using it as a trait bound; `HWND` is constructed from `*mut c_void`.
+- **The feature list in `oxagent/Cargo.toml` is load-bearing.** WGC needs `Foundation`,
+  `Graphics_Capture`, `Graphics_DirectX_Direct3D11`, `Win32_Graphics_Direct3D`,
+  `Win32_System_WinRT_Direct3D11`, `Win32_System_WinRT_Graphics_Capture` and
+  `Win32_System_Com` together; a missing one fails as a confusing "not found" rather than a
+  missing-feature error.
+- **`Direct3D11CaptureFramePool::CreateFreeThreaded`** avoids needing a `DispatcherQueue` and a
+  message pump on the capture thread — use it, not `Create`.
 
 ## 10. Git / GitHub
 

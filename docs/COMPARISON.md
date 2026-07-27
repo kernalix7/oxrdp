@@ -2,6 +2,15 @@
 
 **English** | [한국어](COMPARISON.ko.md)
 
+> [!IMPORTANT]
+> **Superseded (2026-07-02).** This document describes the original design, in which oxrdp was
+> an RDP *client*. The project has since pivoted to **replacing RDP** with a custom low-latency
+> protocol (a Windows guest agent streaming individual app windows to a Linux client). Current
+> state: [`docs/HANDOFF.md`](HANDOFF.md) · protocol: [`docs/design/OXPROTO.md`](design/OXPROTO.md)
+> · gaps: [`docs/design/AUDIT-2026-07.md`](design/AUDIT-2026-07.md). Kept for the parts that
+> still apply (the client shells, the codec base) and for history.
+
+
 > **Status: pre-alpha.** This compares oxrdp's *intended* design against existing options.
 > oxrdp does not yet function; treat this as a statement of goals, not benchmarks.
 

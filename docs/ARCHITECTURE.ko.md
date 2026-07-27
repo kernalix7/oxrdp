@@ -2,6 +2,14 @@
 
 [English](ARCHITECTURE.md) | **한국어**
 
+> [!IMPORTANT]
+> **대체됨 (2026-07-02).** 이 문서는 oxrdp가 RDP *클라이언트*였던 최초 설계를 기술합니다. 이후
+> 프로젝트는 **RDP 자체를 대체**하는 방향(Windows 게스트 에이전트가 개별 앱 창을 Linux
+> 클라이언트로 스트리밍하는 커스텀 저지연 프로토콜)으로 전환했습니다. 현재 상태:
+> [`docs/HANDOFF.md`](HANDOFF.md) · 프로토콜: [`docs/design/OXPROTO.md`](design/OXPROTO.md) ·
+> 갭 감사: [`docs/design/AUDIT-2026-07.md`](design/AUDIT-2026-07.md).
+
+
 이 문서는 oxrdp의 엔지니어링 형태를 기록합니다: sans-io 코어, 크레이트 워크스페이스,
 디스플레이 백엔드 추상화, v0의 "드롭인 동등성" 기준을 정의하는 FreeRDP 동등성 매트릭스,
 그리고 마일스톤 로드맵.

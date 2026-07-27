@@ -2,6 +2,14 @@
 
 [English](COMPARISON.md) | **한국어**
 
+> [!IMPORTANT]
+> **대체됨 (2026-07-02).** 이 문서는 oxrdp가 RDP *클라이언트*였던 최초 설계를 기술합니다. 이후
+> 프로젝트는 **RDP 자체를 대체**하는 방향(Windows 게스트 에이전트가 개별 앱 창을 Linux
+> 클라이언트로 스트리밍하는 커스텀 저지연 프로토콜)으로 전환했습니다. 현재 상태:
+> [`docs/HANDOFF.md`](HANDOFF.md) · 프로토콜: [`docs/design/OXPROTO.md`](design/OXPROTO.md) ·
+> 갭 감사: [`docs/design/AUDIT-2026-07.md`](design/AUDIT-2026-07.md).
+
+
 > **상태: 프리알파(pre-alpha).** 이 문서는 oxrdp의 *의도된* 설계를 기존 선택지와 비교합니다.
 > oxrdp는 아직 동작하지 않습니다; 이를 벤치마크가 아니라 목표의 진술로 받아들이십시오.
 

@@ -30,6 +30,31 @@ HW/SW encode, QUIC+TCP transport.
   enumeration. The Windows deps are `cfg(windows)`-gated, so the workspace still builds
   `oxagent` as a stub on Linux and CI stays green — the agent is developed and built entirely
   from the Linux host, no in-guest toolchain needed.
+- **Gap audit + hardening.** A multi-agent audit (56 adversarially verified findings,
+  `docs/design/AUDIT-2026-07.md`) drove: CI that cross-compiles and lints the Windows agent,
+  a blocking `cargo audit` plus `cargo deny` for licenses/bans/sources, a pinned toolchain, and
+  corrections to claims the docs asserted but had not validated (the VA-API → wgpu DMA-BUF
+  import is now marked unvalidated).
+- **P1c — WGC per-window capture.** `oxagent` captures a single window to BGRA through a D3D11
+  device, a free-threaded frame pool and a reused staging texture, with row-pitch-aware readback
+  and frame-pool recreation on resize. Window enumeration now filters cloaked / tool / child /
+  shell windows and reports DWM extended frame bounds, and the process is per-monitor DPI aware.
+- **oxproto v1 — the protocol redesign.** Specified in `docs/design/OXPROTO.md` and implemented:
+  an 8-byte chunk envelope with fragmentation and per-channel reassembly (so a keyframe cannot
+  head-of-line-block input or control), authoritative lengths, per-type size limits enforced
+  before allocation, an authenticated handshake with version range and feature negotiation, and
+  the message set the first design lacked — keyboard/text/modifier input, bidirectional window
+  control, cursor streaming, frame acknowledgement and quality hints, per-stage timestamps for
+  latency measurement, display layout with fractional scaling, app identity and icons, errors,
+  close and ping/pong. Unknown message types are skipped rather than fatal.
+- **P2a — client session.** `oxclient` performs the handshake, negotiates features, answers
+  ping/pong transparently, and yields a `ClientEvent` stream.
+- **Robustness.** `oxproto` gains deterministic smoke-fuzz tests (arbitrary bodies and chunk
+  headers never panic; truncation always errors; a declared length cannot make the receiver
+  allocate) and cargo-fuzz targets under `fuzz/`. `SECURITY.md` is rewritten for the inverted
+  post-pivot threat model — the agent is now a server that shares screen content and injects
+  input — and `docs/design/agent-runtime.md` settles the guest session and deployment model.
+  122 tests.
 - **P1 — window enumeration + async transport.** `oxagent` enumerates visible top-level
   windows (`EnumWindows` → handle / title / geometry), cross-compile-validated to windows-gnu.
   `oxtransport` frames oxproto messages over any tokio stream (`read_message_bytes` /

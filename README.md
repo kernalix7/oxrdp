@@ -6,56 +6,104 @@
 [![status](https://img.shields.io/badge/status-pre--alpha-orange?style=flat-square)](#status)
 [![language](https://img.shields.io/badge/rust-stable-DEA584?style=flat-square&logo=rust&logoColor=white)](https://www.rust-lang.org/)
 
-**A memory-safe RDP client written in Rust, built for seamless integration of Windows applications into the Linux desktop.**
+**A memory-safe, low-latency remote-application system in Rust: individual Windows applications
+appear as native Linux windows.**
 
-oxrdp connects to a Windows RDP server and renders remote apps as native Linux windows via RAIL / RemoteApp — real titles, real `WM_CLASS`, pinnable and alt-tabbable — prioritizing Rust's safety guarantees, minimal resource usage, and high performance.
+A **Windows guest agent** captures each application window and streams it over a purpose-built
+protocol to a **Linux client**, which maps every remote window to a real native window — correct
+title, `WM_CLASS`, icon, pinnable, alt-tabbable. Not a desktop in a box: one app, one window.
 
-oxrdp is the RDP engine behind [winpodx](../00G_winpodx), split out as a standalone project. It exists to replace winpodx's current dependency on FreeRDP 3.x and to fix the limitations that dependency imposes.
+oxrdp is the engine behind [winpodx](https://github.com/kernalix7/winpodx), split out as a
+standalone project.
 
 ---
 
-## Why oxrdp exists
+## Why it exists
 
-winpodx today shells out to `xfreerdp3` (FreeRDP 3.x) to surface Windows apps as native Linux windows through RemoteApp / RAIL. That works, but the FreeRDP dependency is the source of recurring pain:
+winpodx surfaces Windows apps as Linux windows through FreeRDP's RemoteApp. That works, but the
+RDP path imposes limits that cannot be fixed from the client side:
 
-- **RAIL window-mapping correctness** — z-order, missing windows, popups / drop-downs / tooltips, taskbar and `WM_CLASS` mapping bugs that vary by FreeRDP point-release (e.g. broken RemoteApp windows below 3.6.0).
-- **Performance & input latency** — GFX H.264 / AVC444 negotiation, bandwidth, frame rate, and round-trip input lag.
-- **Memory safety & stability** — a large C codebase in the critical path; crashes and undefined behavior land on the user.
-- **Feature gaps & friction** — clipboard, audio in/out, multi-monitor strategy, HiDPI scaling, and device redirection each carry FreeRDP-version-specific quirks.
+- **Latency is structural.** RDP is bandwidth-optimized and TCP-first: head-of-line blocking on
+  loss, buffering that trades latency for efficiency, and general-purpose overhead a
+  purpose-built app-streaming protocol does not have to pay.
+- **Seamless-window correctness is upstream's.** RAIL z-order, popups, taskbar and `WM_CLASS`
+  mapping bugs vary by FreeRDP point-release.
+- **A large C codebase sits in the critical path**, so crashes and undefined behavior land on
+  the user.
 
-oxrdp's thesis: **own the protocol stack in safe Rust**, designed from day one around RAIL and native Linux window integration, so these become engineering decisions we control instead of upstream quirks we work around.
+So oxrdp replaces the protocol itself — the same move RustDesk and Moonlight make — rather than
+writing a better client for someone else's.
 
-## Project decisions (locked)
+> **History.** oxrdp began as a from-scratch Rust *RDP client*; that stack was built and
+> validated end to end against a real Windows host (through MCS channel join) before the project
+> pivoted on 2026-07-02. It is shelved but kept in git, and its client shells and
+> bounds-checked codec are reused. Pre-pivot documents carry a "Superseded" banner.
+
+## How it works
+
+```
+[Linux] oxclient  ──oxproto (TCP+TLS now, QUIC planned)──▶  [Windows guest] oxagent
+  · decode (VA-API / wgpu)                                    · enumerate app windows (Win32)
+  · one native X11/Wayland window per remote window           · capture per window (WGC)
+  · capture input, send it back                               · encode (Media Foundation / SW)
+                                                              · inject input
+```
+
+## Design decisions
 
 | Decision | Choice | Rationale |
 | --- | --- | --- |
-| **Protocol stack** | Implemented from scratch in Rust | Full control, zero FreeRDP dependency, true memory-safe core. |
-| **Low-level building blocks** | Reuse vetted crates | TLS via `rustls`+`ring`; NLA/CredSSP via `sspi-rs` (deferred); video decode via `openh264`/`dav1d` bindings; async IO via `tokio`. "From scratch" = the RDP protocol, RAIL, and rendering — not crypto/codec primitives. |
-| **Core architecture** | sans-io state machine | Pure, IO-free protocol core (à la IronRDP) with pluggable IO / render / input shells. Buys testability, fuzzing, and X11+Wayland reuse. |
-| **Display backend** | X11 + Wayland behind one abstraction | A `DisplayBackend` trait; each remote RAIL window maps to one native toplevel. X11 backend first (matches today's deployment), Wayland alongside. |
-| **Rendering & decode** | `wgpu` GPU from the start; VA-API HW decode | Compositing/scaling/present via `wgpu`. H.264 GFX decode is VA-API hardware-first with an `openh264` software fallback; VA-API frames import to `wgpu` via DMA-BUF (zero-copy). |
-| **Keymap** | Hybrid (host XKB + table fallback) | `xkbcommon` reads the host layout (correct Hangul/CJK), falling back to a shipped table when none resolves. |
-| **Protocol surface** | Staged | v0 forces the modern, narrow surface (we control the guest); broaden toward general RDP-server compatibility later. |
-| **winpodx integration** | Rust library + thin binary; v0 = `oxrdp-cli` subprocess + IPC | winpodx (Python) spawns `oxrdp-cli` and drives it over a socket/JSON control channel. In-process C-ABI `cdylib` FFI is a post-v0 option. |
-| **v0 success criterion** | **Drop-in equivalence with winpodx's FreeRDP path** | v0 is "done" when winpodx runs its RAIL multi-app workflow on oxrdp instead of `xfreerdp3`, at parity. |
-
-## Scope
-
-**In scope (eventually):** the full set of FreeRDP capabilities winpodx relies on — see the parity matrix in [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md). RAIL/RemoteApp is the headline feature, not an afterthought.
-
-**v0 target surface (drop-in parity):**
-- Connect + logon (`/v /u /d /p`) over **TLS security** (`/sec:tls`) with trust-on-first-use certs (`/cert:tofu|ignore`). **NLA/CredSSP is deferred** — winpodx deliberately uses `/sec:tls` to avoid the NLA path, so v0 does not need it.
-- RAIL / RemoteApp launch (`/app:program,name,cmd`), `WM_CLASS` mapping, keyboard grab.
-- Graphics: GFX pipeline (H.264 AVC420/AVC444) with RemoteFX fallback; bitmap as last resort.
-- Channels: clipboard (cliprdr), audio out (rdpsnd), filesystem redirection (`\\tsclient`, rdpdr).
-- Display: multi-monitor (RAIL-primary + span), HiDPI scaling, dynamic resolution (desktop mode).
-
-**Deferred / staged:** NLA/CredSSP & Kerberos, microphone (audin), printer, USB / smartcard / serial / parallel redirection, broad compatibility with arbitrary (non-winpodx-controlled) RDP servers.
+| **What we replace** | RDP itself — custom protocol + guest agent | The latency limits are in the protocol, not the client. |
+| **Protocol** | [`oxproto`](docs/design/OXPROTO.md): chunked, channelled, sans-io | Fragmentation + per-channel priority so a keyframe cannot delay input; frame acks so latency cannot grow unbounded; per-type size limits because the agent parses untrusted input. |
+| **Guest agent** | Rust + `windows-rs`, Windows.Graphics.Capture | Per-window GPU capture; memory-safe outside the audited FFI. Cross-compiled from Linux. |
+| **Encoding** | Runtime select: Media Foundation HW → SW fallback | Hardware where the guest has it; `RAW_BGRA` for bring-up only. |
+| **Transport** | QUIC preferred, TCP fallback | QUIC's independent streams remove the last head-of-line blocking on lossy links. |
+| **Client rendering** | `wgpu` GPU, VA-API decode | The DMA-BUF import path is **unvalidated** and needs a `wgpu_hal` spike. |
+| **Display backends** | X11 + Wayland behind one trait | One native toplevel per remote window. |
+| **Security** | Mandatory TLS + pinned agent cert + auth token | The agent shares screen content and injects input; it must never serve an unauthenticated peer. See [SECURITY.md](SECURITY.md). |
 
 ## Status
 
-Pre-alpha — specification and scaffolding. No working client yet. See [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) for the workspace layout and milestone roadmap.
+**Pre-alpha.** The protocol, its framing, and the transport are implemented and tested; the
+agent captures windows; the client performs the handshake and event loop. Nothing renders yet.
+
+| Component | State |
+| --- | --- |
+| `oxproto` — protocol messages, framing, limits | implemented, tested, fuzzed |
+| `oxtransport` — async chunk IO | implemented, tested |
+| `oxclient` — handshake + event loop | implemented, tested |
+| `oxagent` — window enumeration, WGC capture | implemented (cross-compiles); no listener yet |
+| display / render / input | not started |
+
+Current state and next steps: [`docs/HANDOFF.md`](docs/HANDOFF.md).
+Known gaps, adversarially verified: [`docs/design/AUDIT-2026-07.md`](docs/design/AUDIT-2026-07.md).
+
+## Build
+
+```bash
+cargo test --workspace                                   # Linux side
+cargo build -p oxagent --target x86_64-pc-windows-gnu    # the Windows agent, cross-compiled
+```
+
+The toolchain and the Windows target are pinned in `rust-toolchain.toml`; the agent's Windows
+dependencies are `cfg(windows)`-gated, so the workspace builds on Linux with the agent as a stub.
+
+## Documentation
+
+| | |
+| --- | --- |
+| Current state, roadmap, how to continue | [`docs/HANDOFF.md`](docs/HANDOFF.md) |
+| Protocol wire specification | [`docs/design/OXPROTO.md`](docs/design/OXPROTO.md) |
+| Agent runtime model (session, deployment) | [`docs/design/agent-runtime.md`](docs/design/agent-runtime.md) |
+| Gap audit | [`docs/design/AUDIT-2026-07.md`](docs/design/AUDIT-2026-07.md) |
+| Security posture | [`SECURITY.md`](SECURITY.md) |
+
+## Name
+
+`oxrdp` is now a misnomer — the project no longer speaks RDP. The crates keep their `oxrdp-*`
+names for the shelved client; the new components are `oxproto` / `oxtransport` / `oxagent` /
+`oxclient`. A rename is deliberately deferred until the first end-to-end milestone.
 
 ## License
 
-TBD (intended permissive — Apache-2.0 / MIT, matching the Rust ecosystem and winpodx's distribution model).
+MIT — see [LICENSE](LICENSE).

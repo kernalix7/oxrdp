@@ -25,6 +25,27 @@ git 히스토리에 남기고 **셸빙**; 클라 셸(TLS·전송·wgpu 디코드
   `x86_64-pc-windows-gnu`(mingw-w64)로 크로스컴파일 — `oxagent.exe`가 windows-rs 0.58(WGC +
   Media Foundation + Win32 창열거) 링크. Windows deps는 `cfg(windows)` 게이트라 리눅스에선
   스텁으로 빌드되어 CI green 유지 — 에이전트를 게스트 내 툴체인 없이 리눅스에서 개발·빌드.
+- **갭 감사 + 하드닝.** 다중 에이전트 감사(반증 검증된 56건, `docs/design/AUDIT-2026-07.md`)
+  결과: Windows 에이전트를 크로스컴파일·린트하는 CI 잡, 차단형 `cargo audit`과 라이선스/금지/소스
+  검사를 위한 `cargo deny`, 툴체인 핀, 그리고 문서가 검증 없이 단언하던 주장 정정(VA-API → wgpu
+  DMA-BUF 임포트를 "미검증"으로 표기).
+- **P1c — WGC 창별 캡처.** `oxagent`가 D3D11 디바이스·free-threaded 프레임풀·재사용 스테이징
+  텍스처로 창 하나를 BGRA로 캡처(row-pitch 인식 리드백, 리사이즈 시 프레임풀 재생성). 창 열거는
+  cloaked/tool/child/shell 창을 걸러내고 DWM 확장 프레임 경계를 보고하며, 프로세스는 per-monitor
+  DPI 인식.
+- **oxproto v1 — 프로토콜 재설계.** `docs/design/OXPROTO.md`에 명세하고 구현: 단편화와 채널별
+  재조립을 갖춘 8바이트 청크 envelope(키프레임이 입력·제어를 head-of-line 블로킹할 수 없음),
+  권위적 길이, 할당 전에 강제되는 타입별 크기 제한, 버전 범위와 기능 협상을 포함한 인증된
+  핸드셰이크, 그리고 최초 설계에 없던 메시지 세트 — 키보드/텍스트/모디파이어 입력, 양방향 창 제어,
+  커서 스트리밍, 프레임 ack와 품질 힌트, 지연 측정을 위한 단계별 타임스탬프, 분수 스케일링을 갖춘
+  디스플레이 레이아웃, 앱 아이덴티티와 아이콘, 에러·종료·ping/pong. 알 수 없는 메시지 타입은
+  치명적 오류가 아니라 건너뜀.
+- **P2a — 클라이언트 세션.** `oxclient`가 핸드셰이크를 수행하고 기능을 협상하며 ping/pong을 투명하게
+  처리하고 `ClientEvent` 스트림을 제공.
+- **견고성.** `oxproto`에 결정적 스모크 퍼즈 테스트(임의 본문·청크 헤더가 절대 panic하지 않음, 절단은
+  항상 에러, 선언된 길이가 수신자 할당을 유발할 수 없음)와 `fuzz/`의 cargo-fuzz 타깃 추가.
+  `SECURITY.md`를 피벗 이후 뒤집힌 위협 모델(에이전트가 화면을 공유하고 입력을 주입하는 서버)로
+  재작성했고, `docs/design/agent-runtime.md`가 게스트 세션·배포 모델을 확정. 122개 테스트.
 - **P1 — 창 열거 + 비동기 전송.** `oxagent`가 보이는 최상위 창을 열거(`EnumWindows` →
   핸들/제목/좌표), windows-gnu 크로스컴파일 검증. `oxtransport`가 tokio 스트림 위로 oxproto
   메시지를 프레이밍(`read_message_bytes`/`write_message`, 64 MiB 가드). `oxproto`가

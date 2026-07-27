@@ -2,6 +2,14 @@
 
 [English](USAGE.md) | **한국어**
 
+> [!IMPORTANT]
+> **대체됨 (2026-07-02).** 이 문서는 oxrdp가 RDP *클라이언트*였던 최초 설계를 기술합니다. 이후
+> 프로젝트는 **RDP 자체를 대체**하는 방향(Windows 게스트 에이전트가 개별 앱 창을 Linux
+> 클라이언트로 스트리밍하는 커스텀 저지연 프로토콜)으로 전환했습니다. 현재 상태:
+> [`docs/HANDOFF.md`](HANDOFF.md) · 프로토콜: [`docs/design/OXPROTO.md`](design/OXPROTO.md) ·
+> 갭 감사: [`docs/design/AUDIT-2026-07.md`](design/AUDIT-2026-07.md).
+
+
 > **상태: 계획됨 — 아직 사용 불가.** oxrdp는 프리알파입니다; 클라이언트가 아직 실행되지
 > 않습니다. 이 페이지는 자리표시자입니다. `oxrdp-cli` 플래그 표면과 라이브러리 `Session`
 > API가 존재하고 동작하면 이를 문서화할 것입니다. 그때까지는 존재하지 않는 기능을 암시하지

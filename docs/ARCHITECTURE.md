@@ -1,5 +1,14 @@
 # oxrdp — Architecture
 
+> [!IMPORTANT]
+> **Superseded (2026-07-02).** This document describes the original design, in which oxrdp was
+> an RDP *client*. The project has since pivoted to **replacing RDP** with a custom low-latency
+> protocol (a Windows guest agent streaming individual app windows to a Linux client). Current
+> state: [`docs/HANDOFF.md`](HANDOFF.md) · protocol: [`docs/design/OXPROTO.md`](design/OXPROTO.md)
+> · gaps: [`docs/design/AUDIT-2026-07.md`](design/AUDIT-2026-07.md). Kept for the parts that
+> still apply (the client shells, the codec base) and for history.
+
+
 This document records the engineering shape of oxrdp: the sans-io core, the crate
 workspace, the display-backend abstraction, the FreeRDP parity matrix that defines
 the v0 "drop-in equivalence" bar, and the milestone roadmap.
@@ -46,7 +55,7 @@ A Cargo workspace. Pure crates have no `tokio` / windowing deps.
 | `oxrdp-pdu` | pure | Wire types: encode/decode of every PDU we speak. The protocol vocabulary. |
 | `oxrdp-core` | pure | Connection state machine: X.224, MCS, capability exchange, channel join, the connection sequence. |
 | `oxrdp-graphics` | pure | GFX/RFX/bitmap **protocol** + surface/region model. Emits codec-tagged decode commands (`decode H.264/RFX/bitmap payload → surface S @ region R`); it does **not** run hardware decoders — actual pixel decode lives in the render shell. |
-| `oxrdp-render` | shell | H.264 decode (**VA-API** HW, `openh264` SW fallback), RFX/bitmap CPU decode, and `wgpu` compositing/present. VA-API frames import to `wgpu` via DMA-BUF (zero-copy). |
+| `oxrdp-render` | shell | H.264 decode (**VA-API** HW, `openh264` SW fallback), RFX/bitmap CPU decode, and `wgpu` compositing/present. VA-API frames are intended to import into `wgpu` via DMA-BUF (zero-copy) — **unvalidated**: wgpu exposes no public API for importing an external DMA-BUF, so this needs a `wgpu_hal` Vulkan spike before it can be relied on. |
 | `oxrdp-channels` | pure | Static/dynamic virtual channels: cliprdr (clipboard), rdpsnd (audio out), rdpdr (drive/printer), audin (mic). |
 | `oxrdp-rail` | pure | RAIL / RemoteApp: remote window list, ordering, icons, move/resize/minimize, popups, language-bar, sysmenu. The heart of "seamless." |
 | `oxrdp-crypto` | thin | Security glue: `rustls` TLS, and (deferred) `sspi-rs` NLA/CredSSP. Sits between `oxrdp-io` and the core. |
@@ -172,7 +181,9 @@ the capabilities, not the CLI syntax, are what must reach parity.
 - **H.264 GFX decode: VA-API hardware first, `openh264` software fallback.** VA-API for
   lower CPU/latency and 4K headroom; `openh264` keeps it working where VA-API is
   unavailable. Decoded frames stay on the GPU — VA-API output is imported into `wgpu` via
-  **DMA-BUF (zero-copy)** and presented without a CPU round-trip; the software path
+  **DMA-BUF (zero-copy)** and presented without a CPU round-trip — this path is
+  **unvalidated** (no public wgpu API; needs a `wgpu_hal` Vulkan spike, with a CPU-copy
+  fallback if it does not hold); the software path
   uploads to a `wgpu` texture.
 - **Keymap: hybrid — host XKB-derived with built-in table fallback.** `xkbcommon` reads
   the user's actual host layout (correct Hangul/CJK/non-US), falling back to a shipped

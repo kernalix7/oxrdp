@@ -1,0 +1,29 @@
+[package]
+name = "oxproto-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+# Its own workspace: cargo-fuzz needs nightly, while the main workspace is pinned to stable.
+[workspace]
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+oxproto = { path = "../crates/oxproto" }
+
+[[bin]]
+name = "message"
+path = "fuzz_targets/message.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "reassembly"
+path = "fuzz_targets/reassembly.rs"
+test = false
+doc = false
+bench = false
