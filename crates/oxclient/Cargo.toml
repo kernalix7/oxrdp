@@ -8,9 +8,15 @@ authors.workspace = true
 repository.workspace = true
 
 [dependencies]
-tokio = { version = "1", features = ["io-util", "net", "rt", "macros"] }
+tokio = { version = "1", features = ["io-util", "net", "rt-multi-thread", "macros"] }
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12", "logging"] }
 oxproto = { path = "../oxproto" }
 oxtransport = { path = "../oxtransport" }
+oxsec = { path = "../oxsec" }
+
+[[bin]]
+name = "oxclient"
+path = "src/main.rs"
 
 [lints]
 workspace = true

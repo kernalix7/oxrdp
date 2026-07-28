@@ -180,8 +180,10 @@ name = "oxagent"
 version = "0.0.0"
 dependencies = [
  "oxproto",
+ "oxsec",
  "oxtransport",
  "tokio",
+ "tokio-rustls",
  "windows",
 ]
 
@@ -190,8 +192,10 @@ name = "oxclient"
 version = "0.0.0"
 dependencies = [
  "oxproto",
+ "oxsec",
  "oxtransport",
  "tokio",
+ "tokio-rustls",
 ]
 
 [[package]]

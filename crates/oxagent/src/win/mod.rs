@@ -4,11 +4,18 @@
 pub mod capture;
 pub mod enumerate;
 
+use std::process::ExitCode;
+
+use oxsec::AgentIdentity;
+use tokio::net::TcpListener;
+use tokio_rustls::TlsAcceptor;
 use windows::Win32::Foundation::HWND;
 use windows::Win32::UI::HiDpi::{
     SetProcessDpiAwarenessContext, DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2,
 };
 
+use crate::config::AgentConfig;
+use crate::serve::{run_session, SessionParams};
 use capture::WindowCapture;
 use enumerate::enumerate_windows;
 
@@ -24,64 +31,188 @@ fn set_dpi_awareness() {
     }
 }
 
-/// Agent entry point (bring-up): report capture support, list windows, and capture one frame
-/// from the first window to prove the pipeline end to end on the guest.
-pub fn run() {
+/// Agent entry point: set up TLS, bind the listener, and serve clients until shutdown.
+///
+/// Each connection is authenticated before the capture source is touched (see
+/// [`crate::serve::run_session`]), and sessions are handled one at a time — a second client
+/// would contend for the same windows, and multi-session support is out of scope for v0.
+pub fn run_agent(config: &AgentConfig, print_pin: bool) -> ExitCode {
     set_dpi_awareness();
 
-    eprintln!(
-        "oxagent: Windows.Graphics.Capture supported = {}",
-        capture::is_supported()
-    );
-
-    let windows = enumerate_windows();
-    eprintln!("oxagent: {} shareable window(s)", windows.len());
-    for w in windows.iter().take(10) {
-        eprintln!(
-            "  [{:#x}] {}x{} @({},{}){}  {}",
-            w.hwnd,
-            w.width,
-            w.height,
-            w.x,
-            w.y,
-            if w.minimized { " [min]" } else { "" },
-            w.title
-        );
+    let identity =
+        match AgentIdentity::load_or_generate(&config.cert_path, &config.key_path, "oxagent") {
+            Ok(id) => id,
+            Err(e) => {
+                eprintln!("oxagent: TLS identity: {e}");
+                return ExitCode::from(2);
+            }
+        };
+    let pin = match identity.spki_pin() {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("oxagent: certificate pin: {e}");
+            return ExitCode::from(2);
+        }
+    };
+    if print_pin {
+        println!("{pin}");
+        return ExitCode::SUCCESS;
     }
 
-    let Some(target) = windows.iter().find(|w| !w.minimized) else {
-        eprintln!("oxagent: no capturable window found");
-        return;
+    let token = match oxsec::load_token(&config.token_path) {
+        Ok(t) => t,
+        Err(e) => {
+            eprintln!("oxagent: {}: {e}", config.token_path.display());
+            return ExitCode::from(2);
+        }
     };
-    eprintln!("oxagent: capturing '{}' ...", target.title);
+    let tls_config = match oxsec::server_config(&identity) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("oxagent: TLS server config: {e}");
+            return ExitCode::from(2);
+        }
+    };
 
-    let hwnd = HWND(target.hwnd as *mut core::ffi::c_void);
-    match WindowCapture::new(hwnd) {
-        Ok(mut cap) => {
-            if let Ok(size) = cap.size() {
-                eprintln!("oxagent: capture item size {}x{}", size.Width, size.Height);
+    if !capture::is_supported() {
+        eprintln!("oxagent: Windows.Graphics.Capture is not available on this build of Windows");
+        return ExitCode::from(1);
+    }
+
+    eprintln!("oxagent: listening on {} (pin {pin})", config.bind);
+
+    let runtime = match tokio::runtime::Runtime::new() {
+        Ok(rt) => rt,
+        Err(e) => {
+            eprintln!("oxagent: runtime: {e}");
+            return ExitCode::from(1);
+        }
+    };
+    runtime.block_on(async move {
+        let acceptor = TlsAcceptor::from(tls_config);
+        let listener = match TcpListener::bind(config.bind).await {
+            Ok(l) => l,
+            Err(e) => {
+                eprintln!("oxagent: bind {}: {e}", config.bind);
+                return ExitCode::from(1);
             }
-            // WGC delivers asynchronously; poll briefly for the first frame.
-            for _ in 0..120 {
-                match cap.try_next_frame() {
-                    Ok(Some(frame)) => {
-                        eprintln!(
-                            "oxagent: captured frame {}x{} ({} bytes BGRA)",
-                            frame.width,
-                            frame.height,
-                            frame.bgra.len()
-                        );
-                        return;
-                    }
-                    Ok(None) => std::thread::sleep(std::time::Duration::from_millis(16)),
-                    Err(e) => {
-                        eprintln!("oxagent: capture error: {e}");
-                        return;
+        };
+
+        let mut session_id: u64 = 1;
+        loop {
+            let (tcp, peer) = match listener.accept().await {
+                Ok(pair) => pair,
+                Err(e) => {
+                    eprintln!("oxagent: accept: {e}");
+                    continue;
+                }
+            };
+            let tls = match acceptor.accept(tcp).await {
+                Ok(s) => s,
+                Err(e) => {
+                    // A failed TLS handshake is routine (a port scan, a client with the wrong
+                    // pin); log and keep serving.
+                    eprintln!("oxagent: TLS handshake from {peer} failed: {e}");
+                    continue;
+                }
+            };
+
+            eprintln!("oxagent: session {session_id} from {peer}");
+            let params = SessionParams {
+                target_fps: config.target_fps,
+                max_frames_in_flight: config.max_frames_in_flight,
+            };
+            let mut source = WinWindowSource::new();
+            match run_session(tls, &mut source, params, session_id, &token).await {
+                Ok(negotiated) => eprintln!(
+                    "oxagent: session {session_id} with '{}' ended",
+                    negotiated.client_name
+                ),
+                Err(e) => eprintln!("oxagent: session {session_id}: {e}"),
+            }
+            session_id += 1;
+        }
+    })
+}
+
+/// The Windows implementation of the session driver's platform interface.
+///
+/// Holds one live [`WindowCapture`] per window the driver has asked about, created lazily on
+/// first request and dropped when the window disappears.
+pub struct WinWindowSource {
+    captures: std::collections::HashMap<isize, WindowCapture>,
+}
+
+impl WinWindowSource {
+    /// A source with no captures started.
+    pub fn new() -> Self {
+        Self {
+            captures: std::collections::HashMap::new(),
+        }
+    }
+}
+
+impl Default for WinWindowSource {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl crate::serve::WindowSource for WinWindowSource {
+    fn live_windows(&mut self) -> Vec<crate::serve::SourceWindow> {
+        let live = enumerate_windows();
+        // Drop captures for windows that are gone, so their D3D resources are released.
+        let alive: std::collections::HashSet<isize> = live.iter().map(|w| w.hwnd).collect();
+        self.captures.retain(|handle, _| alive.contains(handle));
+
+        live.into_iter()
+            // A minimized window has no meaningful geometry and nothing to capture.
+            .filter(|w| !w.minimized)
+            .map(|w| crate::serve::SourceWindow {
+                handle: w.hwnd,
+                // TODO(P4): resolve the owning process and its executable name so the client
+                // can set a correct WM_CLASS. Until then every window reports the same app id.
+                pid: 0,
+                app_id: "windows-app".to_string(),
+                title: w.title,
+                x: w.x,
+                y: w.y,
+                width: w.width,
+                height: w.height,
+                // TODO(P4): report the window's real per-monitor DPI.
+                dpi: 96,
+            })
+            .collect()
+    }
+
+    fn next_frame(&mut self, handle: isize) -> Option<crate::serve::SourceFrame> {
+        let capture = match self.captures.entry(handle) {
+            std::collections::hash_map::Entry::Occupied(e) => e.into_mut(),
+            std::collections::hash_map::Entry::Vacant(e) => {
+                let hwnd = HWND(handle as *mut core::ffi::c_void);
+                match WindowCapture::new(hwnd) {
+                    Ok(c) => e.insert(c),
+                    Err(err) => {
+                        eprintln!("oxagent: capture failed for {handle:#x}: {err}");
+                        return None;
                     }
                 }
             }
-            eprintln!("oxagent: no frame arrived within ~2s");
+        };
+
+        match capture.try_next_frame() {
+            Ok(Some(frame)) => Some(crate::serve::SourceFrame {
+                width: frame.width.min(u32::from(u16::MAX)) as u16,
+                height: frame.height.min(u32::from(u16::MAX)) as u16,
+                data: frame.bgra,
+            }),
+            Ok(None) => None,
+            Err(err) => {
+                eprintln!("oxagent: capture error for {handle:#x}: {err}");
+                // Drop the broken capture so the next tick recreates it.
+                self.captures.remove(&handle);
+                None
+            }
         }
-        Err(e) => eprintln!("oxagent: failed to start capture: {e}"),
     }
 }

@@ -64,6 +64,8 @@ pub fn is_supported() -> bool {
 pub struct WindowCapture {
     device: ID3D11Device,
     context: ID3D11DeviceContext,
+    /// Kept alive for the lifetime of the session and queried by [`WindowCapture::size`].
+    #[allow(dead_code)]
     item: GraphicsCaptureItem,
     frame_pool: Direct3D11CaptureFramePool,
     _session: GraphicsCaptureSession,
@@ -112,6 +114,10 @@ impl WindowCapture {
     }
 
     /// The window's current capture size, as reported by the capture item.
+    ///
+    /// Used to detect a resize before a frame arrives, so the driver can re-announce geometry
+    /// without waiting for the frame pool to be recreated.
+    #[allow(dead_code)]
     pub fn size(&self) -> WinResult<SizeInt32> {
         self.item.Size()
     }
