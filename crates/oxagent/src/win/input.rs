@@ -121,8 +121,13 @@ impl InputSink for WinInputSink {
 
         // Window-relative -> guest screen coordinates, through the same extended frame bounds
         // capture uses (OXPROTO.md §6), so a click lands on the pixel the user actually sees.
-        let abs_x = rect.left + x;
-        let abs_y = rect.top + y;
+        // `x`/`y` come straight off the wire from an authenticated-but-untrusted peer, so this
+        // is saturating rather than plain `+`: the release profile does not enable
+        // `overflow-checks`, so a crafted extreme value would not panic today, but turning that
+        // hardening on later must not turn one bad message into a process crash post-auth.
+        // `normalize` below clamps the result into the virtual desktop regardless.
+        let abs_x = rect.left.saturating_add(x);
+        let abs_y = rect.top.saturating_add(y);
 
         let (vx, vy, vw, vh) = virtual_desktop_rect();
         let norm_x = normalize(abs_x, vx, vw);

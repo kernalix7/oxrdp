@@ -23,12 +23,13 @@ use oxproto::envelope::{channel, Reassembler};
 use oxproto::message::input::key_flag;
 use oxproto::message::window::{window_flag, window_show};
 use oxproto::message::{
-    FrameData, Message, WindowClosed, WindowGeometry, WindowOpened, WindowState, WindowTitle,
+    Close, Error as ProtoError, FrameData, Message, WindowClosed, WindowGeometry, WindowOpened,
+    WindowState, WindowTitle,
 };
-use oxproto::{feature, msg_type};
-use oxtransport::{read_message, write_raw};
+use oxproto::{error_code, feature, msg_type};
+use oxtransport::{read_message, write_message, write_raw};
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, Semaphore};
 
 use crate::handshake::{negotiate, HandshakeError, Negotiated};
 use crate::input::InputSink;
@@ -131,6 +132,16 @@ struct WindowStream {
 ///
 /// Returns when the client disconnects or the transport fails. The handshake happens here, so
 /// a caller that gets an error never had an authenticated peer.
+///
+/// `pre_auth_deadline` bounds the *whole* pre-authentication phase — reading `ClientHello`
+/// here, plus whatever the caller spent accepting TLS before this was even called — as one
+/// combined deadline against the same absolute instant, not two independent timeouts a slow
+/// trickle could exploit at the boundary between them. `session_slot` enforces that exactly one
+/// authenticated session drives windows at a time: connections are now handled concurrently
+/// (each on its own task, so one stalled peer cannot block every connection after it — see
+/// `crate::win::run_agent`), and without this gate that would let a second, fully authenticated
+/// client also start streaming and injecting input alongside the first.
+#[allow(clippy::too_many_arguments)]
 pub async fn run_session<S, W, I>(
     stream: S,
     source: &mut W,
@@ -138,6 +149,8 @@ pub async fn run_session<S, W, I>(
     params: SessionParams,
     session_id: u64,
     expected_token: &str,
+    pre_auth_deadline: Instant,
+    session_slot: &Semaphore,
 ) -> Result<Negotiated, HandshakeError>
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
@@ -154,10 +167,49 @@ where
             reader: &mut reader,
             writer: &mut writer,
         };
-        negotiate(&mut duplex, &mut reassembler, session_id, |presented| {
-            oxsec::verify_token(expected_token, presented)
-        })
-        .await?
+        match tokio::time::timeout_at(
+            tokio::time::Instant::from(pre_auth_deadline),
+            negotiate(&mut duplex, &mut reassembler, session_id, |presented| {
+                oxsec::verify_token(expected_token, presented)
+            }),
+        )
+        .await
+        {
+            Ok(result) => result?,
+            // The peer is simply dropped, nothing is written back: a peer that has not sent a
+            // complete `ClientHello` in the whole pre-auth window is exactly the kind of peer
+            // this deadline exists to stop spending time on, and a reply is more time spent.
+            Err(_elapsed) => return Err(HandshakeError::Timeout),
+        }
+    };
+
+    // Exactly one authenticated session at a time. A second one is turned away *here* — after
+    // it authenticated, so it gets a real, documented `Error` instead of a connection that just
+    // hangs or silently drops — but before it can touch `source`/`sink` at all. `try_acquire`
+    // rather than `acquire`: a client that cannot get the slot right now must be told so, not
+    // queued to start streaming later once the first session happens to end.
+    let Ok(_session_permit) = session_slot.try_acquire() else {
+        // error_code has no dedicated "another session is active" code; PROTOCOL is the closest
+        // existing fit (an out-of-sequence attempt to start a second session). Flagged to the
+        // crates/oxproto owner as worth a dedicated code rather than picked silently.
+        let _ = write_message(
+            &mut writer,
+            &Message::Error(ProtoError {
+                code: error_code::PROTOCOL,
+                message: "a session is already active".into(),
+            }),
+            channel::CONTROL,
+        )
+        .await;
+        // OXPROTO.md §15: reason 3 is "error" — the same reason every other post-`Error`
+        // `Close` in this crate uses (see `crate::handshake::reject`).
+        let _ = write_message(
+            &mut writer,
+            &Message::Close(Close { reason: 3 }),
+            channel::CONTROL,
+        )
+        .await;
+        return Err(HandshakeError::Busy);
     };
 
     // From here on the read side runs independently so acks and input are not blocked behind
@@ -266,6 +318,18 @@ where
                         // and not yet closed, keyed by the same `window_id` the wire uses — so
                         // a miss here is "unknown or already-gone window", dropped rather than
                         // injected into whatever window happens to have focus.
+                        //
+                        // Accepted, not fixed: `streams` (via `sync_windows`) only re-resolves
+                        // `window_id -> handle` once per tick, not on every message, so between
+                        // two ticks a `handle` can go stale — the window closed and Windows
+                        // recycled the `HWND` for a different, not-yet-announced window — and an
+                        // event for the old id resolves to that new window until the next tick's
+                        // diff notices the old handle is gone and reports it closed. This was
+                        // reviewed and rated low: the guest is single-tenant and the one client
+                        // this session has can already drive whatever window is focused, so
+                        // hitting the recycled handle grants no capability it did not already
+                        // have. Do not add re-resolution machinery for this — see the security
+                        // review.
                         if let Some(stream) = streams.get(&p.window_id) {
                             sink.pointer_event(
                                 stream.handle,
@@ -293,6 +357,8 @@ where
                     }
                     // Gated on WINDOW_CONTROL by the match guard: a client that never
                     // negotiated it falls through to the catch-all below and is dropped.
+                    //
+                    // Same accepted stale-handle window as `PointerEvent` above — see there.
                     Message::WindowControl(w) if window_control_enabled => {
                         if let Some(stream) = streams.get(&w.window_id) {
                             sink.window_control(
@@ -813,6 +879,12 @@ mod tests {
         }
     }
 
+    /// A `pre_auth_deadline` far enough out that a test exercising anything other than the
+    /// timeout itself never comes close to hitting it.
+    fn far_deadline() -> Instant {
+        Instant::now() + Duration::from_secs(30)
+    }
+
     #[test]
     fn window_flags_packs_every_bit_correctly() {
         use oxproto::message::window::window_flag;
@@ -946,6 +1018,7 @@ mod tests {
         let agent_task = tokio::spawn(async move {
             let mut source = FakeSource::one_window(3);
             let mut sink = NoopSink;
+            let session_slot = Semaphore::new(1);
             run_session(
                 agent,
                 &mut source,
@@ -956,6 +1029,8 @@ mod tests {
                 },
                 77,
                 "secret",
+                far_deadline(),
+                &session_slot,
             )
             .await
         });
@@ -1017,6 +1092,7 @@ mod tests {
         let agent_task = tokio::spawn(async move {
             let mut source = Forbidden;
             let mut sink = NoopSink;
+            let session_slot = Semaphore::new(1);
             run_session(
                 agent,
                 &mut source,
@@ -1024,6 +1100,8 @@ mod tests {
                 SessionParams::default(),
                 1,
                 "secret",
+                far_deadline(),
+                &session_slot,
             )
             .await
         });
@@ -1066,6 +1144,7 @@ mod tests {
         let agent_task = tokio::spawn(async move {
             let mut source = Vanishing { polls: 0 };
             let mut sink = NoopSink;
+            let session_slot = Semaphore::new(1);
             run_session(
                 agent,
                 &mut source,
@@ -1076,6 +1155,8 @@ mod tests {
                 },
                 5,
                 "secret",
+                far_deadline(),
+                &session_slot,
             )
             .await
         });
@@ -1134,6 +1215,7 @@ mod tests {
         let agent_task = tokio::spawn(async move {
             let mut source = FakeSource::one_window(0);
             let mut sink = RecordingSink(tx);
+            let session_slot = Semaphore::new(1);
             run_session(
                 agent,
                 &mut source,
@@ -1141,6 +1223,8 @@ mod tests {
                 SessionParams::default(),
                 3,
                 "secret",
+                far_deadline(),
+                &session_slot,
             )
             .await
         });
@@ -1232,6 +1316,7 @@ mod tests {
         let agent_task = tokio::spawn(async move {
             let mut source = FakeSource::one_window(0);
             let mut sink = RecordingSink(tx);
+            let session_slot = Semaphore::new(1);
             run_session(
                 agent,
                 &mut source,
@@ -1239,6 +1324,8 @@ mod tests {
                 SessionParams::default(),
                 4,
                 "secret",
+                far_deadline(),
+                &session_slot,
             )
             .await
         });
@@ -1298,6 +1385,7 @@ mod tests {
             let agent_task = tokio::spawn(async move {
                 let mut source = FakeSource::one_window(0);
                 let mut sink = RecordingSink(tx);
+                let session_slot = Semaphore::new(1);
                 run_session(
                     agent,
                     &mut source,
@@ -1305,6 +1393,8 @@ mod tests {
                     SessionParams::default(),
                     1,
                     "secret",
+                    far_deadline(),
+                    &session_slot,
                 )
                 .await
             });
@@ -1369,6 +1459,7 @@ mod tests {
         let agent_task = tokio::spawn(async move {
             let mut source = FakeSource::one_window(0);
             let mut sink = RecordingSink(tx);
+            let session_slot = Semaphore::new(1);
             run_session(
                 agent,
                 &mut source,
@@ -1376,6 +1467,8 @@ mod tests {
                 SessionParams::default(),
                 9,
                 "secret",
+                far_deadline(),
+                &session_slot,
             )
             .await
         });
@@ -1458,6 +1551,7 @@ mod tests {
             async move {
                 let mut source = MutableSource(state);
                 let mut sink = NoopSink;
+                let session_slot = Semaphore::new(1);
                 run_session(
                     agent,
                     &mut source,
@@ -1468,6 +1562,8 @@ mod tests {
                     },
                     11,
                     "secret",
+                    far_deadline(),
+                    &session_slot,
                 )
                 .await
             }
@@ -1517,6 +1613,7 @@ mod tests {
             async move {
                 let mut source = MutableSource(state);
                 let mut sink = NoopSink;
+                let session_slot = Semaphore::new(1);
                 run_session(
                     agent,
                     &mut source,
@@ -1527,6 +1624,8 @@ mod tests {
                     },
                     12,
                     "secret",
+                    far_deadline(),
+                    &session_slot,
                 )
                 .await
             }
@@ -1623,6 +1722,7 @@ mod tests {
             async move {
                 let mut source = PanicsIfPolledWhileMinimized(state);
                 let mut sink = NoopSink;
+                let session_slot = Semaphore::new(1);
                 run_session(
                     agent,
                     &mut source,
@@ -1633,6 +1733,8 @@ mod tests {
                     },
                     13,
                     "secret",
+                    far_deadline(),
+                    &session_slot,
                 )
                 .await
             }
@@ -1672,5 +1774,197 @@ mod tests {
             result.is_ok(),
             "the session task must not have panicked: {result:?}"
         );
+    }
+
+    #[tokio::test]
+    async fn a_silent_peer_is_dropped_after_the_pre_auth_deadline() {
+        // The attack this closes: connect and send nothing at all. Before the deadline existed,
+        // `negotiate`'s `ClientHello` read simply waited forever.
+        let (client, agent) = tokio::io::duplex(4096);
+        let deadline = Instant::now() + Duration::from_millis(50);
+        let session_slot = Semaphore::new(1);
+        let mut source = FakeSource::one_window(0);
+        let mut sink = NoopSink;
+
+        let started = Instant::now();
+        let result = run_session(
+            agent,
+            &mut source,
+            &mut sink,
+            SessionParams::default(),
+            1,
+            "secret",
+            deadline,
+            &session_slot,
+        )
+        .await;
+        let elapsed = started.elapsed();
+
+        assert!(
+            matches!(result, Err(HandshakeError::Timeout)),
+            "got {result:?}"
+        );
+        // Generous slack over the 50ms deadline for scheduling jitter, but nowhere near what a
+        // bug that ignored the deadline and blocked forever would look like.
+        assert!(
+            elapsed < Duration::from_secs(2),
+            "took {elapsed:?}, should have returned promptly after the deadline"
+        );
+
+        drop(client); // the silent peer: still connected, never sent a byte.
+    }
+
+    #[tokio::test]
+    async fn a_hanging_connection_does_not_block_a_second_one() {
+        // Simulates two connections handled the way `crate::win::run_agent` now handles them:
+        // each in its own task. Connection A never sends anything and has a short deadline of
+        // its own; connection B authenticates normally. Before per-connection concurrency, a
+        // single stalled accept loop would have made B wait for A's slot even to be attempted —
+        // now B must complete while A is still (deliberately) hanging.
+        let (client_a, agent_a) = tokio::io::duplex(4096);
+        let (mut client_b, agent_b) = tokio::io::duplex(4096);
+
+        let session_slot = std::sync::Arc::new(Semaphore::new(1));
+        let deadline_a = Instant::now() + Duration::from_millis(300);
+        let deadline_b = far_deadline();
+
+        let _task_a = tokio::spawn({
+            let session_slot = std::sync::Arc::clone(&session_slot);
+            async move {
+                let mut source = FakeSource::one_window(0);
+                let mut sink = NoopSink;
+                run_session(
+                    agent_a,
+                    &mut source,
+                    &mut sink,
+                    SessionParams::default(),
+                    1,
+                    "secret",
+                    deadline_a,
+                    &session_slot,
+                )
+                .await
+            }
+        });
+
+        let task_b = tokio::spawn({
+            let session_slot = std::sync::Arc::clone(&session_slot);
+            async move {
+                let mut source = FakeSource::one_window(0);
+                let mut sink = NoopSink;
+                run_session(
+                    agent_b,
+                    &mut source,
+                    &mut sink,
+                    SessionParams::default(),
+                    2,
+                    "secret",
+                    deadline_b,
+                    &session_slot,
+                )
+                .await
+            }
+        });
+
+        write_message(&mut client_b, &hello("secret"), channel::CONTROL)
+            .await
+            .unwrap();
+        let mut rb = Reassembler::new();
+        // Bounded well under A's 300ms deadline: if connections were still handled one at a
+        // time, B would not even start being served until A's task finished.
+        let sh = tokio::time::timeout(Duration::from_millis(150), async {
+            loop {
+                if let Some(msg) = read_message(&mut client_b, &mut rb).await.unwrap() {
+                    return msg;
+                }
+            }
+        })
+        .await
+        .expect("B must not wait on A's hanging connection");
+        assert!(matches!(sh, Message::ServerHello(_)));
+
+        task_b.abort();
+        drop(client_a);
+        drop(client_b);
+    }
+
+    #[tokio::test]
+    async fn a_second_authenticated_client_is_rejected_while_one_is_active() {
+        // Requirement: connections are now handled concurrently, but exactly one *authenticated*
+        // session may drive windows at a time. A second one must be turned away with a real
+        // `Error` + `Close`, not queued and not allowed to run alongside the first.
+        let session_slot = std::sync::Arc::new(Semaphore::new(1));
+        let deadline = far_deadline();
+
+        let (mut client_a, agent_a) = tokio::io::duplex(64 * 1024);
+        let task_a = tokio::spawn({
+            let session_slot = std::sync::Arc::clone(&session_slot);
+            async move {
+                let mut source = FakeSource::one_window(0);
+                let mut sink = NoopSink;
+                run_session(
+                    agent_a,
+                    &mut source,
+                    &mut sink,
+                    SessionParams {
+                        target_fps: 240,
+                        max_frames_in_flight: 2,
+                    },
+                    1,
+                    "secret",
+                    deadline,
+                    &session_slot,
+                )
+                .await
+            }
+        });
+
+        let mut ra = Reassembler::new();
+        write_message(&mut client_a, &hello("secret"), channel::CONTROL)
+            .await
+            .unwrap();
+        let sh_a = read_message(&mut client_a, &mut ra).await.unwrap().unwrap();
+        assert!(matches!(sh_a, Message::ServerHello(_)));
+        // Give A's task a chance to run past the (synchronous, no further `.await` before it)
+        // `try_acquire` that follows sending `ServerHello`, so the permit is actually held by
+        // the time B tries for it below — otherwise this test would be racing the scheduler.
+        tokio::time::sleep(Duration::from_millis(10)).await;
+
+        let (mut client_b, agent_b) = tokio::io::duplex(64 * 1024);
+        write_message(&mut client_b, &hello("secret"), channel::CONTROL)
+            .await
+            .unwrap();
+        let mut source_b = FakeSource::one_window(0);
+        let mut sink_b = NoopSink;
+        let result_b = run_session(
+            agent_b,
+            &mut source_b,
+            &mut sink_b,
+            SessionParams::default(),
+            2,
+            "secret",
+            deadline,
+            &session_slot,
+        )
+        .await;
+        assert!(
+            matches!(result_b, Err(HandshakeError::Busy)),
+            "got {result_b:?}"
+        );
+
+        let mut rb = Reassembler::new();
+        let sh_b = read_message(&mut client_b, &mut rb).await.unwrap().unwrap();
+        assert!(
+            matches!(sh_b, Message::ServerHello(_)),
+            "B does authenticate — it just cannot run a session"
+        );
+        let err_b = read_message(&mut client_b, &mut rb).await.unwrap().unwrap();
+        assert!(matches!(err_b, Message::Error(_)), "got {err_b:?}");
+        let close_b = read_message(&mut client_b, &mut rb).await.unwrap().unwrap();
+        assert!(matches!(close_b, Message::Close(_)), "got {close_b:?}");
+
+        drop(client_a);
+        drop(client_b);
+        let _ = task_a.await;
     }
 }

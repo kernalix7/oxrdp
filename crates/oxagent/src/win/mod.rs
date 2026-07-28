@@ -7,9 +7,12 @@ pub mod enumerate;
 mod input;
 
 use std::process::ExitCode;
+use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use oxsec::AgentIdentity;
 use tokio::net::TcpListener;
+use tokio::sync::Semaphore;
 use tokio_rustls::TlsAcceptor;
 use windows::Win32::Foundation::HWND;
 use windows::Win32::UI::HiDpi::{
@@ -21,6 +24,22 @@ use crate::serve::{run_session, SessionParams};
 use capture::WindowCapture;
 use enumerate::enumerate_windows;
 use input::WinInputSink;
+
+/// Deadline for the *whole* pre-authentication phase: TLS accept and the `ClientHello` read,
+/// together (`crate::serve::run_session`'s `pre_auth_deadline`) — not two independent timeouts,
+/// which a slow trickle across their boundary would defeat. 20 seconds is generous for a real
+/// client on a bad link (TLS is a handful of round trips; `ClientHello` is one small message)
+/// and gives an attacker nothing: holding a socket open for 20s costs it as much as holding one
+/// open forever, for zero benefit past that point.
+const PRE_AUTH_DEADLINE: Duration = Duration::from_secs(20);
+
+/// How many connections may be mid-handshake (TLS accept through `ClientHello`) at once.
+/// Spawning a task per connection fixes "one silent peer blocks the listener forever" (see
+/// `run_agent`), but without a cap on *concurrent* pre-auth attempts, the same attacker just
+/// moves the target from "one socket blocks everything" to "ten thousand sockets exhaust
+/// memory". A handful of legitimate simultaneous connection attempts never needs anywhere near
+/// this many at once.
+const PRE_AUTH_CONCURRENCY: usize = 4;
 
 /// Opt into per-monitor DPI awareness.
 ///
@@ -37,8 +56,12 @@ fn set_dpi_awareness() {
 /// Agent entry point: set up TLS, bind the listener, and serve clients until shutdown.
 ///
 /// Each connection is authenticated before the capture source is touched (see
-/// [`crate::serve::run_session`]), and sessions are handled one at a time — a second client
-/// would contend for the same windows, and multi-session support is out of scope for v0.
+/// [`crate::serve::run_session`]). Connections are accepted and handshaked *concurrently* —
+/// each on its own task — but only one authenticated session drives windows at a time: a second
+/// client would contend for the same windows, and multi-session support is out of scope for v0.
+/// See [`PRE_AUTH_DEADLINE`] and [`PRE_AUTH_CONCURRENCY`] for why the concurrent part exists at
+/// all: a sequential accept loop with no timeout let one silent connection block the listener,
+/// and everyone after it, forever.
 pub fn run_agent(config: &AgentConfig, print_pin: bool) -> ExitCode {
     set_dpi_awareness();
 
@@ -101,41 +124,120 @@ pub fn run_agent(config: &AgentConfig, print_pin: bool) -> ExitCode {
             }
         };
 
-        let mut session_id: u64 = 1;
-        loop {
-            let (tcp, peer) = match listener.accept().await {
-                Ok(pair) => pair,
-                Err(e) => {
-                    eprintln!("oxagent: accept: {e}");
-                    continue;
-                }
-            };
-            let tls = match acceptor.accept(tcp).await {
-                Ok(s) => s,
-                Err(e) => {
-                    // A failed TLS handshake is routine (a port scan, a client with the wrong
-                    // pin); log and keep serving.
-                    eprintln!("oxagent: TLS handshake from {peer} failed: {e}");
-                    continue;
-                }
-            };
+        let token: Arc<str> = Arc::from(token);
+        // Exactly one authenticated session drives windows at a time — unchanged from before
+        // this loop grew concurrency, just now enforced explicitly (`crate::serve::run_session`
+        // checks it) instead of holding by construction from a strictly sequential loop.
+        let session_slot = Arc::new(Semaphore::new(1));
+        let pre_auth_slots = Arc::new(Semaphore::new(PRE_AUTH_CONCURRENCY));
 
-            eprintln!("oxagent: session {session_id} from {peer}");
-            let params = SessionParams {
-                target_fps: config.target_fps,
-                max_frames_in_flight: config.max_frames_in_flight,
-            };
-            let mut source = WinWindowSource::new();
-            let mut sink = WinInputSink::new();
-            match run_session(tls, &mut source, &mut sink, params, session_id, &token).await {
-                Ok(negotiated) => eprintln!(
-                    "oxagent: session {session_id} with '{}' ended",
-                    negotiated.client_name
-                ),
-                Err(e) => eprintln!("oxagent: session {session_id}: {e}"),
-            }
-            session_id += 1;
-        }
+        // `WinWindowSource`/`WinInputSink` hold WinRT/D3D11 COM interfaces, and windows-rs
+        // deliberately leaves those `!Send` (every one wraps a `NonNull<c_void>`, which itself
+        // opts out of the auto trait) rather than asserting a cross-thread safety guarantee
+        // Windows does not make for arbitrary COM objects. `tokio::spawn` requires `Send` and
+        // cannot hold one across an `.await`, so per-connection tasks below use a `LocalSet`
+        // and `spawn_local` instead: local tasks still interleave freely — `accept()` still
+        // returns immediately, several connections still authenticate concurrently — they are
+        // just guaranteed to stay on the one thread already driving this `block_on` call, which
+        // is exactly where these COM objects were already confined before this file had any
+        // concurrency at all.
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async move {
+                let mut session_id: u64 = 1;
+                loop {
+                    // `listener.accept()` itself is not the denial-of-service vector: it
+                    // completes as soon as a peer's TCP handshake lands, regardless of what
+                    // that peer does next. The vector is everything after — TLS accept and the
+                    // `ClientHello` read — which is why only that part moves into a spawned
+                    // task with its own deadline below.
+                    let (tcp, peer) = match listener.accept().await {
+                        Ok(pair) => pair,
+                        Err(e) => {
+                            eprintln!("oxagent: accept: {e}");
+                            continue;
+                        }
+                    };
+
+                    // Reject before spending a TLS accept's worth of work on a connection that
+                    // has nowhere to go: with `PRE_AUTH_CONCURRENCY` already saturated,
+                    // spawning this one anyway would just trade "one socket blocks the
+                    // listener" for "unbounded sockets exhaust memory" — the same failure mode
+                    // in a different shape.
+                    let Ok(pre_auth_permit) = Arc::clone(&pre_auth_slots).try_acquire_owned()
+                    else {
+                        eprintln!("oxagent: too many connections mid-handshake; dropping {peer}");
+                        continue;
+                    };
+
+                    let acceptor = acceptor.clone();
+                    let token = Arc::clone(&token);
+                    let session_slot = Arc::clone(&session_slot);
+                    let params = SessionParams {
+                        target_fps: config.target_fps,
+                        max_frames_in_flight: config.max_frames_in_flight,
+                    };
+                    let id = session_id;
+                    session_id += 1;
+
+                    // One task per connection: accept must return to the loop immediately, or a
+                    // single stalled peer blocks every legitimate connection behind it — the
+                    // denial of service this whole restructure exists to close. It also bounds
+                    // the blast radius of a panic anywhere in TLS, the handshake, the drive
+                    // loop or input injection to this one task rather than the whole agent
+                    // process, which today is awaited inline.
+                    tokio::task::spawn_local(async move {
+                        // Held for the rest of this task and released on drop, covering TLS
+                        // accept and (via `deadline` threaded into `run_session`) the
+                        // `ClientHello` read too — exactly the span `PRE_AUTH_CONCURRENCY`
+                        // needs to bound.
+                        let _pre_auth_permit = pre_auth_permit;
+
+                        let deadline = Instant::now() + PRE_AUTH_DEADLINE;
+                        let tls = match tokio::time::timeout_at(
+                            tokio::time::Instant::from(deadline),
+                            acceptor.accept(tcp),
+                        )
+                        .await
+                        {
+                            Ok(Ok(tls)) => tls,
+                            Ok(Err(e)) => {
+                                // A failed TLS handshake is routine (a port scan, a client with
+                                // the wrong pin); log and move on.
+                                eprintln!("oxagent: TLS handshake from {peer} failed: {e}");
+                                return;
+                            }
+                            Err(_elapsed) => {
+                                eprintln!("oxagent: TLS handshake from {peer} timed out");
+                                return;
+                            }
+                        };
+
+                        eprintln!("oxagent: session {id} from {peer}");
+                        let mut source = WinWindowSource::new();
+                        let mut sink = WinInputSink::new();
+                        match run_session(
+                            tls,
+                            &mut source,
+                            &mut sink,
+                            params,
+                            id,
+                            &token,
+                            deadline,
+                            &session_slot,
+                        )
+                        .await
+                        {
+                            Ok(negotiated) => eprintln!(
+                                "oxagent: session {id} with '{}' ended",
+                                negotiated.client_name
+                            ),
+                            Err(e) => eprintln!("oxagent: session {id}: {e}"),
+                        }
+                    });
+                }
+            })
+            .await
     })
 }
 

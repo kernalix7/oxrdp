@@ -45,6 +45,13 @@ pub enum HandshakeError {
         /// Human-readable reason, for the agent's own log.
         reason: &'static str,
     },
+    /// TLS accept and the `ClientHello` read, together, did not complete within the
+    /// pre-authentication deadline (`crate::serve::run_session`'s DoS hardening). Nothing is
+    /// sent to the peer before this is returned — see the call site for why not.
+    Timeout,
+    /// The peer authenticated successfully, but a session was already active; `Error` + `Close`
+    /// were already sent before this was returned.
+    Busy,
 }
 
 impl std::fmt::Display for HandshakeError {
@@ -54,6 +61,13 @@ impl std::fmt::Display for HandshakeError {
             HandshakeError::Rejected { code, reason } => {
                 write!(f, "handshake rejected (code {code}): {reason}")
             }
+            HandshakeError::Timeout => {
+                write!(
+                    f,
+                    "handshake did not complete within the pre-authentication deadline"
+                )
+            }
+            HandshakeError::Busy => write!(f, "rejected: a session was already active"),
         }
     }
 }
