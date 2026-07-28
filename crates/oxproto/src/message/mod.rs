@@ -116,7 +116,8 @@ pub mod feature {
 pub mod codec {
     /// Uncompressed BGRA8, top-down, tightly packed. Bring-up only.
     pub const RAW_BGRA: u8 = 1;
-    /// Annex-B H.264.
+    /// Annex-B H.264. Payload framing (parameter sets, keyframe/IDR semantics, NAL
+    /// delimiting) is pinned down in `OXPROTO.md` §9.1.
     pub const H264: u8 = 2;
     /// Annex-B H.265.
     pub const H265: u8 = 3;

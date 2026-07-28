@@ -1,17 +1,17 @@
 //! Byte-exact wire fixtures for the oxproto v1 format.
 //!
 //! Each fixture's expected bytes are written down by hand from
-//! `docs/design/OXPROTO.md` (framing §3, type registry §5, conventions §6) and the
-//! field order in `crates/oxproto/src/message/` — never produced by the encoder. An
-//! accidental change to any message body is caught here instead of at interop time.
+//! `docs/design/OXPROTO.md` (framing §3, type registry §5, conventions §6, H.264 payload
+//! format §9.1) and the field order in `crates/oxproto/src/message/` — never produced by the
+//! encoder. An accidental change to any message body is caught here instead of at interop time.
 //!
 //! Run with: `cargo test -p oxproto --test conformance`.
 
 use oxproto::{
-    channel, decode, encode_vec,
+    channel, codec, decode, encode_vec,
     message::{
-        msg_type, Close, CursorVisibility, FrameAck, Message, ModifierSync, Ping, Pong,
-        WindowClosed, WindowGeometry, WindowZOrder,
+        msg_type, window::frame_flag, Close, CursorVisibility, FrameAck, FrameData, Message,
+        ModifierSync, Ping, Pong, WindowClosed, WindowGeometry, WindowZOrder,
     },
 };
 
@@ -198,6 +198,169 @@ body_fixture!(
         0x08, 0x07, 0x06, 0x05, 0x04, 0x03, 0x02, 0x01,
     ]
 );
+
+// --- H.264 payload framing (§9.1) ---------------------------------------------
+
+/// Annex-B start code the encoder must emit before every NAL unit (§9.1).
+const START_CODE: [u8; 4] = [0x00, 0x00, 0x00, 0x01];
+
+/// A representative SPS NAL (`nal_ref_idc = 3`, `nal_unit_type = 7` — the top 3 bits of
+/// `0x67` are `011`, the bottom 5 are `00111`). Only the NAL header byte is meaningful to
+/// these fixtures: the protocol treats everything after it as opaque RBSP, so the remaining
+/// bytes are filler, not a decodable SPS.
+const SPS_NAL: [u8; 8] = [0x67, 0x42, 0x00, 0x1F, 0x8C, 0x8D, 0x40, 0x50];
+
+/// A representative PPS NAL (`nal_ref_idc = 3`, `nal_unit_type = 8`); see [`SPS_NAL`].
+const PPS_NAL: [u8; 4] = [0x68, 0xCE, 0x3C, 0x80];
+
+/// A representative IDR slice NAL (`nal_ref_idc = 3`, `nal_unit_type = 5`); see [`SPS_NAL`].
+const IDR_SLICE_NAL: [u8; 6] = [0x65, 0x88, 0x84, 0x00, 0x10, 0xFF];
+
+/// A representative non-IDR (P) slice NAL (`nal_ref_idc = 2`, `nal_unit_type = 1`).
+const P_SLICE_NAL: [u8; 5] = [0x41, 0x9A, 0x24, 0x6C, 0x03];
+
+/// Build a `FrameData.data` payload the way §9.1 mandates: every NAL unit prefixed with the
+/// Annex-B start code, concatenated in decode order.
+fn annex_b(nals: &[&[u8]]) -> Vec<u8> {
+    let mut buf = Vec::new();
+    for nal in nals {
+        buf.extend_from_slice(&START_CODE);
+        buf.extend_from_slice(nal);
+    }
+    buf
+}
+
+body_fixture!(
+    h264_keyframe_with_parameter_sets_bytes,
+    FrameData,
+    FrameData {
+        window_id: 0x1122_3344,
+        frame_id: 1,
+        codec: codec::H264,
+        flags: frame_flag::KEYFRAME,
+        width: 800,
+        height: 600,
+        captured_us: 100_000,
+        encoded_us: 105_000,
+        data: annex_b(&[&SPS_NAL, &PPS_NAL, &IDR_SLICE_NAL]),
+    },
+    [
+        // window_id: u32 LE
+        0x44, 0x33, 0x22, 0x11, // frame_id: u64 LE (lo32, hi32) = 1
+        0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // codec: H264 (2)
+        0x02, // flags: KEYFRAME (bit0)
+        0x01, // width: u16 LE (800)
+        0x20, 0x03, // height: u16 LE (600)
+        0x58, 0x02, // captured_us: u64 LE (100_000 = 0x0001_86A0)
+        0xA0, 0x86, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00,
+        // encoded_us: u64 LE (105_000 = 0x0001_9A28)
+        0x28, 0x9A, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, // data: u32 LE length (30 bytes)
+        0x1E, 0x00, 0x00, 0x00,
+        // data: start-code + SPS(7) + start-code + PPS(8) + start-code + IDR slice(5) —
+        // parameter sets attached because KEYFRAME is set (§9.1)
+        0x00, 0x00, 0x00, 0x01, 0x67, 0x42, 0x00, 0x1F, 0x8C, 0x8D, 0x40, 0x50, //
+        0x00, 0x00, 0x00, 0x01, 0x68, 0xCE, 0x3C, 0x80, //
+        0x00, 0x00, 0x00, 0x01, 0x65, 0x88, 0x84, 0x00, 0x10, 0xFF,
+    ]
+);
+
+body_fixture!(
+    h264_delta_frame_no_parameter_sets_bytes,
+    FrameData,
+    FrameData {
+        window_id: 0x1122_3344,
+        frame_id: 2,
+        codec: codec::H264,
+        flags: 0,
+        width: 800,
+        height: 600,
+        captured_us: 150_000,
+        encoded_us: 152_000,
+        data: annex_b(&[&P_SLICE_NAL]),
+    },
+    [
+        // window_id: u32 LE
+        0x44, 0x33, 0x22, 0x11, // frame_id: u64 LE (lo32, hi32) = 2
+        0x02, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // codec: H264 (2)
+        0x02, // flags: none set — not a keyframe, so no parameter sets (§9.1)
+        0x00, // width: u16 LE (800, unchanged)
+        0x20, 0x03, // height: u16 LE (600, unchanged)
+        0x58, 0x02, // captured_us: u64 LE (150_000 = 0x0002_49F0)
+        0xF0, 0x49, 0x02, 0x00, 0x00, 0x00, 0x00, 0x00,
+        // encoded_us: u64 LE (152_000 = 0x0002_51C0)
+        0xC0, 0x51, 0x02, 0x00, 0x00, 0x00, 0x00, 0x00, // data: u32 LE length (9 bytes)
+        0x09, 0x00, 0x00, 0x00,
+        // data: start-code + non-IDR slice(1) — no SPS/PPS on a non-keyframe
+        0x00, 0x00, 0x00, 0x01, 0x41, 0x9A, 0x24, 0x6C, 0x03,
+    ]
+);
+
+body_fixture!(
+    h264_keyframe_after_resize_bytes,
+    FrameData,
+    FrameData {
+        window_id: 0x1122_3344,
+        frame_id: 3,
+        codec: codec::H264,
+        flags: frame_flag::KEYFRAME,
+        width: 640,
+        height: 480,
+        captured_us: 300_000,
+        encoded_us: 306_000,
+        data: annex_b(&[&SPS_NAL, &PPS_NAL, &IDR_SLICE_NAL]),
+    },
+    [
+        // window_id: u32 LE
+        0x44, 0x33, 0x22, 0x11, // frame_id: u64 LE (lo32, hi32) = 3
+        0x03, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // codec: H264 (2)
+        0x02, // flags: KEYFRAME — mandatory because width/height changed (§9.1)
+        0x01, // width: u16 LE (640, changed from 800)
+        0x80, 0x02, // height: u16 LE (480, changed from 600)
+        0xE0, 0x01, // captured_us: u64 LE (300_000 = 0x0004_93E0)
+        0xE0, 0x93, 0x04, 0x00, 0x00, 0x00, 0x00, 0x00,
+        // encoded_us: u64 LE (306_000 = 0x0004_AB50)
+        0x50, 0xAB, 0x04, 0x00, 0x00, 0x00, 0x00, 0x00,
+        // data: u32 LE length (30 bytes) — fresh SPS/PPS accompanying the resize
+        0x1E, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0x67, 0x42, 0x00, 0x1F, 0x8C, 0x8D, 0x40,
+        0x50, //
+        0x00, 0x00, 0x00, 0x01, 0x68, 0xCE, 0x3C, 0x80, //
+        0x00, 0x00, 0x00, 0x01, 0x65, 0x88, 0x84, 0x00, 0x10, 0xFF,
+    ]
+);
+
+/// The H.264-specific constants are part of the wire contract too (§9.1): pin them so an
+/// edit to the codec or flag registries cannot silently change what a deployed peer already
+/// negotiated.
+#[test]
+fn h264_codec_and_keyframe_flag_match_spec() {
+    assert_eq!(codec::H264, 2);
+    assert_eq!(frame_flag::KEYFRAME, 1);
+}
+
+/// `is_keyframe()` is how implementations are expected to read `flags` (§9.1: KEYFRAME means
+/// IDR for H.264) — exercise it directly against both an IDR and a non-IDR access unit.
+#[test]
+fn h264_is_keyframe_reflects_idr_flag() {
+    let idr = FrameData {
+        window_id: 1,
+        frame_id: 0,
+        codec: codec::H264,
+        flags: frame_flag::KEYFRAME,
+        width: 800,
+        height: 600,
+        captured_us: 0,
+        encoded_us: 0,
+        data: annex_b(&[&SPS_NAL, &PPS_NAL, &IDR_SLICE_NAL]),
+    };
+    assert!(idr.is_keyframe());
+
+    let delta = FrameData {
+        flags: 0,
+        data: annex_b(&[&P_SLICE_NAL]),
+        ..idr.clone()
+    };
+    assert!(!delta.is_keyframe());
+}
 
 // --- Chunk envelope ----------------------------------------------------------
 

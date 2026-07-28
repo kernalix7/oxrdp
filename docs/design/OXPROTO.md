@@ -186,13 +186,94 @@ Codec ids are a registry; `0` is invalid (so an all-zero field cannot look like 
 | Id | Codec |
 |---|---|
 | 1 | `RAW_BGRA` — uncompressed BGRA8, top-down, tightly packed. Bring-up only. |
-| 2 | `H264` — Annex-B H.264 *(planned)* |
+| 2 | `H264` — Annex-B H.264 *(planned)*, payload format pinned down in §9.1 |
 | 3 | `H265` *(planned)* |
 | 4 | `AV1` *(planned)* |
 
 `RAW_BGRA` is bring-up only and must be treated as such: 1920×1080×4 at 60 fps is ~4 Gbit/s.
 The bring-up milestone deliberately targets **800×600 at 30 fps (~460 Mbit/s)**, which a
 loopback or LAN link can carry; anything larger requires a real codec.
+
+### 9.1 H.264 payload format (`codec::H264`)
+
+This subsection pins down everything `FrameData.data` (§12) must contain when
+`codec == H264`, so an encoder and a decoder built independently against this document need no
+side channel to agree on a single byte. It does not change `FrameData`'s own wire layout —
+only what its `data` blob is allowed to hold.
+
+**NAL framing: Annex-B, one access unit per `FrameData`.** The encoder emits the 4-byte start
+code (`00 00 00 01`) before every NAL unit in `data`, including the first, so the byte layout
+is fully determined; a decoder must also accept the 3-byte form (`00 00 01`) for any NAL unit,
+since that is what a general-purpose Annex-B demuxer produces and rejecting it buys nothing.
+There is no trailing terminator — `data`'s own length prefix (§12) is authoritative, exactly
+like every other blob field in this protocol. Each `FrameData` carries exactly one access unit
+(one `frame_id`, one picture): `data` is the concatenation, in decode order, of every NAL unit
+belonging to that picture. Ordinarily that is a single slice NAL; an encoder using multi-slice
+pictures may emit more than one, and the protocol does not care how many, only that they all
+share this `frame_id`. A `FrameData` never spans more than one picture.
+
+**Parameter sets are in-band, on every keyframe, and only there.** SPS and PPS are never sent
+standalone and never out of band. Whenever `flags & KEYFRAME` is set (defined below), `data`
+begins with exactly one SPS NAL (`nal_unit_type == 7`) followed by exactly one PPS NAL
+(`nal_unit_type == 8`), each with its own start code, followed by the slice NAL(s). A
+non-keyframe `FrameData` must not contain an SPS or PPS NAL. This is the choice that lets a
+client attach to an in-progress stream and decode immediately: parameter sets sent once out of
+band leave a window — a client that joins between that message and the next keyframe holds a
+bitstream it cannot parse, and this protocol has no message type for "a client just joined,
+resend the parameter sets" without adding one. Repeating SPS+PPS (tens of bytes) on every
+keyframe costs nothing that matters, since keyframes are already the largest, least frequent
+frames, and it removes the race entirely. Consequently: **the agent must send a keyframe as the
+first `FrameData` for a window in every session**, including when it reports an already-open
+window to a newly-connecting or reconnecting client, so a joining client is never left waiting
+for one.
+
+**`flags & KEYFRAME` means IDR, not "any I-frame".** An H.264 access unit can be intra-coded
+(every slice an I slice) without being an IDR: such a frame resets picture content but not the
+reference picture buffer, so a later P frame could in principle still depend on a picture before
+it, and a decoder that starts there has no guarantee of a correct decode. An IDR access unit
+(`nal_unit_type == 5`) carries no such risk by construction — nothing after it may depend on
+anything before it. `frame_flag::KEYFRAME` (bit 0, unchanged) is therefore defined, for H.264,
+as: set if and only if the access unit's slice NAL(s) are IDR; clear for every other picture,
+including a non-IDR I-frame if an encoder ever produces one. Only a `KEYFRAME` frame is safe to
+start decoding from — that is what a joining client waits for.
+
+No additional flag bit is needed for H.264 v1: whether parameter sets are present is fully
+implied by `KEYFRAME` (present if and only if set, per the rule above), so a dedicated
+"parameter-sets-present" bit would be redundant. Bits 1–7 of `FrameData.flags` stay reserved
+(§12: must be zero, ignored on receipt) for a future codec or feature that genuinely needs one.
+
+**Resolution changes.** `WindowGeometry` (§11, channel 3) and `FrameData` for the same window
+(the window's own video channel, ≥16, §4) ride different channels with no ordering guarantee
+between them, so a decoder must size its output surface from `FrameData.width`/`height`, never
+from the most recently seen `WindowGeometry`. Whenever the encoder changes the picture's coded
+size it must treat that frame like the start of a new stream for framing purposes: emit fresh
+SPS/PPS (carrying the new dimensions) and set `KEYFRAME`, by the same in-band rule as above.
+Consequently a decoder may assume the converse: for a given `window_id`, `width`/`height` only
+ever change on a `KEYFRAME` frame, with fresh parameter sets already attached — never on a
+non-keyframe.
+
+**No B-frames.** The encoder must run zero-latency: no frame reordering, no B slices — capture
+order, encode order and `frame_id` order are the same sequence. This is not only a latency
+preference; it is required for §12's flow control to stay correct. The agent may drop the oldest
+unacknowledged frame for a window and encode only the newest content instead (§12), which is
+only safe if no future picture's decode depends on a picture the encoder might skip. Reordering
+would make a dropped frame potentially load-bearing for pictures the encoder has not produced
+yet.
+
+**Unknown NAL types.** SEI (`nal_unit_type == 6`), an access unit delimiter (`9`), filler data
+(`12`), or any other NAL type may appear in `data` alongside what is specified above. A decoder
+must skip any NAL unit type it has no use for rather than treat its presence as an error — the
+same "unknown things are skipped, not fatal" rule as design rule 6 and the chunk envelope itself.
+
+**`captured_us` / `encoded_us` under a real encoder.** Their definitions in §12 hold unchanged
+— `captured_us` is when capture completed, `encoded_us` is when the compressed bitstream for
+*this* access unit became available — but they are only well-behaved together with the
+no-B-frames rule above: because encode order equals capture order, `encoded_us` for a given
+`frame_id` is always ≥ that same frame's `captured_us`, and `encoded_us` is non-decreasing in
+`frame_id` order. Neither held automatically for `RAW_BGRA`, where capture and "encode" are
+close enough to simultaneous not to matter; a real H.264 encoder can take milliseconds, and it
+is exactly that gap — per frame, and its trend over time — that `FrameAck`-based flow control
+(§12) exists to react to.
 
 ## 10. Display, DPI and scaling
 
@@ -248,11 +329,11 @@ assumes the field name means A,R,G,B in memory will render the channels swapped.
 | `window_id` | u32 | |
 | `frame_id` | u64 | monotonic per window |
 | `codec` | u8 | |
-| `flags` | u8 | bit0 keyframe |
+| `flags` | u8 | bit0 `frame_flag::KEYFRAME`; precise meaning is codec-specific — see §9.1 for `H264` |
 | `width`, `height` | u16, u16 | |
 | `captured_us` | u64 | agent clock, when capture completed |
-| `encoded_us` | u64 | agent clock, when encoding completed |
-| `data` | `u32` length + bytes | codec bitstream (fragmented across chunks as needed) |
+| `encoded_us` | u64 | agent clock, when the compressed bitstream for this frame became available |
+| `data` | `u32` length + bytes | codec bitstream, one access unit (fragmented across chunks as needed); framing is codec-specific — see §9.1 for `H264` |
 
 **`FrameAck`** (C→A) — `{ window_id, frame_id, decoded_us, presented_us }`, both on the client's
 clock; the agent only needs the difference between successive acks and its own send time.

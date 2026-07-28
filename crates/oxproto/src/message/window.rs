@@ -33,7 +33,9 @@ pub mod window_show {
 
 /// Bits in `FrameData.flags`.
 pub mod frame_flag {
-    /// This frame is a keyframe / full refresh.
+    /// This frame is a keyframe / full refresh — decodable without any earlier frame for the
+    /// window. Precise per-codec meaning (e.g. IDR, not any I-frame, for `H264`) is defined in
+    /// `OXPROTO.md` §9.1.
     pub const KEYFRAME: u8 = 1 << 0;
 }
 
@@ -330,9 +332,12 @@ pub struct FrameData {
     pub height: u16,
     /// Capture timestamp in microseconds.
     pub captured_us: u64,
-    /// Encode completion timestamp in microseconds.
+    /// Timestamp, in microseconds, when the compressed bitstream for this frame became
+    /// available. For a real encoder this is `>= captured_us`; see `OXPROTO.md` §9.1.
     pub encoded_us: u64,
-    /// Encoded frame bytes.
+    /// Encoded bytes for exactly one access unit (one picture). Codec-specific framing —
+    /// NAL delimiting, parameter-set placement, keyframe semantics — is defined in
+    /// `OXPROTO.md` §9, see §9.1 for `H264`.
     pub data: Vec<u8>,
 }
 
