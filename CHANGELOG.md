@@ -27,15 +27,23 @@ Fixed:
   attacker's input — narrow, but a violation of the function's own documented contract. It now
   always runs the expected length.
 
-Outstanding, and tracked:
+Also fixed, and verified against the live guest:
 
-- **An unauthenticated denial of service.** The accept loop handshakes and serves sequentially
-  with no timeout anywhere, so one idle TCP connection blocks the listener indefinitely and
-  locks out the operator. Being fixed by spawning per connection under a single pre-auth
-  deadline, with a bounded number of connections in that phase and one authenticated session at
-  a time preserved.
-- A panic in the per-connection path takes down the whole process, since sessions are awaited
-  directly rather than spawned. Per-connection spawning resolves this too.
+- **An unauthenticated denial of service.** The accept loop handshook and served sequentially
+  with no timeout anywhere in the crate, so one TCP connection that sent nothing blocked
+  `accept()` indefinitely and locked out the operator. Connections now get their own task under
+  a single pre-auth deadline, with a bounded number of connections in that phase and one
+  authenticated session at a time preserved. Measured on the guest: a silent peer is now closed
+  after 20s, and a legitimate TLS handshake completes immediately while three silent peers are
+  held — before, it never completed at all.
+- A panic in the per-connection path took down the whole process, since sessions were awaited
+  directly rather than spawned. Per-connection tasks bound it to one session.
+
+Those tasks use `LocalSet`/`spawn_local` rather than `tokio::spawn`, which is the detail that
+would have shipped broken: WinRT and D3D11 interfaces are `!Send`, and the host build never
+sees it because the module is `cfg(windows)` — only the Windows cross-compile catches it. The
+fix is to keep those tasks on the thread that already owned the COM objects, not to assert
+`Send` for them.
 
 Examined and found sound: the pin is checked before any success is returned and the signature
 verifiers delegate to the pinned certificate; the pre-auth reassembly bounds hold across every
