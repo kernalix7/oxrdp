@@ -7,11 +7,14 @@
 //! sees `RAW_BGRA` and stays codec-agnostic.
 #![forbid(unsafe_code)]
 
+pub mod clock;
 pub mod decode;
 pub mod geometry;
 pub mod model;
 pub mod session;
 
+pub use clock::ClientClock;
+pub use decode::pipeline::{DecodePipeline, DroppedFrame, FrameSink};
 pub use decode::{DecodeError, Decoder, WindowDecoders};
 pub use geometry::GeometrySync;
 pub use model::{ModelChange, RemoteWindow, WindowModel};

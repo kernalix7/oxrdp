@@ -28,6 +28,7 @@ use std::fmt;
 
 use oxproto::message::{codec, FrameData};
 
+pub mod pipeline;
 pub mod yuv;
 
 #[cfg(feature = "h264")]

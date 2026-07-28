@@ -12,6 +12,8 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 use std::time::Instant;
 
+use oxclient::clock::ClientClock;
+use oxclient::decode::pipeline::{Backpressure, DecodePipeline, DroppedFrame, FrameSink};
 use oxclient::decode::{self, WindowDecoders};
 use oxclient::geometry::GeometrySync;
 use oxclient::session::{ClientSession, SessionConfig};
@@ -294,27 +296,87 @@ async fn run_windowed(
     }
 }
 
-async fn run_session_task<S: AsyncRead + AsyncWrite + Unpin>(
+/// Everything the session task hands to the display thread.
+///
+/// A trait so the session task can be exercised without a window system: `CommandSender` is a
+/// winit event-loop proxy, which cannot exist without a display server, and the behaviour worth
+/// testing here — that input keeps flowing while decode is busy — has nothing to do with winit.
+trait CommandSink: Clone + Send + 'static {
+    /// Hand one command to the display thread. `false` means it is gone.
+    fn send(&self, command: DisplayCommand) -> bool;
+}
+
+impl CommandSink for CommandSender {
+    fn send(&self, command: DisplayCommand) -> bool {
+        CommandSender::send(self, command).is_ok()
+    }
+}
+
+/// Decoded frames go straight from a decode worker to the display thread.
+///
+/// The session task is deliberately not in this path: routing frames back through it would put
+/// the pixel copy back on the task that also writes input events, which is the coupling this
+/// whole arrangement exists to remove.
+#[derive(Clone)]
+struct DisplaySink<C: CommandSink>(C);
+
+impl<C: CommandSink> FrameSink for DisplaySink<C> {
+    fn deliver(&self, frame: FrameData) -> bool {
+        self.0.send(DisplayCommand::Frame(frame))
+    }
+}
+
+/// Resolves when a stalled window's decode queue has room again.
+///
+/// Cancel-safe, which is what lets it sit in a `select!` arm: `reserve` either yields a permit or
+/// yields nothing, and dropping the permit hands the slot straight back. The caller is the only
+/// producer on that queue, so the slot is still free when it sends.
+async fn wait_for_decode_room(queue: Option<tokio::sync::mpsc::Sender<FrameData>>) -> bool {
+    match queue {
+        Some(queue) => queue.reserve().await.is_ok(),
+        // Never selected: the branch is disabled whenever there is no stalled frame.
+        None => std::future::pending().await,
+    }
+}
+
+async fn run_session_task<S, C>(
     mut session: ClientSession<S>,
-    commands: CommandSender,
+    commands: C,
     mut display_events: mpsc::UnboundedReceiver<DisplayEvent>,
-) -> io::Result<()> {
+) -> io::Result<()>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+    C: CommandSink,
+{
     let mut model = WindowModel::new();
-    let mut decoders = WindowDecoders::new();
     let mut geometry = GeometrySync::new();
     let clock = ClientClock::new();
 
+    // Decode runs on one worker thread per window, and decoded frames go from there straight to
+    // the display thread. This task keeps only the protocol: reading the wire, writing input,
+    // and acknowledging frames.
+    let (dropped_tx, mut dropped_rx) = mpsc::unbounded_channel();
+    let mut decoders = DecodePipeline::new(DisplaySink(commands.clone()), dropped_tx, clock);
+    // A frame a worker had no room for. While one is held, this task stops reading the wire —
+    // see `oxclient::decode::pipeline` for why the client must not simply drop it.
+    let mut stalled: Option<Backpressure> = None;
+
     loop {
+        // Cloned out before the `select!` so the waiting branch owns its queue handle and the
+        // handler is free to take `stalled`.
+        let stalled_queue = stalled.as_ref().map(|held| held.queue.clone());
+        let is_stalled = stalled_queue.is_some();
+
         tokio::select! {
-            event = session.next_event() => {
+            event = session.next_event(), if !is_stalled => {
                 let event = match event {
                     Ok(Some(event)) => event,
                     Ok(None) => {
-                        let _ = commands.send(DisplayCommand::Shutdown);
+                        commands.send(DisplayCommand::Shutdown);
                         return Ok(());
                     }
                     Err(error) => {
-                        let _ = commands.send(DisplayCommand::Shutdown);
+                        commands.send(DisplayCommand::Shutdown);
                         return Err(error);
                     }
                 };
@@ -354,46 +416,54 @@ async fn run_session_task<S: AsyncRead + AsyncWrite + Unpin>(
                         _ => {}
                     }
                     let command = match change {
-                        // Decode happens here rather than in the display layer so that what
-                        // crosses to the winit thread is always presentable pixels.
-                        //
-                        // It is also synchronous on this task, which costs the input path up to
-                        // one frame's decode time in added latency. That is the right trade at
-                        // 800x600 and the wrong one at 4K; `Decoder` is `Send` precisely so this
-                        // can move to its own thread without touching anything else.
+                        // Frames leave this task immediately. A worker decodes and hands the
+                        // pixels to the display thread itself, so no frame's decode time is
+                        // charged to the input path.
                         ModelChange::Frame(frame) => {
-                            let (window_id, frame_id) = (frame.window_id, frame.frame_id);
-                            match decode_for_present(&mut decoders, frame) {
-                                Some(decoded) => Some(DisplayCommand::Frame(decoded)),
-                                None => {
-                                    // A frame that will never be presented still has to be
-                                    // acknowledged. The agent keeps a bounded number of
-                                    // unacknowledged frames per window (OXPROTO.md §12) and the
-                                    // display layer only reports frames it actually presented,
-                                    // so a client joining mid-GOP would otherwise spend that
-                                    // budget on frames it dropped and stall the window.
-                                    let now = clock.now_us();
-                                    if let Err(error) =
-                                        send_frame_ack(&mut session, window_id, frame_id, now, now)
-                                            .await
-                                    {
-                                        let _ = commands.send(DisplayCommand::Shutdown);
-                                        return Err(error);
-                                    }
-                                    None
-                                }
+                            if let Err(backpressure) = decoders.submit(frame) {
+                                stalled = Some(backpressure);
                             }
+                            None
                         }
                         other => display_command_for_change(&model, other),
                     };
                     if let Some(command) = command {
-                        if commands.send(command).is_err() {
+                        if !commands.send(command) {
                             return Ok(());
                         }
                     }
                 }
                 if closed {
                     return Ok(());
+                }
+            }
+            // A worker freed a slot, so the frame this task was holding can go. Input has kept
+            // flowing throughout: refusing to read the wire is what pushes back on the agent,
+            // and it costs the input path nothing.
+            alive = wait_for_decode_room(stalled_queue), if is_stalled => {
+                if let Some(held) = stalled.take() {
+                    if alive {
+                        // Sole producer on that queue: the slot reserved above is still free.
+                        let _ = held.queue.try_send(held.frame);
+                    }
+                }
+            }
+            // A frame that will never be presented still has to be acknowledged. The agent keeps
+            // a bounded number of unacknowledged frames per window (OXPROTO.md §12) and the
+            // display layer only reports frames it actually presented, so a client joining
+            // mid-GOP would otherwise spend that budget on frames it dropped and stall the
+            // window. The decision now happens on a worker, which is why this arrives by channel
+            // rather than being decided here.
+            dropped = dropped_rx.recv() => {
+                let Some(DroppedFrame { window_id, frame_id, finished_us }) = dropped else {
+                    return Ok(());
+                };
+                if let Err(error) =
+                    send_frame_ack(&mut session, window_id, frame_id, finished_us, finished_us)
+                        .await
+                {
+                    commands.send(DisplayCommand::Shutdown);
+                    return Err(error);
                 }
             }
             event = display_events.recv() => {
@@ -403,25 +473,10 @@ async fn run_session_task<S: AsyncRead + AsyncWrite + Unpin>(
                 if let Err(error) =
                     handle_display_event(&mut session, &clock, &model, &mut geometry, event).await
                 {
-                    let _ = commands.send(DisplayCommand::Shutdown);
+                    commands.send(DisplayCommand::Shutdown);
                     return Err(error);
                 }
             }
-        }
-    }
-}
-
-/// Decodes one frame into presentable pixels, or `None` if there is nothing to show.
-///
-/// A decode failure is per frame and never ends the session: it is logged and the frame is
-/// dropped, exactly like a frame the decoder legitimately swallows while waiting for a keyframe.
-fn decode_for_present(decoders: &mut WindowDecoders, frame: FrameData) -> Option<FrameData> {
-    let (window_id, frame_id) = (frame.window_id, frame.frame_id);
-    match decoders.decode(frame) {
-        Ok(decoded) => decoded,
-        Err(error) => {
-            eprintln!("oxclient: window {window_id} frame {frame_id} dropped: {error}");
-            None
         }
     }
 }
@@ -747,26 +802,6 @@ fn print_event(event: &ClientEvent, frame_counts: &mut HashMap<u32, u64>) {
     }
 }
 
-struct ClientClock {
-    start: Instant,
-}
-
-impl ClientClock {
-    fn new() -> Self {
-        Self {
-            start: Instant::now(),
-        }
-    }
-
-    fn now_us(&self) -> u64 {
-        self.start
-            .elapsed()
-            .as_micros()
-            .try_into()
-            .unwrap_or(u64::MAX)
-    }
-}
-
 /// Render a `WindowOpened.flags` bitmask as the set of named flags it carries.
 ///
 /// Unknown bits are reported as a residual hex value rather than dropped, so a client built
@@ -798,11 +833,12 @@ fn describe_window_flags(flags: u32) -> String {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::{Arc, Mutex};
     use std::time::Duration;
 
     use oxclient::geometry::SETTLE;
     use oxproto::envelope::{channel, Reassembler};
-    use oxproto::message::window::window_flag;
+    use oxproto::message::window::{frame_flag, window_flag};
     use oxproto::message::{ServerHello, WindowOpened};
     use oxtransport::{read_message, write_message};
     use tokio::io::DuplexStream;
@@ -1040,6 +1076,154 @@ mod tests {
         // The guest is told about the displacement applied to its own position, never about a
         // host screen coordinate it has no room for.
         assert_eq!((control.x, control.y), (140, 185));
+    }
+
+    /// A display thread that can be frozen mid-frame.
+    ///
+    /// Blocking in `send` is exactly what a worker busy decoding looks like from the session
+    /// task: the frame is somewhere else, and this task is not waiting on it.
+    #[derive(Clone)]
+    struct GatedCommands {
+        commands: std::sync::mpsc::Sender<DisplayCommand>,
+        gate: Arc<Mutex<Option<std::sync::mpsc::Receiver<()>>>>,
+    }
+
+    impl CommandSink for GatedCommands {
+        fn send(&self, command: DisplayCommand) -> bool {
+            if matches!(command, DisplayCommand::Frame(_)) {
+                if let Some(gate) = self.gate.lock().expect("the gate is not poisoned").as_ref() {
+                    let _ = gate.recv();
+                }
+            }
+            self.commands.send(command).is_ok()
+        }
+    }
+
+    fn raw_frame(window_id: u32, frame_id: u64) -> Message {
+        Message::FrameData(oxproto::message::FrameData {
+            window_id,
+            frame_id,
+            codec: oxproto::codec::RAW_BGRA,
+            flags: frame_flag::KEYFRAME,
+            width: 2,
+            height: 2,
+            captured_us: frame_id,
+            encoded_us: frame_id,
+            data: vec![0x20; 2 * 2 * 4],
+        })
+    }
+
+    /// The reason this whole arrangement exists: a frame being decoded must not delay input.
+    ///
+    /// Decode is frozen here for the duration, and every queue between the wire and the decoder
+    /// is filled, so the session task is holding a frame it cannot place — the worst case the
+    /// design has to survive. An input event fed in that state must still reach the agent. When
+    /// decode ran on the session task this could not have held: the task would have been inside
+    /// the decoder, and the input branch of its `select!` could not run until it returned.
+    #[tokio::test]
+    async fn input_reaches_the_agent_while_decode_is_blocked() {
+        let (client_io, mut server_io) = tokio::io::duplex(1024 * 1024);
+        let (release, gate) = std::sync::mpsc::channel();
+        let (display_tx, _display_rx) = std::sync::mpsc::channel();
+        let (events_tx, events_rx) = mpsc::unbounded_channel();
+
+        let server = tokio::spawn(async move {
+            let mut reassembler = Reassembler::new();
+            let _ = read_message(&mut server_io, &mut reassembler).await;
+            write_message(
+                &mut server_io,
+                &Message::ServerHello(ServerHello {
+                    version: 1,
+                    features: feature::WINDOW_CONTROL,
+                    session_id: 1,
+                    codec: oxproto::codec::RAW_BGRA,
+                }),
+                channel::CONTROL,
+            )
+            .await
+            .expect("hello");
+
+            write_message(
+                &mut server_io,
+                &Message::WindowOpened(WindowOpened {
+                    window_id: 1,
+                    video_channel: channel::VIDEO_BASE,
+                    pid: 1,
+                    app_id: "app.exe".into(),
+                    title: "app".into(),
+                    x: 0,
+                    y: 0,
+                    width: 2,
+                    height: 2,
+                    dpi: 96,
+                    flags: window_flag::RESIZABLE,
+                    owner_id: 0,
+                }),
+                channel::CONTROL,
+            )
+            .await
+            .expect("window");
+
+            // Comfortably more frames than the worker's queue holds, so the session task ends up
+            // holding one it cannot place.
+            for frame_id in 0..16 {
+                write_message(&mut server_io, &raw_frame(1, frame_id), channel::VIDEO_BASE)
+                    .await
+                    .expect("frame");
+            }
+            (server_io, reassembler)
+        });
+
+        let session = ClientSession::connect(client_io, &test_config())
+            .await
+            .expect("handshake");
+        let (mut server_io, mut reassembler) = server.await.expect("peer");
+
+        let commands = GatedCommands {
+            commands: display_tx,
+            gate: Arc::new(Mutex::new(Some(gate))),
+        };
+        let task = tokio::spawn(run_session_task(session, commands, events_rx));
+
+        // Give the frames time to arrive and jam the pipeline before input is offered, so the
+        // test is exercising the stalled state rather than racing it.
+        tokio::time::sleep(Duration::from_millis(150)).await;
+
+        events_tx
+            .send(DisplayEvent::Pointer {
+                window_id: 1,
+                x: 42,
+                y: 24,
+                buttons: 1,
+                wheel_x: 0,
+                wheel_y: 0,
+            })
+            .expect("the session task is listening");
+
+        // The pointer event must arrive while decode is still frozen. Without the timeout a
+        // regression here would hang rather than fail.
+        let pointer = tokio::time::timeout(
+            Duration::from_secs(5),
+            read_message(&mut server_io, &mut reassembler),
+        )
+        .await
+        .expect("input must not wait for decode")
+        .expect("a message arrives")
+        .expect("and decodes");
+
+        match pointer {
+            Message::PointerEvent(event) => {
+                assert_eq!((event.x, event.y), (42, 24));
+                assert_eq!(event.buttons, 1);
+            }
+            other => panic!("expected PointerEvent, got {:#04x}", other.msg_type()),
+        }
+
+        // Unfreeze so the task can finish rather than leaking a blocked worker.
+        for _ in 0..32 {
+            let _ = release.send(());
+        }
+        task.abort();
     }
 
     #[tokio::test]
