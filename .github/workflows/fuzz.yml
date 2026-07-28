@@ -1,0 +1,67 @@
+# Deeper, coverage-guided fuzzing of the oxproto decoder (`fuzz/`), on top of the
+# deterministic smoke-fuzz that already runs on every push via `cargo test --workspace`
+# (`crates/oxproto/tests/robustness.rs`).
+#
+# Not on push/pull_request, deliberately: `cargo-fuzz` needs nightly, which the rest of the
+# workspace is pinned away from on purpose (see `fuzz/Cargo.toml` — it is its own `[workspace]`
+# for exactly this reason), and a coverage-guided run worth anything takes longer than a PR gate
+# should block a merge on. Scheduled instead: a regression surfaces within a day instead of
+# never, without slowing down every push. `workflow_dispatch` is there for an on-demand run —
+# after touching `crates/oxproto/src/envelope.rs` or the message decoders, for instance.
+#
+# Both fuzz targets (`message`, `reassembly`) were run locally against the code this workflow
+# was added against — 20 seconds each, ~1M and ~620K executions respectively, no crashes — to
+# confirm the commands below actually build and run before this file started claiming they do.
+name: Fuzz
+on:
+  schedule:
+    - cron: "17 3 * * *" # once a day; 03:17 UTC to land off the top-of-hour scheduling spike
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  fuzz:
+    runs-on: ubuntu-latest
+    strategy:
+      # One target's crash must not stop the other from running, and both should be visible in
+      # the same workflow run rather than needing a re-run to see the second failure.
+      fail-fast: false
+      matrix:
+        target: [message, reassembly]
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: dtolnay/rust-toolchain@nightly
+
+      # `fuzz/` is its own workspace (see the comment above), so it needs its own cache
+      # namespace — sharing one with the main workspace's stable-toolchain cache would just
+      # thrash both.
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: fuzz
+          shared-key: fuzz-${{ matrix.target }}
+
+      - name: Install cargo-fuzz
+        run: cargo install cargo-fuzz --locked
+
+      # 5 minutes per target per day. The corpus itself is not cached between runs (only the
+      # registry/target cache above is), so each run starts from libFuzzer's own seed
+      # generation rather than building on yesterday's corpus — acceptable here, since a crash
+      # is what this job exists to catch, not corpus coverage growth over time.
+      - name: Fuzz ${{ matrix.target }} for 5 minutes
+        working-directory: fuzz
+        run: cargo +nightly fuzz run ${{ matrix.target }} -- -max_total_time=300
+
+      # A hard failure above means libFuzzer found and minimized a crashing input, written to
+      # fuzz/artifacts/<target>/. Upload it so the failure is reproducible locally
+      # (`cargo +nightly fuzz run <target> fuzz/artifacts/<target>/<file>`) instead of only
+      # knowing a run failed.
+      - name: Upload the crashing input, if any
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fuzz-crash-${{ matrix.target }}
+          path: fuzz/artifacts/${{ matrix.target }}/
+          if-no-files-found: ignore

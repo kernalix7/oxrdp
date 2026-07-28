@@ -22,6 +22,10 @@ jobs:
         uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy, rustfmt
+      # `openh264` (pulled in by oxclient's default `h264` feature) vendors and compiles a C
+      # library, which otherwise dominates every cold `cargo clippy --workspace` run here.
+      - if: steps.guard.outputs.go == '1'
+        uses: Swatinem/rust-cache@v2
       - if: steps.guard.outputs.go == '1'
         run: cargo fmt --all -- --check
       - if: steps.guard.outputs.go == '1'
@@ -39,6 +43,12 @@ jobs:
           if [ -f Cargo.toml ]; then echo "go=1" >> "$GITHUB_OUTPUT"; else echo "no Cargo workspace yet — skipping"; echo "go=0" >> "$GITHUB_OUTPUT"; fi
       - if: steps.guard.outputs.go == '1'
         uses: dtolnay/rust-toolchain@stable
+      # Keyed per matrix arm: an ARM cache is useless (and would just be evicted) on the x86_64
+      # runner and vice versa.
+      - if: steps.guard.outputs.go == '1'
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: test-${{ matrix.runner }}
       # System libs the display/render/input shells need to build (X11, Wayland,
       # xkbcommon, VA-API). Harmless no-op for the pure core crates.
       - if: steps.guard.outputs.go == '1'
@@ -50,6 +60,13 @@ jobs:
         run: cargo build --workspace
       - if: steps.guard.outputs.go == '1'
         run: cargo test --workspace
+      # `h264` is on by default for oxclient and vendors + compiles `openh264` (a C library) via
+      # `openh264-sys2`. This build must keep passing without it: turning the feature off is
+      # what lets the validated RAW_BGRA bring-up path survive on a machine where the codec
+      # cannot build, and the default build staying green does not prove this one still does —
+      # see the `h264` feature doc in `crates/oxclient/Cargo.toml`.
+      - if: steps.guard.outputs.go == '1'
+        run: cargo test -p oxclient --no-default-features
 
   # The Windows guest agent is the component that matters most and never builds on a Linux
   # runner's default target — without this job it can break while CI stays green.
@@ -61,6 +78,11 @@ jobs:
         with:
           targets: x86_64-pc-windows-gnu
           components: clippy
+      # A distinct cache namespace from `test`'s ubuntu-latest run: same runner OS, different
+      # target triple, so sharing a key would mix host and cross-compiled artifacts for nothing.
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: agent-windows
       - name: Install the mingw-w64 cross toolchain
         run: |
           sudo apt-get update
