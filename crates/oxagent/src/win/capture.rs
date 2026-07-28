@@ -27,7 +27,7 @@ use windows::Graphics::Capture::{
 use windows::Graphics::DirectX::Direct3D11::IDirect3DDevice;
 use windows::Graphics::DirectX::DirectXPixelFormat;
 use windows::Graphics::SizeInt32;
-use windows::Win32::Foundation::{HMODULE, HWND};
+use windows::Win32::Foundation::{E_POINTER, HMODULE, HWND};
 use windows::Win32::Graphics::Direct3D::{D3D_DRIVER_TYPE_HARDWARE, D3D_DRIVER_TYPE_WARP};
 use windows::Win32::Graphics::Direct3D11::{
     D3D11CreateDevice, ID3D11Device, ID3D11DeviceContext, ID3D11Texture2D, D3D11_CPU_ACCESS_READ,
@@ -88,9 +88,14 @@ impl WindowCapture {
         let item: GraphicsCaptureItem = unsafe { interop.CreateForWindow(hwnd)? };
 
         let pool_size = item.Size()?;
+        // `Direct3D11CaptureFramePool` accepts exactly two pixel formats:
+        // `B8G8R8A8UIntNormalized` and `R16G16B16A16Float`. The *sRGB* BGRA variant looks like
+        // the obvious choice and compiles fine, but the pool rejects it at runtime with a bare
+        // `E_INVALIDARG` — which is indistinguishable from a bad HWND and cost a debugging
+        // session to pin down. Do not "restore" the sRGB form here.
         let frame_pool = Direct3D11CaptureFramePool::CreateFreeThreaded(
             &d3d_device,
-            DirectXPixelFormat::B8G8R8A8UIntNormalizedSrgb,
+            DirectXPixelFormat::B8G8R8A8UIntNormalized,
             FRAME_POOL_BUFFERS,
             pool_size,
         )?;
@@ -124,8 +129,20 @@ impl WindowCapture {
 
     /// Try to take the next frame. Returns `Ok(None)` when no new frame is queued.
     pub fn try_next_frame(&mut self) -> WinResult<Option<Frame>> {
-        let Ok(frame) = self.frame_pool.TryGetNextFrame() else {
-            return Ok(None);
+        // An empty pool is not an error, but windows-rs still reports it as one: the WinRT call
+        // succeeds with `S_OK` and hands back a *null* frame, and the generated binding turns any
+        // null return into `Err` — carrying the original, successful `S_OK` (some builds use
+        // `E_POINTER`). So the empty-pool sentinel is an `Err` whose HRESULT is not a failure.
+        //
+        // Both halves of this matter. Treating every error as an empty pool hides a genuinely
+        // broken capture as an idle window — a silent stall with nothing logged. Treating the
+        // empty pool as an error is worse: the caller drops the capture and rebuilds it on the
+        // next tick, so the pool is destroyed before it can ever fill, and the stream produces
+        // exactly zero frames forever while looking busy.
+        let frame = match self.frame_pool.TryGetNextFrame() {
+            Ok(frame) => frame,
+            Err(e) if e.code().is_ok() || e.code() == E_POINTER => return Ok(None),
+            Err(e) => return Err(e),
         };
 
         // A resized window changes ContentSize; the pool must be rebuilt or every later
@@ -134,7 +151,8 @@ impl WindowCapture {
         if content.Width != self.pool_size.Width || content.Height != self.pool_size.Height {
             self.frame_pool.Recreate(
                 &self.d3d_device,
-                DirectXPixelFormat::B8G8R8A8UIntNormalizedSrgb,
+                // Must match the format the pool was created with — see the note there.
+                DirectXPixelFormat::B8G8R8A8UIntNormalized,
                 FRAME_POOL_BUFFERS,
                 content,
             )?;

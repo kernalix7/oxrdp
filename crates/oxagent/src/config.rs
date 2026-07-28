@@ -17,6 +17,15 @@ pub struct AgentConfig {
     pub target_fps: u16,
     /// Maximum unacknowledged frames in flight per window before the agent drops stale ones.
     pub max_frames_in_flight: u8,
+    /// Permit `bind` to be a wildcard address.
+    ///
+    /// Refusing a wildcard by default is right for a normal host: this agent shares screen
+    /// content and injects input, so listening on every interface must never happen by
+    /// accident. But inside a VM whose only reachable path is one explicitly forwarded host
+    /// port, the guest's own address is assigned by DHCP and is not known when the config is
+    /// written — there, a wildcard is both necessary and no less safe than the forward itself.
+    /// That case must be stated deliberately rather than inferred.
+    pub allow_wildcard_bind: bool,
 }
 
 /// Error returned when configuration cannot be loaded.
@@ -73,6 +82,7 @@ impl Default for AgentConfig {
             key_path: PathBuf::from("oxagent-key.pem"),
             target_fps: 30,
             max_frames_in_flight: 2,
+            allow_wildcard_bind: false,
         }
     }
 }
@@ -91,6 +101,7 @@ impl AgentConfig {
     pub fn parse(text: &str) -> Result<Self, ConfigError> {
         let mut cfg = AgentConfig::default();
         let mut token_path_seen = false;
+        let mut bind_line: Option<usize> = None;
 
         // Windows editors routinely prepend a UTF-8 BOM. It is not Unicode whitespace, so
         // without this the first key silently becomes an unknown key and its line is ignored.
@@ -112,14 +123,28 @@ impl AgentConfig {
             let value = value.trim();
 
             match key {
-                // A wildcard bind is refused outright, not merely defaulted away from: this
-                // agent shares screen content and injects input, so exposing it on every
-                // interface must be a deliberate act outside this config, never a typo in it.
+                // A wildcard bind is refused unless `allow_wildcard_bind` says otherwise:
+                // this agent shares screen content and injects input, so exposing it on every
+                // interface must be a deliberate act, never a typo. The check happens after
+                // the whole file is read so the two keys may appear in either order.
                 "bind" => match value.parse::<SocketAddr>() {
-                    Ok(addr) if !addr.ip().is_unspecified() => cfg.bind = addr,
-                    _ => {
+                    Ok(addr) => {
+                        cfg.bind = addr;
+                        bind_line = Some(line_no);
+                    }
+                    Err(_) => {
                         return Err(ConfigError::Value {
                             key: "bind",
+                            line: line_no,
+                        })
+                    }
+                },
+                "allow_wildcard_bind" => match value {
+                    "true" => cfg.allow_wildcard_bind = true,
+                    "false" => cfg.allow_wildcard_bind = false,
+                    _ => {
+                        return Err(ConfigError::Value {
+                            key: "allow_wildcard_bind",
                             line: line_no,
                         })
                     }
@@ -154,6 +179,13 @@ impl AgentConfig {
 
         if !token_path_seen {
             return Err(ConfigError::Missing { key: "token_path" });
+        }
+        // Checked here rather than at the `bind` line so the two keys may appear in any order.
+        if cfg.bind.ip().is_unspecified() && !cfg.allow_wildcard_bind {
+            return Err(ConfigError::Value {
+                key: "bind",
+                line: bind_line.unwrap_or(0),
+            });
         }
 
         Ok(cfg)
@@ -255,6 +287,41 @@ max_frames_in_flight = 3
                 "{addr} must be refused"
             );
         }
+    }
+
+    #[test]
+    fn a_wildcard_bind_requires_an_explicit_opt_in() {
+        // Refused by default, whichever order the keys appear in.
+        assert!(matches!(
+            AgentConfig::parse("token_path = t\nbind = 0.0.0.0:7644\n"),
+            Err(ConfigError::Value { key: "bind", .. })
+        ));
+        assert!(matches!(
+            AgentConfig::parse("bind = [::]:7644\ntoken_path = t\n"),
+            Err(ConfigError::Value { key: "bind", .. })
+        ));
+
+        // Allowed when the operator says so — the VM-behind-a-port-forward case.
+        let cfg =
+            AgentConfig::parse("token_path = t\nbind = 0.0.0.0:7644\nallow_wildcard_bind = true\n")
+                .unwrap();
+        assert!(cfg.bind.ip().is_unspecified());
+        assert!(cfg.allow_wildcard_bind);
+
+        // And the opt-in may precede the bind line.
+        assert!(AgentConfig::parse(
+            "allow_wildcard_bind = true\ntoken_path = t\nbind = 0.0.0.0:7644\n"
+        )
+        .is_ok());
+
+        // A non-boolean opt-in is a config error, not a silent false.
+        assert!(matches!(
+            AgentConfig::parse("token_path = t\nallow_wildcard_bind = yes\n"),
+            Err(ConfigError::Value {
+                key: "allow_wildcard_bind",
+                line: 2
+            })
+        ));
     }
 
     #[test]
