@@ -262,12 +262,38 @@ split, and the client resolves it with four normative rules:
    remainder** — no scaling in the CPU presenter, ever; the GPU presenter may scale the stale
    frame at P5 but still snaps when the correctly-sized frame arrives. Guest size is
    authoritative only for the *pixel dimensions of the frame*.
-2. **Position on X11: the guest wins, bidirectionally synced.** `WindowOpened`/`WindowGeometry`
-   positions are applied via `set_outer_position`; local drags emit `MoveRequested` →
-   `WindowControl{move}` so the guest window follows and both coordinate spaces stay aligned.
-   winpodx provisions the guest virtual desktop to mirror the client's layout (it already
-   sends `DisplayLayout`), so the mapping is identity in v1; anything smarter waits for the
-   multi-monitor milestone.
+2. **Position on X11: the guest wins, and local moves are sent as *displacements*.**
+   `WindowOpened`/`WindowGeometry` positions are applied via `set_outer_position`; a local drag
+   emits `MoveRequested` → `WindowControl{move}`. What goes on the wire is the guest's own last
+   known position plus how far the window just moved — **never an observed local position**.
+
+   > **Corrected 2026-07-28.** This rule previously said the mapping was identity, because
+   > winpodx provisions the guest desktop to mirror the client's layout. That premise does not
+   > hold for oxrdp's own guest: it is a 1280x800 desktop while the client's X screen extends
+   > past x=3200, and taking it literally is what shipped a real bug — connecting the client
+   > pushed host coordinates into the guest as if they were guest coordinates, leaving windows
+   > moved off the desktop and, in one case, resized to 1x52. Do not restore the identity
+   > mapping on the strength of a claim about how the guest was provisioned; oxrdp does not
+   > control that, and a client cannot even check it, because there is no agent→client message
+   > carrying the guest's desktop bounds.
+   >
+   > A displacement is the one quantity that means the same thing in both spaces, so it needs
+   > no such message. Where the mirroring premise *does* hold, a displacement is the identity
+   > mapping anyway — this is a weaker assumption, not a different design.
+
+   Two consequences worth stating, because both were learned the hard way. Sending a
+   displacement requires **two** local observations, which is what makes it structurally
+   impossible to echo the window manager's own initial placement back to the guest as if the
+   user had dragged something — a first report can only become an anchor. And a geometry change
+   the *client* caused is not user intent: creating a window, and applying a guest-originated
+   move, must each open a settling window during which local reports only update what the
+   client believes.
+
+   Two guards belong with this rule rather than in the implementation that happens to hold them
+   today. A window the guest reports as non-resizable must never be sent a resize — a
+   fixed-size dialog told to become 1x52 is destroyed. And a report of zero width or height is
+   never forwarded: some window managers report 0x0 for an unmapped window, which would ask the
+   guest to resize to nothing.
 3. **Position on Wayland: never applied, never reported.** Guest x/y is stored as data (future
    popup/dialog anchor math) but no positioning is attempted, and `MoveRequested` is never
    emitted — the client cannot observe local moves on Wayland. Consequence, stated honestly:
