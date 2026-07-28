@@ -12,14 +12,16 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 use std::time::Instant;
 
+use oxclient::decode::{self, WindowDecoders};
 use oxclient::session::{ClientSession, SessionConfig};
 use oxclient::{ClientEvent, ModelChange, RemoteWindow, WindowModel};
 use oxdisplay::{CommandSender, CpuPresenter, DisplayCommand, DisplayEvent, WindowSpec};
 use oxproto::message::input::{key_flag, window_action};
 use oxproto::message::{
-    DisplayLayout, FrameAck, KeyEvent, ModifierSync, Output, PointerEvent, TextInput, WindowControl,
+    Close, DisplayLayout, Error as ProtoError, FrameAck, FrameData, KeyEvent, ModifierSync, Output,
+    PointerEvent, TextInput, WindowControl,
 };
-use oxproto::{codec, feature, Message};
+use oxproto::{error_code, feature, Message};
 use tokio::net::TcpStream;
 use tokio::sync::{mpsc, oneshot};
 use tokio_rustls::client::TlsStream;
@@ -147,6 +149,28 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
         session.version, session.session_id, session.codec, session.features
     );
 
+    // The agent must choose from what the client advertised. If it did not, every frame would
+    // fail to decode; say so once, tell the agent why, and stop.
+    if !decode::supports_codec(session.codec) {
+        let message = format!(
+            "agent selected codec {} which this client cannot decode (advertised {:?})",
+            session.codec,
+            decode::preferred_codecs()
+        );
+        session
+            .send(&Message::Error(ProtoError {
+                code: error_code::UNSUPPORTED_CODEC,
+                message: message.clone(),
+            }))
+            .await?;
+        // OXPROTO.md §15: reason 3 is "error".
+        session.send(&Message::Close(Close { reason: 3 })).await?;
+        return Err(Box::new(io::Error::new(
+            io::ErrorKind::InvalidData,
+            message,
+        )));
+    }
+
     if cli.headless {
         run_headless(&mut session).await?;
     } else {
@@ -179,7 +203,9 @@ async fn connect_session(
     let config = SessionConfig {
         auth_token,
         client_name: cli.name.clone(),
-        codecs: vec![codec::RAW_BGRA],
+        // Descending preference, and only what this build can actually decode: with the `h264`
+        // feature off this is `RAW_BGRA` alone, exactly what the bring-up client advertised.
+        codecs: decode::preferred_codecs(),
         // The session handshake still advertises the same conservative synthetic output used by
         // the bring-up client. Native-window output enumeration can replace this after display
         // layout negotiation is treated as its own protocol surface.
@@ -205,19 +231,29 @@ async fn run_headless(
 ) -> Result<(), Box<dyn std::error::Error>> {
     // Per-window frame counters, so the rate-limit below is per window rather than global.
     let mut frame_counts: HashMap<u32, u64> = HashMap::new();
+    let mut decoders = WindowDecoders::new();
     let clock = ClientClock::new();
 
     while let Some(event) = session.next_event().await? {
         print_event(&event, &mut frame_counts);
-        if let ClientEvent::Frame(frame) = &event {
-            send_frame_ack(
-                session,
-                frame.window_id,
-                frame.frame_id,
-                clock.now_us(),
-                clock.now_us(),
-            )
-            .await?;
+        match event {
+            // Headless still decodes. It is the bring-up path for a machine with no display
+            // server, so it has to exercise the decoder rather than route around it.
+            ClientEvent::Frame(frame) => {
+                let (window_id, frame_id) = (frame.window_id, frame.frame_id);
+                let decoded_us = match decoders.decode(frame) {
+                    Ok(_) => clock.now_us(),
+                    Err(error) => {
+                        eprintln!(
+                            "oxclient: dropped frame {frame_id} for window {window_id}: {error}"
+                        );
+                        clock.now_us()
+                    }
+                };
+                send_frame_ack(session, window_id, frame_id, decoded_us, clock.now_us()).await?;
+            }
+            ClientEvent::WindowClosed(closed) => decoders.forget(closed.window_id),
+            _ => {}
         }
     }
 
@@ -259,6 +295,7 @@ async fn run_session_task(
     mut display_events: mpsc::UnboundedReceiver<DisplayEvent>,
 ) -> io::Result<()> {
     let mut model = WindowModel::new();
+    let mut decoders = WindowDecoders::new();
     let clock = ClientClock::new();
 
     loop {
@@ -277,7 +314,43 @@ async fn run_session_task(
                 };
                 let closed = matches!(event, ClientEvent::Closed(_));
                 for change in model.apply(event) {
-                    if let Some(command) = display_command_for_change(&model, change) {
+                    if let ModelChange::Destroyed(window_id) = change {
+                        decoders.forget(window_id);
+                    }
+                    let command = match change {
+                        // Decode happens here rather than in the display layer so that what
+                        // crosses to the winit thread is always presentable pixels.
+                        //
+                        // It is also synchronous on this task, which costs the input path up to
+                        // one frame's decode time in added latency. That is the right trade at
+                        // 800x600 and the wrong one at 4K; `Decoder` is `Send` precisely so this
+                        // can move to its own thread without touching anything else.
+                        ModelChange::Frame(frame) => {
+                            let (window_id, frame_id) = (frame.window_id, frame.frame_id);
+                            match decode_for_present(&mut decoders, frame) {
+                                Some(decoded) => Some(DisplayCommand::Frame(decoded)),
+                                None => {
+                                    // A frame that will never be presented still has to be
+                                    // acknowledged. The agent keeps a bounded number of
+                                    // unacknowledged frames per window (OXPROTO.md §12) and the
+                                    // display layer only reports frames it actually presented,
+                                    // so a client joining mid-GOP would otherwise spend that
+                                    // budget on frames it dropped and stall the window.
+                                    let now = clock.now_us();
+                                    if let Err(error) =
+                                        send_frame_ack(&mut session, window_id, frame_id, now, now)
+                                            .await
+                                    {
+                                        let _ = commands.send(DisplayCommand::Shutdown);
+                                        return Err(error);
+                                    }
+                                    None
+                                }
+                            }
+                        }
+                        other => display_command_for_change(&model, other),
+                    };
+                    if let Some(command) = command {
                         if commands.send(command).is_err() {
                             return Ok(());
                         }
@@ -300,6 +373,21 @@ async fn run_session_task(
     }
 }
 
+/// Decodes one frame into presentable pixels, or `None` if there is nothing to show.
+///
+/// A decode failure is per frame and never ends the session: it is logged and the frame is
+/// dropped, exactly like a frame the decoder legitimately swallows while waiting for a keyframe.
+fn decode_for_present(decoders: &mut WindowDecoders, frame: FrameData) -> Option<FrameData> {
+    let (window_id, frame_id) = (frame.window_id, frame.frame_id);
+    match decoders.decode(frame) {
+        Ok(decoded) => decoded,
+        Err(error) => {
+            eprintln!("oxclient: window {window_id} frame {frame_id} dropped: {error}");
+            None
+        }
+    }
+}
+
 fn display_command_for_change(model: &WindowModel, change: ModelChange) -> Option<DisplayCommand> {
     Some(match change {
         ModelChange::Created(id) => DisplayCommand::CreateWindow(window_spec(model.get(id)?)),
@@ -309,7 +397,9 @@ fn display_command_for_change(model: &WindowModel, change: ModelChange) -> Optio
         ModelChange::StateChanged(id) => DisplayCommand::ChangeState(window_spec(model.get(id)?)),
         ModelChange::IconChanged(id) => DisplayCommand::ChangeIcon(window_spec(model.get(id)?)),
         ModelChange::Restacked => DisplayCommand::Restack(model.stack().to_vec()),
-        ModelChange::Frame(frame) => DisplayCommand::Frame(frame),
+        // Frames never take this path: the caller runs them through the decoder, because a frame
+        // that reaches the presenter still encoded is a black window, not an error.
+        ModelChange::Frame(_) => return None,
         ModelChange::CursorShape(shape) => DisplayCommand::CursorShape(shape),
         ModelChange::CursorMoved { window_id, x, y } => {
             DisplayCommand::CursorPosition { window_id, x, y }
@@ -533,18 +623,30 @@ async fn send_frame_ack(
 
 fn print_event(event: &ClientEvent, frame_counts: &mut HashMap<u32, u64>) {
     match event {
+        // Flags are printed by name rather than as a hex mask: this is the bring-up path, and
+        // the one thing worth reading off it is whether the agent thinks a window's caption is
+        // safe to crop — a judgement that is wrong for every DWM-frame-extended app if the
+        // agent's heuristic is wrong, and invisible in a bare `flags=0x5`.
         ClientEvent::WindowOpened(w) => println!(
-            "window opened: id={} app_id={} title={:?} geometry={}x{}+{}+{}",
-            w.window_id, w.app_id, w.title, w.width, w.height, w.x, w.y
+            "window opened: id={} app_id={} title={:?} geometry={}x{}+{}+{} flags=[{}]",
+            w.window_id,
+            w.app_id,
+            w.title,
+            w.width,
+            w.height,
+            w.x,
+            w.y,
+            describe_window_flags(w.flags)
         ),
         ClientEvent::Frame(f) => {
             let count = frame_counts.entry(f.window_id).or_insert(0);
             *count += 1;
             if *count == 1 || count.is_multiple_of(FRAME_LOG_STRIDE) {
                 println!(
-                    "frame: id={} window={} bytes={} keyframe={}",
+                    "frame: id={} window={} codec={} bytes={} keyframe={}",
                     f.frame_id,
                     f.window_id,
+                    f.codec,
                     f.data.len(),
                     f.is_keyframe()
                 );
@@ -726,5 +828,34 @@ mod tests {
         ]))
         .expect_err("a host:port without ':' must be rejected");
         assert!(err.contains(':'));
+    }
+}
+
+/// Render a `WindowOpened.flags` bitmask as the set of named flags it carries.
+///
+/// Unknown bits are reported as a residual hex value rather than dropped, so a client built
+/// against an older protocol revision does not silently hide what a newer agent is saying.
+fn describe_window_flags(flags: u32) -> String {
+    use oxproto::message::window::window_flag;
+    const NAMED: [(u32, &str); 5] = [
+        (window_flag::RESIZABLE, "resizable"),
+        (window_flag::HAS_FRAME, "has_frame"),
+        (window_flag::TOPMOST, "topmost"),
+        (window_flag::MINIMIZED, "minimized"),
+        (window_flag::MAXIMIZED, "maximized"),
+    ];
+    let mut parts: Vec<String> = NAMED
+        .iter()
+        .filter(|(bit, _)| flags & bit != 0)
+        .map(|(_, name)| (*name).to_string())
+        .collect();
+    let residual = flags & !NAMED.iter().fold(0, |acc, (bit, _)| acc | bit);
+    if residual != 0 {
+        parts.push(format!("unknown:{residual:#x}"));
+    }
+    if parts.is_empty() {
+        "none".to_string()
+    } else {
+        parts.join(",")
     }
 }
