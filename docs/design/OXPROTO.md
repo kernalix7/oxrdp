@@ -232,6 +232,13 @@ boxes.
 Subsequent changes arrive as `WindowGeometry`, `WindowTitle`, `WindowState`, `WindowZOrder`
 (`{ window_id, above_window_id }`, 0 = bottom), `WindowIcon`, and finally `WindowClosed`.
 
+**`WindowIcon` pixel format.** `{ window_id, width, height, pixels }` where the payload is
+**BGRA8 in memory order** (byte 0 = blue), **straight** alpha, top-down, tightly packed at
+`width * 4` bytes per row. Memory order, like every other pixel payload here — it is what
+Windows' `GetDIBits` produces, so the agent copies it without reordering, and a client that
+assumes the field name means A,R,G,B in memory will render the channels swapped. Unlike
+[`CursorShape`](#14-cursor), the alpha here is **not** premultiplied.
+
 ## 12. Video and flow control
 
 **`FrameData`**

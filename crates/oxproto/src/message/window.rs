@@ -278,7 +278,13 @@ pub struct WindowIcon {
     pub width: u16,
     /// Icon height in pixels.
     pub height: u16,
-    /// Raw ARGB pixel data.
+    /// Icon pixels, **BGRA8 in memory order** (byte 0 = blue), straight — *not*
+    /// premultiplied — alpha, top-down, tightly packed at `width * 4` bytes per row.
+    ///
+    /// The field name is historical. Every pixel payload in this protocol is named by memory
+    /// order (`RAW_BGRA`, `CursorShape`'s `BGRA_PREMUL`), and this one is no exception: it is
+    /// what `GetDIBits` hands back on Windows, so the agent copies it without reordering.
+    /// Note the difference from `CursorShape`, whose alpha *is* premultiplied.
     pub argb: Vec<u8>,
 }
 
