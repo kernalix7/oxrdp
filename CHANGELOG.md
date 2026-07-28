@@ -8,6 +8,32 @@ All notable changes to oxrdp are documented here. The format is based on
 
 ## [Unreleased]
 
+### First end-to-end run (2026-07-28)
+
+A Windows application window is now captured in the guest and shown as a **native Linux
+window**, live. The whole path ran for real against oxrdp's own dockur guest: WGC capture →
+`oxproto` framing → TLS with SPKI pinning and token auth → `oxclient` → `oxdisplay` (winit +
+softbuffer). Measured 1115×628 RAW_BGRA at ~21 fps, roughly 470 Mbit/s for a single window —
+the concrete case for the P5 H.264 encoder.
+
+Three bugs were found only by running it, none of which the test suite could have caught:
+
+- **WGC pixel format.** The frame pool was created with `B8G8R8A8UIntNormalizedSrgb`.
+  `Direct3D11CaptureFramePool` accepts only `B8G8R8A8UIntNormalized` and `R16G16B16A16Float`,
+  and rejects anything else with a bare `E_INVALIDARG`.
+- **Empty-pool sentinel.** `TryGetNextFrame` reports an empty pool as an `Err` carrying `S_OK`.
+  Treating that as a failure made the caller rebuild the capture every tick, so the pool never
+  lived long enough to fill and the stream produced zero frames while looking busy.
+- **Cancellation safety.** `read_reassembled` keeps its read progress in the future, so a
+  `tokio::select!` branch dropped mid-chunk lost the bytes it had consumed and the stream
+  resumed mid-payload. Added `ChunkReader`, which keeps that progress in the caller's state;
+  `ClientSession` reads through it and buffers writes resumably.
+
+`dev/vm/oxrdp-windows.sh status` was also rewritten: its old probe reported a healthy agent as
+"NOT running", because rustls does not answer a truncated handshake with an alert. It now
+completes a real TLS handshake and prints the SPKI pin, which was checked against the agent's
+own `--print-pin`.
+
 ### Direction change (2026-07-02)
 
 oxrdp pivots from "a better RDP **client**" to **replacing RDP itself** with a purpose-built,

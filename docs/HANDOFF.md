@@ -3,9 +3,12 @@
 Snapshot for continuing this project in another tool (e.g. opencode). Everything needed to
 resume is here; the full history is in git (`github.com/kernalix7/oxrdp`, branch `main`).
 
-Last state: **P1d done — the agent serves authenticated TLS sessions and streams windows; the
-client connects end to end and models window state. Display architecture decided; P2b (first
-pixels) next.** See [Roadmap & next steps](#8-roadmap--next-steps).
+Last state: **P2b done — first pixels, for real.** On 2026-07-28 a Windows PowerShell window
+running in oxrdp's own guest was captured, streamed over `oxproto`, and presented as a live
+native Linux window (1115×628 RAW_BGRA, ~21 fps). The full path — WGC → framing → TLS with SPKI
+pinning and token auth → client → winit/softbuffer — is validated against real Windows, not
+just against tests. Next: P3 input injection, then P5 H.264, since one window at RAW_BGRA is
+already ~470 Mbit/s. See [Roadmap & next steps](#8-roadmap--next-steps).
 
 ## 1. TL;DR
 
