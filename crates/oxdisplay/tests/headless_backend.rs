@@ -1,53 +1,42 @@
-use oxclient::{ClientEvent, WindowModel};
-use oxdisplay::apply_model_change;
+use oxdisplay::apply_display_command;
 use oxdisplay::headless::{HeadlessBackend, HeadlessCall};
+use oxproto::message::codec;
 use oxproto::message::input::cursor_format;
-use oxproto::message::window::{frame_flag, window_flag, window_show};
-use oxproto::message::{codec, Error as AgentError};
-use oxproto::message::{
-    CursorPosition, CursorShape, CursorVisibility, FrameData, WindowClosed, WindowGeometry,
-    WindowIcon, WindowOpened, WindowState, WindowTitle, WindowZOrder,
-};
+use oxproto::message::window::frame_flag;
+use oxproto::message::{CursorShape, FrameData, WindowIcon};
 
-fn apply(
-    model: &mut WindowModel,
-    backend: &mut HeadlessBackend,
-    event: ClientEvent,
-) -> Vec<HeadlessCall> {
-    for change in model.apply(event) {
-        apply_model_change(backend, model, change).unwrap();
-    }
+use oxdisplay::{DisplayCommand, WindowSpec};
+
+fn apply(backend: &mut HeadlessBackend, command: DisplayCommand) -> Vec<HeadlessCall> {
+    apply_display_command(backend, command).unwrap();
     backend.take_calls()
 }
 
-fn opened(window_id: u32, owner_id: u32) -> WindowOpened {
-    WindowOpened {
+fn window(window_id: u32, owner_id: u32) -> WindowSpec {
+    WindowSpec {
         window_id,
-        video_channel: 16,
-        pid: 7,
         app_id: "notepad.exe".to_owned(),
         title: format!("window {window_id}"),
         x: 10,
         y: 20,
         width: 640,
         height: 480,
-        dpi: 96,
-        flags: window_flag::RESIZABLE | window_flag::HAS_FRAME,
         owner_id,
+        minimized: false,
+        maximized: false,
+        resizable: true,
+        has_frame: true,
+        topmost: false,
+        icon: None,
     }
 }
 
 #[test]
 fn model_changes_drive_headless_backend_in_order() {
-    let mut model = WindowModel::new();
     let mut backend = HeadlessBackend::new();
 
     assert_eq!(
-        apply(
-            &mut model,
-            &mut backend,
-            ClientEvent::WindowOpened(opened(1, 0)),
-        ),
+        apply(&mut backend, DisplayCommand::CreateWindow(window(1, 0))),
         vec![HeadlessCall::Created {
             window_id: 1,
             app_id: "notepad.exe".to_owned(),
@@ -62,11 +51,10 @@ fn model_changes_drive_headless_backend_in_order() {
 
     assert_eq!(
         apply(
-            &mut model,
             &mut backend,
-            ClientEvent::WindowTitle(WindowTitle {
-                window_id: 1,
+            DisplayCommand::RetitleWindow(WindowSpec {
                 title: "renamed".to_owned(),
+                ..window(1, 0)
             }),
         ),
         vec![HeadlessCall::Retitled {
@@ -77,14 +65,13 @@ fn model_changes_drive_headless_backend_in_order() {
 
     assert_eq!(
         apply(
-            &mut model,
             &mut backend,
-            ClientEvent::WindowGeometry(WindowGeometry {
-                window_id: 1,
+            DisplayCommand::MoveWindow(WindowSpec {
                 x: 30,
                 y: 40,
                 width: 800,
                 height: 600,
+                ..window(1, 0)
             }),
         ),
         vec![HeadlessCall::Moved {
@@ -98,12 +85,10 @@ fn model_changes_drive_headless_backend_in_order() {
 
     assert_eq!(
         apply(
-            &mut model,
             &mut backend,
-            ClientEvent::WindowState(WindowState {
-                window_id: 1,
-                state: window_show::MAXIMIZED,
-                flags: 0,
+            DisplayCommand::ChangeState(WindowSpec {
+                maximized: true,
+                ..window(1, 0)
             }),
         ),
         vec![HeadlessCall::StateChanged {
@@ -115,24 +100,22 @@ fn model_changes_drive_headless_backend_in_order() {
 
     assert_eq!(
         apply(
-            &mut model,
             &mut backend,
-            ClientEvent::WindowIcon(WindowIcon {
-                window_id: 1,
-                width: 1,
-                height: 1,
-                argb: vec![255, 1, 2, 3],
+            DisplayCommand::ChangeIcon(WindowSpec {
+                icon: Some(WindowIcon {
+                    window_id: 1,
+                    width: 1,
+                    height: 1,
+                    argb: vec![255, 1, 2, 3],
+                }),
+                ..window(1, 0)
             }),
         ),
         vec![HeadlessCall::IconChanged(1)]
     );
 
     assert_eq!(
-        apply(
-            &mut model,
-            &mut backend,
-            ClientEvent::WindowOpened(opened(2, 1)),
-        ),
+        apply(&mut backend, DisplayCommand::CreateWindow(window(2, 1))),
         vec![HeadlessCall::Created {
             window_id: 2,
             app_id: "notepad.exe".to_owned(),
@@ -146,37 +129,25 @@ fn model_changes_drive_headless_backend_in_order() {
     );
 
     assert_eq!(
-        apply(
-            &mut model,
-            &mut backend,
-            ClientEvent::WindowZOrder(WindowZOrder {
-                window_id: 1,
-                above_window_id: 2,
-            }),
-        ),
+        apply(&mut backend, DisplayCommand::Restack(vec![2, 1])),
         vec![HeadlessCall::Restacked(vec![2, 1])]
     );
 
     assert_eq!(
-        apply(
-            &mut model,
-            &mut backend,
-            ClientEvent::WindowClosed(WindowClosed { window_id: 1 }),
-        ),
+        apply(&mut backend, DisplayCommand::DestroyWindow(1)),
         vec![HeadlessCall::Destroyed(1)]
     );
 }
 
 #[test]
 fn frames_cursor_and_session_events_are_forwarded() {
-    let mut model = WindowModel::new();
     let mut backend = HeadlessBackend::new();
+    let _ = apply(&mut backend, DisplayCommand::CreateWindow(window(9, 0)));
 
     assert_eq!(
         apply(
-            &mut model,
             &mut backend,
-            ClientEvent::Frame(FrameData {
+            DisplayCommand::Frame(FrameData {
                 window_id: 9,
                 frame_id: 42,
                 codec: codec::RAW_BGRA,
@@ -197,9 +168,8 @@ fn frames_cursor_and_session_events_are_forwarded() {
 
     assert_eq!(
         apply(
-            &mut model,
             &mut backend,
-            ClientEvent::CursorShape(CursorShape {
+            DisplayCommand::CursorShape(CursorShape {
                 cursor_id: 5,
                 width: 1,
                 height: 1,
@@ -218,13 +188,12 @@ fn frames_cursor_and_session_events_are_forwarded() {
 
     assert_eq!(
         apply(
-            &mut model,
             &mut backend,
-            ClientEvent::CursorPosition(CursorPosition {
+            DisplayCommand::CursorPosition {
                 window_id: 9,
                 x: 4,
                 y: 6,
-            }),
+            },
         ),
         vec![HeadlessCall::CursorMoved {
             window_id: 9,
@@ -234,26 +203,44 @@ fn frames_cursor_and_session_events_are_forwarded() {
     );
 
     assert_eq!(
-        apply(
-            &mut model,
-            &mut backend,
-            ClientEvent::CursorVisibility(CursorVisibility { visible: false }),
-        ),
+        apply(&mut backend, DisplayCommand::CursorVisibility(false)),
         vec![HeadlessCall::CursorVisibility(false)]
     );
 
     assert_eq!(
         apply(
-            &mut model,
             &mut backend,
-            ClientEvent::Error(AgentError {
+            DisplayCommand::AgentError {
                 code: 12,
                 message: "capture failed".to_owned(),
-            }),
+            },
         ),
         vec![HeadlessCall::AgentError {
             code: 12,
             message: "capture failed".to_owned(),
         }]
+    );
+}
+
+#[test]
+fn headless_backend_drops_frames_for_unknown_windows() {
+    let mut backend = HeadlessBackend::new();
+
+    assert_eq!(
+        apply(
+            &mut backend,
+            DisplayCommand::Frame(FrameData {
+                window_id: 99,
+                frame_id: 1,
+                codec: codec::RAW_BGRA,
+                flags: frame_flag::KEYFRAME,
+                width: 1,
+                height: 1,
+                captured_us: 0,
+                encoded_us: 0,
+                data: vec![0, 0, 0, 0],
+            }),
+        ),
+        Vec::<HeadlessCall>::new()
     );
 }

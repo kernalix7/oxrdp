@@ -194,3 +194,67 @@ pub fn locks() -> u8 {
     let _ = lock_state::CAPS | lock_state::NUM | lock_state::SCROLL;
     0
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn keycode_to_scancode_maps_plain_extended_and_unknown_keys() {
+        assert_eq!(
+            keycode_to_scancode(KeyCode::KeyA),
+            Some(Scancode {
+                code: 0x1e,
+                extended: false,
+            })
+        );
+        assert_eq!(
+            keycode_to_scancode(KeyCode::ArrowLeft),
+            Some(Scancode {
+                code: 0x4b,
+                extended: true,
+            })
+        );
+        assert_eq!(keycode_to_scancode(KeyCode::Fn), None);
+    }
+
+    #[test]
+    fn key_flags_encode_pressed_and_extended_bits() {
+        assert_eq!(
+            key_flags(ElementState::Pressed, true),
+            key_flag::PRESSED | key_flag::EXTENDED
+        );
+        assert_eq!(key_flags(ElementState::Released, false), 0);
+    }
+
+    #[test]
+    fn update_buttons_sets_and_clears_known_buttons_and_ignores_other() {
+        let buttons = update_buttons(0, MouseButton::Left, ElementState::Pressed);
+        let buttons = update_buttons(buttons, MouseButton::Back, ElementState::Pressed);
+        assert_eq!(buttons, pointer_button::LEFT | pointer_button::X1);
+
+        let buttons = update_buttons(buttons, MouseButton::Left, ElementState::Released);
+        assert_eq!(buttons, pointer_button::X1);
+
+        assert_eq!(
+            update_buttons(buttons, MouseButton::Other(9), ElementState::Pressed),
+            buttons
+        );
+    }
+
+    #[test]
+    fn modifiers_convert_winit_bits_to_protocol_bits() {
+        let state = ModifiersState::SHIFT | ModifiersState::CONTROL | ModifiersState::ALT;
+        assert_eq!(
+            modifiers(state),
+            modifier::SHIFT | modifier::CTRL | modifier::ALT
+        );
+        assert_eq!(modifiers(ModifiersState::SUPER), modifier::META);
+        assert_eq!(modifiers(ModifiersState::empty()), 0);
+    }
+
+    #[test]
+    fn locks_reports_no_lock_state_in_v1() {
+        assert_eq!(locks(), 0);
+    }
+}

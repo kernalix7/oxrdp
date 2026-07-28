@@ -1,21 +1,28 @@
-//! `oxclient` — bring-up CLI: connect to an `oxagent` over pinned TLS and print the event
-//! stream to stdout/stderr.
+//! `oxclient` — connect to an `oxagent` over pinned TLS and present remote windows.
 //!
-//! This exists to verify the agent end to end (handshake, window lifecycle, frame delivery,
-//! flow control) before any real rendering layer exists. It renders nothing: frames are
-//! counted and acknowledged, never decoded or displayed.
+//! `--headless` keeps the original event-printing bring-up path for environments without a
+//! display server.
 
 #![forbid(unsafe_code)]
 
 use std::collections::HashMap;
 use std::env;
+use std::io;
 use std::path::PathBuf;
 use std::process::ExitCode;
+use std::time::Instant;
 
-use oxclient::session::{ClientEvent, ClientSession, SessionConfig};
-use oxproto::message::{DisplayLayout, FrameAck, Output};
+use oxclient::session::{ClientSession, SessionConfig};
+use oxclient::{ClientEvent, ModelChange, RemoteWindow, WindowModel};
+use oxdisplay::{CommandSender, CpuPresenter, DisplayCommand, DisplayEvent, WindowSpec};
+use oxproto::message::input::{key_flag, window_action};
+use oxproto::message::{
+    DisplayLayout, FrameAck, KeyEvent, ModifierSync, Output, PointerEvent, TextInput, WindowControl,
+};
 use oxproto::{codec, feature, Message};
 use tokio::net::TcpStream;
+use tokio::sync::{mpsc, oneshot};
+use tokio_rustls::client::TlsStream;
 use tokio_rustls::rustls::pki_types::ServerName;
 use tokio_rustls::TlsConnector;
 
@@ -24,7 +31,7 @@ use tokio_rustls::TlsConnector;
 const FRAME_LOG_STRIDE: u64 = 60;
 
 const USAGE: &str =
-    "usage: oxclient <host:port> --pin <spki-hex> --token-file <path> [--name <client-name>]";
+    "usage: oxclient <host:port> --pin <spki-hex> --token-file <path> [--name <client-name>] [--headless]";
 
 /// Parsed command-line arguments.
 #[derive(Debug, PartialEq, Eq)]
@@ -34,11 +41,12 @@ struct Cli {
     pin: String,
     token_path: PathBuf,
     name: String,
+    headless: bool,
 }
 
 /// Parse `argv[1..]` into a [`Cli`], or a human-readable error.
 ///
-/// Deliberately hand-rolled instead of pulling in `clap`: this binary has four flags and
+/// Deliberately hand-rolled instead of pulling in `clap`: this binary has a few flags and
 /// keeping the dependency surface small matters for a bring-up tool that is meant to be the
 /// simplest possible thing that proves the agent works.
 fn parse_args(args: &[String]) -> Result<Cli, String> {
@@ -46,6 +54,7 @@ fn parse_args(args: &[String]) -> Result<Cli, String> {
     let mut pin: Option<String> = None;
     let mut token_path: Option<String> = None;
     let mut name: Option<String> = None;
+    let mut headless = false;
 
     let mut iter = args.iter();
     while let Some(arg) = iter.next() {
@@ -70,6 +79,9 @@ fn parse_args(args: &[String]) -> Result<Cli, String> {
             }
             "--name" => {
                 name = Some(iter.next().ok_or("--name requires a value")?.clone());
+            }
+            "--headless" => {
+                headless = true;
             }
             other if other.starts_with("--") => {
                 return Err(format!("unknown argument: {other}"));
@@ -103,6 +115,7 @@ fn parse_args(args: &[String]) -> Result<Cli, String> {
         pin,
         token_path: PathBuf::from(token_path),
         name: name.unwrap_or_else(|| "oxclient".to_string()),
+        headless,
     })
 }
 
@@ -128,6 +141,24 @@ async fn main() -> ExitCode {
 }
 
 async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
+    let mut session = connect_session(&cli).await?;
+    eprintln!(
+        "oxclient: connected: protocol v{} session={:#x} codec={} features={:#x}",
+        session.version, session.session_id, session.codec, session.features
+    );
+
+    if cli.headless {
+        run_headless(&mut session).await?;
+    } else {
+        run_windowed(session).await?;
+    }
+
+    Ok(())
+}
+
+async fn connect_session(
+    cli: &Cli,
+) -> Result<ClientSession<TlsStream<TcpStream>>, Box<dyn std::error::Error>> {
     // Never read from argv: load_token only ever sees a filesystem path.
     let auth_token = oxsec::load_token(&cli.token_path)?;
     let tls_config = oxsec::client_config_pinned(&cli.pin)?;
@@ -147,12 +178,11 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
 
     let config = SessionConfig {
         auth_token,
-        client_name: cli.name,
+        client_name: cli.name.clone(),
         codecs: vec![codec::RAW_BGRA],
-        // Placeholder: no real display backend exists yet (that is a separate milestone), so
-        // this bring-up tool advertises a single synthetic 1920x1080 output at 1:1 scale and
-        // 60 Hz. It is only used to let the agent complete DPI/geometry negotiation; nothing
-        // is actually rendered onto it.
+        // The session handshake still advertises the same conservative synthetic output used by
+        // the bring-up client. Native-window output enumeration can replace this after display
+        // layout negotiation is treated as its own protocol surface.
         display: DisplayLayout {
             outputs: vec![Output {
                 id: 0,
@@ -167,93 +197,422 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
         },
     };
 
-    let mut session = ClientSession::connect(tls_stream, &config).await?;
-    eprintln!(
-        "oxclient: connected: protocol v{} session={:#x} codec={} features={:#x}",
-        session.version, session.session_id, session.codec, session.features
-    );
+    Ok(ClientSession::connect(tls_stream, &config).await?)
+}
 
+async fn run_headless(
+    session: &mut ClientSession<TlsStream<TcpStream>>,
+) -> Result<(), Box<dyn std::error::Error>> {
     // Per-window frame counters, so the rate-limit below is per window rather than global.
     let mut frame_counts: HashMap<u32, u64> = HashMap::new();
+    let clock = ClientClock::new();
 
     while let Some(event) = session.next_event().await? {
-        match event {
-            ClientEvent::WindowOpened(w) => println!(
-                "window opened: id={} app_id={} title={:?} geometry={}x{}+{}+{}",
-                w.window_id, w.app_id, w.title, w.width, w.height, w.x, w.y
-            ),
-            ClientEvent::Frame(f) => {
-                let count = frame_counts.entry(f.window_id).or_insert(0);
-                *count += 1;
-                if *count == 1 || count.is_multiple_of(FRAME_LOG_STRIDE) {
-                    println!(
-                        "frame: id={} window={} bytes={} keyframe={}",
-                        f.frame_id,
-                        f.window_id,
-                        f.data.len(),
-                        f.is_keyframe()
-                    );
-                }
-
-                // This is what lets the agent's flow control (OXPROTO.md §12) work at all: the
-                // agent bounds how many frames it will have unacknowledged per window, and
-                // without an ack it stalls after that many. decoded_us/presented_us are 0
-                // because there is no decoder or renderer yet to time.
-                if session.has_feature(feature::FRAME_ACK) {
-                    session
-                        .send(&Message::FrameAck(FrameAck {
-                            window_id: f.window_id,
-                            frame_id: f.frame_id,
-                            decoded_us: 0,
-                            presented_us: 0,
-                        }))
-                        .await?;
-                }
-            }
-            ClientEvent::WindowGeometry(g) => println!(
-                "window geometry: id={} pos=({},{}) size={}x{}",
-                g.window_id, g.x, g.y, g.width, g.height
-            ),
-            ClientEvent::WindowTitle(t) => {
-                println!("window title: id={} title={:?}", t.window_id, t.title)
-            }
-            ClientEvent::WindowState(s) => println!(
-                "window state: id={} state={} flags={:#x}",
-                s.window_id, s.state, s.flags
-            ),
-            ClientEvent::WindowZOrder(z) => println!(
-                "window z-order: id={} above={}",
-                z.window_id, z.above_window_id
-            ),
-            ClientEvent::WindowIcon(i) => println!(
-                "window icon: id={} size={}x{} bytes={}",
-                i.window_id,
-                i.width,
-                i.height,
-                i.argb.len()
-            ),
-            ClientEvent::WindowClosed(c) => println!("window closed: id={}", c.window_id),
-            ClientEvent::CursorShape(c) => println!(
-                "cursor shape: id={} size={}x{} hotspot=({},{})",
-                c.cursor_id, c.width, c.height, c.hotspot_x, c.hotspot_y
-            ),
-            ClientEvent::CursorPosition(p) => println!(
-                "cursor position: window={} pos=({},{})",
-                p.window_id, p.x, p.y
-            ),
-            ClientEvent::CursorVisibility(v) => {
-                println!("cursor visibility: visible={}", v.visible)
-            }
-            ClientEvent::Error(e) => {
-                eprintln!("oxclient: agent error {}: {}", e.code, e.message);
-            }
-            ClientEvent::Closed(c) => {
-                eprintln!("oxclient: agent closed the session (reason={})", c.reason);
-            }
+        print_event(&event, &mut frame_counts);
+        if let ClientEvent::Frame(frame) = &event {
+            send_frame_ack(
+                session,
+                frame.window_id,
+                frame.frame_id,
+                clock.now_us(),
+                clock.now_us(),
+            )
+            .await?;
         }
     }
 
     Ok(())
+}
+
+async fn run_windowed(
+    session: ClientSession<TlsStream<TcpStream>>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let (display_events_tx, display_events_rx) = mpsc::unbounded_channel();
+    let (session_result_tx, session_result_rx) = oneshot::channel();
+
+    // `winit` owns the main-thread event loop, while `ClientSession` is async network IO.
+    // Run the session on the Tokio runtime and cross the thread boundary with winit's proxy
+    // plus an mpsc channel for display-originated input and presentation events.
+    oxdisplay::run(
+        Box::new(CpuPresenter::new()),
+        display_events_tx,
+        move |commands| {
+            tokio::spawn(async move {
+                let result = run_session_task(session, commands, display_events_rx).await;
+                let _ = session_result_tx.send(result.map_err(|error| error.to_string()));
+            });
+        },
+    )?;
+
+    match session_result_rx.await {
+        Ok(Ok(())) => Ok(()),
+        Ok(Err(error)) => Err(Box::new(io::Error::other(error))),
+        Err(_) => Err(Box::new(io::Error::other(
+            "session task ended without reporting a result",
+        ))),
+    }
+}
+
+async fn run_session_task(
+    mut session: ClientSession<TlsStream<TcpStream>>,
+    commands: CommandSender,
+    mut display_events: mpsc::UnboundedReceiver<DisplayEvent>,
+) -> io::Result<()> {
+    let mut model = WindowModel::new();
+    let clock = ClientClock::new();
+
+    loop {
+        tokio::select! {
+            event = session.next_event() => {
+                let event = match event {
+                    Ok(Some(event)) => event,
+                    Ok(None) => {
+                        let _ = commands.send(DisplayCommand::Shutdown);
+                        return Ok(());
+                    }
+                    Err(error) => {
+                        let _ = commands.send(DisplayCommand::Shutdown);
+                        return Err(error);
+                    }
+                };
+                let closed = matches!(event, ClientEvent::Closed(_));
+                for change in model.apply(event) {
+                    if let Some(command) = display_command_for_change(&model, change) {
+                        if commands.send(command).is_err() {
+                            return Ok(());
+                        }
+                    }
+                }
+                if closed {
+                    return Ok(());
+                }
+            }
+            event = display_events.recv() => {
+                let Some(event) = event else {
+                    return Ok(());
+                };
+                if let Err(error) = handle_display_event(&mut session, &clock, event).await {
+                    let _ = commands.send(DisplayCommand::Shutdown);
+                    return Err(error);
+                }
+            }
+        }
+    }
+}
+
+fn display_command_for_change(model: &WindowModel, change: ModelChange) -> Option<DisplayCommand> {
+    Some(match change {
+        ModelChange::Created(id) => DisplayCommand::CreateWindow(window_spec(model.get(id)?)),
+        ModelChange::Destroyed(id) => DisplayCommand::DestroyWindow(id),
+        ModelChange::Moved(id) => DisplayCommand::MoveWindow(window_spec(model.get(id)?)),
+        ModelChange::Retitled(id) => DisplayCommand::RetitleWindow(window_spec(model.get(id)?)),
+        ModelChange::StateChanged(id) => DisplayCommand::ChangeState(window_spec(model.get(id)?)),
+        ModelChange::IconChanged(id) => DisplayCommand::ChangeIcon(window_spec(model.get(id)?)),
+        ModelChange::Restacked => DisplayCommand::Restack(model.stack().to_vec()),
+        ModelChange::Frame(frame) => DisplayCommand::Frame(frame),
+        ModelChange::CursorShape(shape) => DisplayCommand::CursorShape(shape),
+        ModelChange::CursorMoved { window_id, x, y } => {
+            DisplayCommand::CursorPosition { window_id, x, y }
+        }
+        ModelChange::CursorVisibility(visible) => DisplayCommand::CursorVisibility(visible),
+        ModelChange::AgentError { code, message } => DisplayCommand::AgentError { code, message },
+        ModelChange::Closed => DisplayCommand::Shutdown,
+    })
+}
+
+fn window_spec(window: &RemoteWindow) -> WindowSpec {
+    WindowSpec {
+        window_id: window.window_id,
+        app_id: window.app_id.clone(),
+        title: window.title.clone(),
+        x: window.x,
+        y: window.y,
+        width: window.width,
+        height: window.height,
+        owner_id: window.owner_id,
+        minimized: window.minimized,
+        maximized: window.maximized,
+        resizable: window.resizable,
+        has_frame: window.has_frame,
+        topmost: window.topmost,
+        icon: window.icon.clone(),
+    }
+}
+
+async fn handle_display_event(
+    session: &mut ClientSession<TlsStream<TcpStream>>,
+    clock: &ClientClock,
+    event: DisplayEvent,
+) -> io::Result<()> {
+    match event {
+        DisplayEvent::Pointer {
+            window_id,
+            x,
+            y,
+            buttons,
+            wheel_x,
+            wheel_y,
+        } => {
+            session
+                .send(&Message::PointerEvent(PointerEvent {
+                    window_id,
+                    x,
+                    y,
+                    buttons,
+                    wheel_x,
+                    wheel_y,
+                    timestamp: clock.now_us(),
+                }))
+                .await?;
+        }
+        DisplayEvent::Key {
+            scancode,
+            pressed,
+            extended,
+        } => {
+            let mut flags = 0;
+            if pressed {
+                flags |= key_flag::PRESSED;
+            }
+            if extended {
+                flags |= key_flag::EXTENDED;
+            }
+            session
+                .send(&Message::KeyEvent(KeyEvent {
+                    scancode,
+                    flags,
+                    timestamp: clock.now_us(),
+                }))
+                .await?;
+        }
+        DisplayEvent::Text { text } if session.has_feature(feature::TEXT_INPUT) => {
+            session
+                .send(&Message::TextInput(TextInput { text }))
+                .await?;
+        }
+        DisplayEvent::Text { .. } => {}
+        DisplayEvent::Modifiers { modifiers, locks } => {
+            session
+                .send(&Message::ModifierSync(ModifierSync { modifiers, locks }))
+                .await?;
+        }
+        DisplayEvent::Focused {
+            window_id,
+            focused: true,
+        } if session.has_feature(feature::WINDOW_CONTROL) => {
+            send_window_control(
+                session,
+                WindowControl {
+                    window_id,
+                    action: window_action::ACTIVATE,
+                    x: 0,
+                    y: 0,
+                    width: 0,
+                    height: 0,
+                },
+            )
+            .await?;
+        }
+        DisplayEvent::Focused { .. } => {}
+        DisplayEvent::CloseRequested { window_id }
+            if session.has_feature(feature::WINDOW_CONTROL) =>
+        {
+            send_window_control(
+                session,
+                WindowControl {
+                    window_id,
+                    action: window_action::CLOSE,
+                    x: 0,
+                    y: 0,
+                    width: 0,
+                    height: 0,
+                },
+            )
+            .await?;
+        }
+        DisplayEvent::CloseRequested { .. } => {}
+        DisplayEvent::ResizeRequested {
+            window_id,
+            width,
+            height,
+        } if session.has_feature(feature::WINDOW_CONTROL) => {
+            send_window_control(
+                session,
+                WindowControl {
+                    window_id,
+                    action: window_action::RESIZE,
+                    x: 0,
+                    y: 0,
+                    width,
+                    height,
+                },
+            )
+            .await?;
+        }
+        DisplayEvent::ResizeRequested { .. } => {}
+        DisplayEvent::MoveRequested { window_id, x, y }
+            if session.has_feature(feature::WINDOW_CONTROL) =>
+        {
+            send_window_control(
+                session,
+                WindowControl {
+                    window_id,
+                    action: window_action::MOVE,
+                    x,
+                    y,
+                    width: 0,
+                    height: 0,
+                },
+            )
+            .await?;
+        }
+        DisplayEvent::MoveRequested { .. } => {}
+        DisplayEvent::Minimized {
+            window_id,
+            minimized,
+        } if session.has_feature(feature::WINDOW_CONTROL) => {
+            send_window_control(
+                session,
+                WindowControl {
+                    window_id,
+                    action: if minimized {
+                        window_action::MINIMIZE
+                    } else {
+                        window_action::RESTORE
+                    },
+                    x: 0,
+                    y: 0,
+                    width: 0,
+                    height: 0,
+                },
+            )
+            .await?;
+        }
+        DisplayEvent::Minimized { .. } => {}
+        DisplayEvent::Presented {
+            window_id,
+            frame_id,
+            decoded_us,
+            presented_us,
+        } => {
+            send_frame_ack(session, window_id, frame_id, decoded_us, presented_us).await?;
+        }
+        DisplayEvent::BackendError { message } => {
+            eprintln!("oxclient: display backend error: {message}");
+        }
+    }
+    Ok(())
+}
+
+async fn send_window_control(
+    session: &mut ClientSession<TlsStream<TcpStream>>,
+    control: WindowControl,
+) -> io::Result<()> {
+    session.send(&Message::WindowControl(control)).await
+}
+
+async fn send_frame_ack(
+    session: &mut ClientSession<TlsStream<TcpStream>>,
+    window_id: u32,
+    frame_id: u64,
+    decoded_us: u64,
+    presented_us: u64,
+) -> io::Result<()> {
+    if session.has_feature(feature::FRAME_ACK) {
+        session
+            .send(&Message::FrameAck(FrameAck {
+                window_id,
+                frame_id,
+                decoded_us,
+                presented_us,
+            }))
+            .await?;
+    }
+    Ok(())
+}
+
+fn print_event(event: &ClientEvent, frame_counts: &mut HashMap<u32, u64>) {
+    match event {
+        ClientEvent::WindowOpened(w) => println!(
+            "window opened: id={} app_id={} title={:?} geometry={}x{}+{}+{}",
+            w.window_id, w.app_id, w.title, w.width, w.height, w.x, w.y
+        ),
+        ClientEvent::Frame(f) => {
+            let count = frame_counts.entry(f.window_id).or_insert(0);
+            *count += 1;
+            if *count == 1 || count.is_multiple_of(FRAME_LOG_STRIDE) {
+                println!(
+                    "frame: id={} window={} bytes={} keyframe={}",
+                    f.frame_id,
+                    f.window_id,
+                    f.data.len(),
+                    f.is_keyframe()
+                );
+            }
+        }
+        ClientEvent::WindowGeometry(g) => println!(
+            "window geometry: id={} pos=({},{}) size={}x{}",
+            g.window_id, g.x, g.y, g.width, g.height
+        ),
+        ClientEvent::WindowTitle(t) => {
+            println!("window title: id={} title={:?}", t.window_id, t.title)
+        }
+        ClientEvent::WindowState(s) => println!(
+            "window state: id={} state={} flags={:#x}",
+            s.window_id, s.state, s.flags
+        ),
+        ClientEvent::WindowZOrder(z) => {
+            println!(
+                "window z-order: id={} above={}",
+                z.window_id, z.above_window_id
+            )
+        }
+        ClientEvent::WindowIcon(i) => println!(
+            "window icon: id={} size={}x{} bytes={}",
+            i.window_id,
+            i.width,
+            i.height,
+            i.argb.len()
+        ),
+        ClientEvent::WindowClosed(c) => println!("window closed: id={}", c.window_id),
+        ClientEvent::CursorShape(c) => println!(
+            "cursor shape: id={} size={}x{} hotspot=({},{})",
+            c.cursor_id, c.width, c.height, c.hotspot_x, c.hotspot_y
+        ),
+        ClientEvent::CursorPosition(p) => println!(
+            "cursor position: window={} pos=({},{})",
+            p.window_id, p.x, p.y
+        ),
+        ClientEvent::CursorVisibility(v) => {
+            println!("cursor visibility: visible={}", v.visible)
+        }
+        ClientEvent::Error(e) => {
+            eprintln!("oxclient: agent error {}: {}", e.code, e.message);
+        }
+        ClientEvent::Closed(c) => {
+            eprintln!("oxclient: agent closed the session (reason={})", c.reason);
+        }
+    }
+}
+
+struct ClientClock {
+    start: Instant,
+}
+
+impl ClientClock {
+    fn new() -> Self {
+        Self {
+            start: Instant::now(),
+        }
+    }
+
+    fn now_us(&self) -> u64 {
+        self.start
+            .elapsed()
+            .as_micros()
+            .try_into()
+            .unwrap_or(u64::MAX)
+    }
 }
 
 #[cfg(test)]
@@ -285,6 +644,7 @@ mod tests {
                 pin: "ab12".to_string(),
                 token_path: PathBuf::from("/etc/oxrdp/token"),
                 name: "my-laptop".to_string(),
+                headless: false,
             }
         );
     }
@@ -301,6 +661,22 @@ mod tests {
         .expect("valid arguments should parse");
 
         assert_eq!(cli.name, "oxclient");
+        assert!(!cli.headless);
+    }
+
+    #[test]
+    fn parses_headless_flag() {
+        let cli = parse_args(&args(&[
+            "host:1",
+            "--pin",
+            "ab12",
+            "--token-file",
+            "token.txt",
+            "--headless",
+        ]))
+        .expect("valid arguments should parse");
+
+        assert!(cli.headless);
     }
 
     #[test]

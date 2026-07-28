@@ -1,7 +1,8 @@
-use oxclient::RemoteWindow;
+use std::collections::HashSet;
+
 use oxproto::message::{CursorShape, FrameData};
 
-use crate::{DisplayBackend, DisplayError, PresentTimes};
+use crate::{DisplayBackend, DisplayError, PresentTimes, WindowSpec};
 
 /// Recorded backend call for headless tests.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -104,6 +105,7 @@ pub enum HeadlessCall {
 #[derive(Debug, Default)]
 pub struct HeadlessBackend {
     calls: Vec<HeadlessCall>,
+    windows: HashSet<u32>,
 }
 
 impl HeadlessBackend {
@@ -126,7 +128,8 @@ impl HeadlessBackend {
 }
 
 impl DisplayBackend for HeadlessBackend {
-    fn create_window(&mut self, window: &RemoteWindow) -> Result<(), DisplayError> {
+    fn create_window(&mut self, window: &WindowSpec) -> Result<(), DisplayError> {
+        self.windows.insert(window.window_id);
         self.calls.push(HeadlessCall::Created {
             window_id: window.window_id,
             app_id: window.app_id.clone(),
@@ -141,11 +144,12 @@ impl DisplayBackend for HeadlessBackend {
     }
 
     fn destroy_window(&mut self, window_id: u32) -> Result<(), DisplayError> {
+        self.windows.remove(&window_id);
         self.calls.push(HeadlessCall::Destroyed(window_id));
         Ok(())
     }
 
-    fn move_window(&mut self, window: &RemoteWindow) -> Result<(), DisplayError> {
+    fn move_window(&mut self, window: &WindowSpec) -> Result<(), DisplayError> {
         self.calls.push(HeadlessCall::Moved {
             window_id: window.window_id,
             x: window.x,
@@ -156,7 +160,7 @@ impl DisplayBackend for HeadlessBackend {
         Ok(())
     }
 
-    fn retitle_window(&mut self, window: &RemoteWindow) -> Result<(), DisplayError> {
+    fn retitle_window(&mut self, window: &WindowSpec) -> Result<(), DisplayError> {
         self.calls.push(HeadlessCall::Retitled {
             window_id: window.window_id,
             title: window.title.clone(),
@@ -164,7 +168,7 @@ impl DisplayBackend for HeadlessBackend {
         Ok(())
     }
 
-    fn change_state(&mut self, window: &RemoteWindow) -> Result<(), DisplayError> {
+    fn change_state(&mut self, window: &WindowSpec) -> Result<(), DisplayError> {
         self.calls.push(HeadlessCall::StateChanged {
             window_id: window.window_id,
             minimized: window.minimized,
@@ -173,7 +177,7 @@ impl DisplayBackend for HeadlessBackend {
         Ok(())
     }
 
-    fn change_icon(&mut self, window: &RemoteWindow) -> Result<(), DisplayError> {
+    fn change_icon(&mut self, window: &WindowSpec) -> Result<(), DisplayError> {
         self.calls.push(HeadlessCall::IconChanged(window.window_id));
         Ok(())
     }
@@ -184,6 +188,9 @@ impl DisplayBackend for HeadlessBackend {
     }
 
     fn frame(&mut self, frame: &FrameData) -> Result<Option<PresentTimes>, DisplayError> {
+        if !self.windows.contains(&frame.window_id) {
+            return Ok(None);
+        }
         self.calls.push(HeadlessCall::Frame {
             window_id: frame.window_id,
             frame_id: frame.frame_id,

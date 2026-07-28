@@ -184,7 +184,7 @@ impl Presenter for CpuPresenter {
             .get_mut(&id)
             .ok_or(PresentError::UnknownWindow(id))?;
         blit(window, frame)?;
-        window.last_frame = Some(frame.clone());
+        window.cache_frame(frame);
         Ok(PresentTimes {
             decoded_us,
             presented_us: self.now_us(),
@@ -192,18 +192,19 @@ impl Presenter for CpuPresenter {
     }
 
     fn refresh(&mut self, id: u32) -> Result<(), PresentError> {
-        let frame = self
+        let window = self
             .windows
-            .get(&id)
-            .ok_or(PresentError::UnknownWindow(id))?
-            .last_frame
-            .clone();
-        if let Some(frame) = frame {
-            let window = self
-                .windows
-                .get_mut(&id)
-                .ok_or(PresentError::UnknownWindow(id))?;
-            blit(window, &frame)?;
+            .get_mut(&id)
+            .ok_or(PresentError::UnknownWindow(id))?;
+        if let Some(frame) = window.last_frame.as_ref() {
+            blit_pixels(
+                &mut window.surface,
+                window.width,
+                window.height,
+                u32::from(frame.width),
+                u32::from(frame.height),
+                &frame.data,
+            )?;
         }
         Ok(())
     }
@@ -219,7 +220,64 @@ struct CpuWindow {
     surface: Surface<BorrowedHandles, BorrowedHandles>,
     width: u32,
     height: u32,
-    last_frame: Option<FrameData>,
+    last_frame: Option<CachedFrame>,
+}
+
+impl CpuWindow {
+    fn cache_frame(&mut self, frame: &FrameData) {
+        match self.last_frame.as_mut() {
+            Some(cached) if cached.data.capacity() >= frame.data.len() => {
+                cached.replace_from(frame);
+            }
+            _ => {
+                self.last_frame = Some(CachedFrame::from(frame));
+            }
+        }
+    }
+}
+
+#[derive(Debug)]
+struct CachedFrame {
+    window_id: u32,
+    frame_id: u64,
+    codec: u8,
+    flags: u8,
+    width: u16,
+    height: u16,
+    captured_us: u64,
+    encoded_us: u64,
+    data: Vec<u8>,
+}
+
+impl From<&FrameData> for CachedFrame {
+    fn from(frame: &FrameData) -> Self {
+        Self {
+            window_id: frame.window_id,
+            frame_id: frame.frame_id,
+            codec: frame.codec,
+            flags: frame.flags,
+            width: frame.width,
+            height: frame.height,
+            captured_us: frame.captured_us,
+            encoded_us: frame.encoded_us,
+            data: frame.data.clone(),
+        }
+    }
+}
+
+impl CachedFrame {
+    fn replace_from(&mut self, frame: &FrameData) {
+        self.window_id = frame.window_id;
+        self.frame_id = frame.frame_id;
+        self.codec = frame.codec;
+        self.flags = frame.flags;
+        self.width = frame.width;
+        self.height = frame.height;
+        self.captured_us = frame.captured_us;
+        self.encoded_us = frame.encoded_us;
+        self.data.clear();
+        self.data.extend_from_slice(&frame.data);
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -256,18 +314,34 @@ impl HasWindowHandle for BorrowedHandles {
 }
 
 fn blit(window: &mut CpuWindow, frame: &FrameData) -> Result<(), PresentError> {
-    let mut buffer = window.surface.buffer_mut().map_err(platform_error)?;
-    let frame_width = u32::from(frame.width);
-    let frame_height = u32::from(frame.height);
-    let copy_width = window.width.min(frame_width);
-    let copy_height = window.height.min(frame_height);
+    blit_pixels(
+        &mut window.surface,
+        window.width,
+        window.height,
+        u32::from(frame.width),
+        u32::from(frame.height),
+        &frame.data,
+    )
+}
 
-    if window.width != frame_width || window.height != frame_height {
+fn blit_pixels(
+    surface: &mut Surface<BorrowedHandles, BorrowedHandles>,
+    window_width: u32,
+    window_height: u32,
+    frame_width: u32,
+    frame_height: u32,
+    frame_data: &[u8],
+) -> Result<(), PresentError> {
+    let mut buffer = surface.buffer_mut().map_err(platform_error)?;
+    let copy_width = window_width.min(frame_width);
+    let copy_height = window_height.min(frame_height);
+
+    if window_width != frame_width || window_height != frame_height {
         buffer.fill(0);
     }
 
-    let dst_stride = usize::try_from(window.width).unwrap_or(usize::MAX) * 4;
-    let src_stride = usize::from(frame.width) * 4;
+    let dst_stride = usize::try_from(window_width).unwrap_or(usize::MAX) * 4;
+    let src_stride = usize::try_from(frame_width).unwrap_or(usize::MAX) * 4;
     let row_bytes = usize::try_from(copy_width).unwrap_or(usize::MAX) * 4;
     let rows = usize::try_from(copy_height).unwrap_or(0);
 
@@ -280,7 +354,7 @@ fn blit(window: &mut CpuWindow, frame: &FrameData) -> Result<(), PresentError> {
         // Copying as bytes also avoids imposing u32 alignment on the untrusted Vec<u8> payload.
         unsafe {
             std::ptr::copy_nonoverlapping(
-                frame.data.as_ptr().add(src_offset),
+                frame_data.as_ptr().add(src_offset),
                 buffer.as_mut_ptr().cast::<u8>().add(dst_offset),
                 row_bytes,
             );
@@ -302,4 +376,46 @@ fn frame_len(width: u16, height: u16) -> Option<usize> {
 
 fn platform_error(error: impl fmt::Display) -> PresentError {
     PresentError::Platform(error.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn frame_len_counts_bgra_bytes() {
+        assert_eq!(frame_len(0, 10), Some(0));
+        assert_eq!(frame_len(800, 600), Some(1_920_000));
+        assert_eq!(frame_len(u16::MAX, u16::MAX), Some(17_179_344_900));
+    }
+
+    #[test]
+    fn cached_frame_can_reuse_existing_capacity() {
+        let first = FrameData {
+            window_id: 1,
+            frame_id: 1,
+            codec: codec::RAW_BGRA,
+            flags: 0,
+            width: 2,
+            height: 1,
+            captured_us: 10,
+            encoded_us: 11,
+            data: vec![1, 2, 3, 4, 5, 6, 7, 8],
+        };
+        let second = FrameData {
+            frame_id: 2,
+            captured_us: 12,
+            encoded_us: 13,
+            data: vec![9, 10, 11, 12],
+            ..first.clone()
+        };
+        let mut cached = CachedFrame::from(&first);
+        let capacity = cached.data.capacity();
+
+        cached.replace_from(&second);
+
+        assert_eq!(cached.frame_id, 2);
+        assert_eq!(cached.data, second.data);
+        assert_eq!(cached.data.capacity(), capacity);
+    }
 }

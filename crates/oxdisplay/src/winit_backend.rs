@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
-use oxclient::{ClientEvent, RemoteWindow, WindowModel};
 use oxproto::message::input::cursor_format;
 use oxproto::message::{CursorShape, FrameData};
 use raw_window_handle::{HasWindowHandle, RawWindowHandle};
@@ -20,9 +20,11 @@ use x11rb::wrapper::ConnectionExt as _;
 
 use crate::input::{key_flags, keycode_to_scancode, locks, modifiers, update_buttons};
 use crate::{
-    apply_model_change, display_error, DisplayBackend, DisplayCommand, DisplayError, DisplayEvent,
-    PresentError, PresentTimes, Presenter,
+    apply_display_command, display_error, DisplayBackend, DisplayCommand, DisplayError,
+    DisplayEvent, PresentError, PresentTimes, Presenter, WindowSpec,
 };
+
+const GEOMETRY_ECHO_DEADLINE: Duration = Duration::from_millis(750);
 
 /// Cloneable command sender for the display event loop.
 #[derive(Debug, Clone)]
@@ -54,14 +56,12 @@ pub fn run(
     ready(CommandSender { proxy });
 
     let mut app = DisplayApp {
-        model: WindowModel::new(),
         backend: WinitBackend::new(presenter, events),
     };
     event_loop.run_app(&mut app).map_err(display_error)
 }
 
 struct DisplayApp {
-    model: WindowModel,
     backend: WinitBackend,
 }
 
@@ -74,42 +74,20 @@ impl ApplicationHandler<DisplayCommand> for DisplayApp {
             return;
         }
 
-        let Some(client_event) = command_to_client_event(event) else {
-            return;
+        let mut backend = WinitBackendAdapter {
+            inner: &mut self.backend,
+            event_loop,
         };
-        for change in self.model.apply(client_event) {
-            let mut backend = WinitBackendAdapter {
-                inner: &mut self.backend,
-                event_loop,
-            };
-            if let Err(error) = apply_model_change(&mut backend, &self.model, change) {
-                let _ = self.backend.events.send(DisplayEvent::BackendError {
-                    message: error.to_string(),
-                });
-            }
+        if let Err(error) = apply_display_command(&mut backend, event) {
+            let _ = self.backend.events.send(DisplayEvent::BackendError {
+                message: error.to_string(),
+            });
         }
     }
 
     fn window_event(&mut self, event_loop: &ActiveEventLoop, id: WindowId, event: WindowEvent) {
         self.backend.handle_window_event(event_loop, id, event);
     }
-}
-
-fn command_to_client_event(command: DisplayCommand) -> Option<ClientEvent> {
-    Some(match command {
-        DisplayCommand::OpenWindow(m) => ClientEvent::WindowOpened(m),
-        DisplayCommand::Geometry(m) => ClientEvent::WindowGeometry(m),
-        DisplayCommand::Title(m) => ClientEvent::WindowTitle(m),
-        DisplayCommand::State(m) => ClientEvent::WindowState(m),
-        DisplayCommand::ZOrder(m) => ClientEvent::WindowZOrder(m),
-        DisplayCommand::Icon(m) => ClientEvent::WindowIcon(m),
-        DisplayCommand::CloseWindow(m) => ClientEvent::WindowClosed(m),
-        DisplayCommand::Frame(m) => ClientEvent::Frame(m),
-        DisplayCommand::CursorShape(m) => ClientEvent::CursorShape(m),
-        DisplayCommand::CursorPosition(m) => ClientEvent::CursorPosition(m),
-        DisplayCommand::CursorVisibility(m) => ClientEvent::CursorVisibility(m),
-        DisplayCommand::Shutdown => return None,
-    })
 }
 
 struct WinitBackend {
@@ -122,6 +100,7 @@ struct WinitBackend {
     pointer_buttons: u8,
     pointer_position: HashMap<u32, (i32, i32)>,
     x11_sidecar: X11Sidecar,
+    geometry_echoes: GeometryEchoLedger,
 }
 
 impl WinitBackend {
@@ -136,6 +115,7 @@ impl WinitBackend {
             pointer_buttons: 0,
             pointer_position: HashMap::new(),
             x11_sidecar: X11Sidecar::new(),
+            geometry_echoes: GeometryEchoLedger::new(GEOMETRY_ECHO_DEADLINE),
         }
     }
 
@@ -158,6 +138,12 @@ impl WinitBackend {
                 let _ = self
                     .presenter
                     .resize(window_id, u32::from(width), u32::from(height));
+                if let Some(entry) = self.windows.get_mut(&window_id) {
+                    entry.geometry.width = width;
+                    entry.geometry.height = height;
+                    self.geometry_echoes
+                        .record(Instant::now(), window_id, entry.geometry);
+                }
                 let _ = self.events.send(DisplayEvent::ResizeRequested {
                     window_id,
                     width,
@@ -165,6 +151,12 @@ impl WinitBackend {
                 });
             }
             WindowEvent::Moved(position) if event_loop.is_x11() => {
+                if let Some(entry) = self.windows.get_mut(&window_id) {
+                    entry.geometry.x = position.x;
+                    entry.geometry.y = position.y;
+                    self.geometry_echoes
+                        .record(Instant::now(), window_id, entry.geometry);
+                }
                 let _ = self.events.send(DisplayEvent::MoveRequested {
                     window_id,
                     x: position.x,
@@ -261,7 +253,7 @@ struct WinitBackendAdapter<'a> {
 }
 
 impl DisplayBackend for WinitBackendAdapter<'_> {
-    fn create_window(&mut self, remote: &RemoteWindow) -> Result<(), DisplayError> {
+    fn create_window(&mut self, remote: &WindowSpec) -> Result<(), DisplayError> {
         if self.inner.windows.contains_key(&remote.window_id) {
             return Ok(());
         }
@@ -269,14 +261,14 @@ impl DisplayBackend for WinitBackendAdapter<'_> {
         let app_id = remote.app_id.clone();
         let mut attrs = Window::default_attributes()
             .with_title(remote.title.clone())
-            .with_decorations(false)
+            .with_decorations(remote.has_frame)
             .with_inner_size(PhysicalSize::new(
                 u32::from(remote.width),
                 u32::from(remote.height),
             ))
-            .with_resizable(remote.window_id != 0)
+            .with_resizable(remote.resizable)
             .with_maximized(remote.maximized)
-            .with_window_level(if remote_flag_topmost(remote) {
+            .with_window_level(if remote.topmost {
                 WindowLevel::AlwaysOnTop
             } else {
                 WindowLevel::Normal
@@ -294,6 +286,9 @@ impl DisplayBackend for WinitBackendAdapter<'_> {
                 .map_err(display_error)?,
         );
         window.set_cursor_visible(self.inner.cursor_visible);
+        if remote.minimized {
+            window.set_minimized(true);
+        }
         let size = window.inner_size();
         self.inner
             .presenter
@@ -309,6 +304,7 @@ impl DisplayBackend for WinitBackendAdapter<'_> {
                 window,
                 xid,
                 owner_id: remote.owner_id,
+                geometry: Geometry::from(remote),
             },
         );
 
@@ -324,7 +320,16 @@ impl DisplayBackend for WinitBackendAdapter<'_> {
         Ok(())
     }
 
-    fn move_window(&mut self, remote: &RemoteWindow) -> Result<(), DisplayError> {
+    fn move_window(&mut self, remote: &WindowSpec) -> Result<(), DisplayError> {
+        let geometry = Geometry::from(remote);
+        if self
+            .inner
+            .geometry_echoes
+            .take_if_echo(Instant::now(), remote.window_id, geometry)
+        {
+            return Ok(());
+        }
+
         let Some(entry) = self.inner.windows.get(&remote.window_id) else {
             return Ok(());
         };
@@ -345,32 +350,33 @@ impl DisplayBackend for WinitBackendAdapter<'_> {
                 .window
                 .set_outer_position(PhysicalPosition::new(remote.x, remote.y));
         }
+        if let Some(entry) = self.inner.windows.get_mut(&remote.window_id) {
+            entry.geometry = geometry;
+        }
         Ok(())
     }
 
-    fn retitle_window(&mut self, remote: &RemoteWindow) -> Result<(), DisplayError> {
+    fn retitle_window(&mut self, remote: &WindowSpec) -> Result<(), DisplayError> {
         if let Some(entry) = self.inner.windows.get(&remote.window_id) {
             entry.window.set_title(&remote.title);
         }
         Ok(())
     }
 
-    fn change_state(&mut self, remote: &RemoteWindow) -> Result<(), DisplayError> {
+    fn change_state(&mut self, remote: &WindowSpec) -> Result<(), DisplayError> {
         if let Some(entry) = self.inner.windows.get(&remote.window_id) {
             entry.window.set_minimized(remote.minimized);
             entry.window.set_maximized(remote.maximized);
-            entry
-                .window
-                .set_window_level(if remote_flag_topmost(remote) {
-                    WindowLevel::AlwaysOnTop
-                } else {
-                    WindowLevel::Normal
-                });
+            entry.window.set_window_level(if remote.topmost {
+                WindowLevel::AlwaysOnTop
+            } else {
+                WindowLevel::Normal
+            });
         }
         Ok(())
     }
 
-    fn change_icon(&mut self, remote: &RemoteWindow) -> Result<(), DisplayError> {
+    fn change_icon(&mut self, remote: &WindowSpec) -> Result<(), DisplayError> {
         if !self.event_loop.is_x11() {
             return Ok(());
         }
@@ -406,7 +412,16 @@ impl DisplayBackend for WinitBackendAdapter<'_> {
                 });
                 Ok(Some(times))
             }
-            Err(PresentError::DroppedFrame { .. }) => Ok(None),
+            Err(PresentError::DroppedFrame {
+                window_id,
+                expected,
+                actual,
+            }) => {
+                log::warn!(
+                    "dropped malformed frame for window {window_id}: expected {expected} bytes, got {actual}"
+                );
+                Ok(None)
+            }
             Err(error) => Err(display_error(error)),
         }
     }
@@ -488,6 +503,69 @@ struct WinitWindow {
     window: Arc<Window>,
     xid: Option<u32>,
     owner_id: u32,
+    geometry: Geometry,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Geometry {
+    x: i32,
+    y: i32,
+    width: u16,
+    height: u16,
+}
+
+impl From<&WindowSpec> for Geometry {
+    fn from(window: &WindowSpec) -> Self {
+        Self {
+            x: window.x,
+            y: window.y,
+            width: window.width,
+            height: window.height,
+        }
+    }
+}
+
+#[derive(Debug)]
+struct GeometryEchoLedger {
+    entries: HashMap<u32, PendingGeometry>,
+    ttl: Duration,
+}
+
+impl GeometryEchoLedger {
+    fn new(ttl: Duration) -> Self {
+        Self {
+            entries: HashMap::new(),
+            ttl,
+        }
+    }
+
+    fn record(&mut self, now: Instant, window_id: u32, geometry: Geometry) {
+        self.entries.insert(
+            window_id,
+            PendingGeometry {
+                geometry,
+                expires_at: now + self.ttl,
+            },
+        );
+    }
+
+    fn take_if_echo(&mut self, now: Instant, window_id: u32, geometry: Geometry) -> bool {
+        let Some(pending) = self.entries.get(&window_id).copied() else {
+            return false;
+        };
+        if now > pending.expires_at {
+            self.entries.remove(&window_id);
+            return false;
+        }
+        self.entries.remove(&window_id);
+        pending.geometry == geometry
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct PendingGeometry {
+    geometry: Geometry,
+    expires_at: Instant,
 }
 
 struct X11Sidecar {
@@ -521,11 +599,6 @@ impl X11Sidecar {
         conn.flush().map_err(display_error)?;
         Ok(())
     }
-}
-
-fn remote_flag_topmost(remote: &RemoteWindow) -> bool {
-    let _ = remote;
-    false
 }
 
 fn x11_window_id(window: &Window) -> Option<u32> {
@@ -605,5 +678,102 @@ fn clamp_f64_to_i32(value: f64) -> i32 {
         i32::MIN
     } else {
         value.round() as i32
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use winit::dpi::PhysicalPosition;
+
+    #[test]
+    fn geometry_echo_ledger_swallows_matching_pending_geometry_once() {
+        let mut ledger = GeometryEchoLedger::new(Duration::from_millis(10));
+        let now = Instant::now();
+        let geometry = Geometry {
+            x: 1,
+            y: 2,
+            width: 3,
+            height: 4,
+        };
+
+        ledger.record(now, 7, geometry);
+
+        assert!(ledger.take_if_echo(now, 7, geometry));
+        assert!(!ledger.take_if_echo(now, 7, geometry));
+    }
+
+    #[test]
+    fn geometry_echo_ledger_does_not_swallow_expired_or_different_geometry() {
+        let mut ledger = GeometryEchoLedger::new(Duration::from_millis(10));
+        let now = Instant::now();
+        let geometry = Geometry {
+            x: 1,
+            y: 2,
+            width: 3,
+            height: 4,
+        };
+
+        ledger.record(now, 7, geometry);
+        assert!(!ledger.take_if_echo(
+            now,
+            7,
+            Geometry {
+                width: 9,
+                ..geometry
+            },
+        ));
+
+        ledger.record(now, 7, geometry);
+        assert!(!ledger.take_if_echo(now + Duration::from_millis(11), 7, geometry));
+    }
+
+    #[test]
+    fn argb_to_rgba_reorders_channels_and_rejects_wrong_lengths() {
+        assert_eq!(argb_to_rgba(&[4, 1, 2, 3], 1, 1), Some(vec![1, 2, 3, 4]));
+        assert_eq!(argb_to_rgba(&[4, 1, 2], 1, 1), None);
+    }
+
+    #[test]
+    fn bgra_premul_to_rgba_unpremultiplies_and_rejects_wrong_lengths() {
+        assert_eq!(
+            bgra_premul_to_rgba(&[10, 20, 30, 128], 1, 1),
+            Some(vec![59, 39, 19, 128])
+        );
+        assert_eq!(bgra_premul_to_rgba(&[1, 2, 3], 1, 1), None);
+        assert_eq!(
+            bgra_premul_to_rgba(&[10, 20, 30, 0], 1, 1),
+            Some(vec![0, 0, 0, 0])
+        );
+    }
+
+    #[test]
+    fn wheel_delta_converts_lines_and_pixels_to_protocol_units() {
+        assert_eq!(
+            wheel_delta(MouseScrollDelta::LineDelta(1.0, -2.0)),
+            (120, -240)
+        );
+        assert_eq!(
+            wheel_delta(MouseScrollDelta::PixelDelta(PhysicalPosition::new(
+                240.0, -120.0,
+            ))),
+            (240, -120)
+        );
+    }
+
+    #[test]
+    fn wheel_delta_saturates_to_i16_range() {
+        assert_eq!(
+            wheel_delta(MouseScrollDelta::LineDelta(1_000_000.0, -1_000_000.0)),
+            (i16::MAX, i16::MIN)
+        );
+    }
+
+    #[test]
+    fn clamp_f64_to_i32_rounds_and_saturates() {
+        assert_eq!(clamp_f64_to_i32(1.4), 1);
+        assert_eq!(clamp_f64_to_i32(1.5), 2);
+        assert_eq!(clamp_f64_to_i32(f64::from(i32::MAX) + 1.0), i32::MAX);
+        assert_eq!(clamp_f64_to_i32(f64::from(i32::MIN) - 1.0), i32::MIN);
     }
 }

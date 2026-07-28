@@ -1,13 +1,11 @@
 //! Display layer for the Linux oxproto client.
 //!
 //! This crate owns native window lifecycle and presentation for the first-pixels milestone:
-//! `WindowModel` emits ordered `ModelChange`s, a display backend maps those changes to native
-//! windows, and `CpuPresenter` blits `RAW_BGRA` frames into each window with `softbuffer`.
+//! the client turns its window model into ordered display commands, a display backend maps those
+//! commands to native windows, and `CpuPresenter` blits `RAW_BGRA` frames into each window with
+//! `softbuffer`.
 //!
-//! Deviation record: `docs/design/client-display.md` says topmost/resizable flags map to native
-//! window state, but `oxclient::RemoteWindow` does not retain those `WindowOpened.flags` fields
-//! and this task forbids editing `oxclient::model`; this crate therefore cannot apply them from
-//! `ModelChange`. `WindowZOrder` is intentionally ignored in v1, as specified by the decision
+//! `WindowZOrder` is intentionally accepted but ignored in v1, as specified by the decision
 //! record.
 //!
 //! The CPU presenter contains the crate's only unsafe code. The public `Presenter` trait takes
@@ -25,11 +23,7 @@ pub mod input;
 use std::error::Error;
 use std::fmt;
 
-use oxclient::{ModelChange, RemoteWindow, WindowModel};
-use oxproto::message::{
-    CursorPosition, CursorShape, CursorVisibility, FrameData, Output, WindowClosed, WindowGeometry,
-    WindowIcon, WindowOpened, WindowState, WindowTitle, WindowZOrder,
-};
+use oxproto::message::{CursorShape, FrameData, Output, WindowIcon};
 use raw_window_handle::{HasDisplayHandle, HasWindowHandle};
 use x11rb::connection::Connection;
 
@@ -44,35 +38,79 @@ pub trait DisplayWindow: HasWindowHandle + HasDisplayHandle {}
 impl<T> DisplayWindow for T where T: HasWindowHandle + HasDisplayHandle {}
 
 /// Session thread to display thread command.
-///
-/// The variants mirror the display-relevant protocol events. The display loop forwards them
-/// through `WindowModel`; it does not re-diff protocol messages.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DisplayCommand {
     /// Create a native window.
-    OpenWindow(WindowOpened),
-    /// Apply guest geometry.
-    Geometry(WindowGeometry),
-    /// Apply a window title.
-    Title(WindowTitle),
-    /// Apply minimized/maximized/restored state.
-    State(WindowState),
-    /// Accept z-order update; ignored in v1 after model ordering is updated.
-    ZOrder(WindowZOrder),
-    /// Apply a window icon where the platform supports it.
-    Icon(WindowIcon),
+    CreateWindow(WindowSpec),
     /// Destroy a native window.
-    CloseWindow(WindowClosed),
+    DestroyWindow(u32),
+    /// Apply guest geometry.
+    MoveWindow(WindowSpec),
+    /// Apply a window title.
+    RetitleWindow(WindowSpec),
+    /// Apply minimized/maximized/restored state.
+    ChangeState(WindowSpec),
+    /// Apply a window icon where the platform supports it.
+    ChangeIcon(WindowSpec),
+    /// Accept z-order update; ignored in v1 after model ordering is updated.
+    Restack(Vec<u32>),
     /// Present a frame.
     Frame(FrameData),
     /// Set cursor bitmap.
     CursorShape(CursorShape),
     /// Accepted for protocol forward compatibility; ignored in v1.
-    CursorPosition(CursorPosition),
+    CursorPosition {
+        /// Window the cursor is over.
+        window_id: u32,
+        /// Window-relative X.
+        x: i32,
+        /// Window-relative Y.
+        y: i32,
+    },
     /// Show or hide native cursor.
-    CursorVisibility(CursorVisibility),
+    CursorVisibility(bool),
+    /// Surface an agent error.
+    AgentError {
+        /// Protocol error code.
+        code: u16,
+        /// Human-readable message from the agent.
+        message: String,
+    },
     /// Stop the display loop.
     Shutdown,
+}
+
+/// Display-ready snapshot of one remote window.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WindowSpec {
+    /// Protocol id, stable for the session.
+    pub window_id: u32,
+    /// Executable base name.
+    pub app_id: String,
+    /// Current title.
+    pub title: String,
+    /// Guest-side X position.
+    pub x: i32,
+    /// Guest-side Y position.
+    pub y: i32,
+    /// Visible frame width.
+    pub width: u16,
+    /// Visible frame height.
+    pub height: u16,
+    /// Owning window, or 0.
+    pub owner_id: u32,
+    /// Whether the guest reports the window minimized.
+    pub minimized: bool,
+    /// Whether the guest reports the window maximized.
+    pub maximized: bool,
+    /// Whether the guest window can be resized by the user.
+    pub resizable: bool,
+    /// Whether the guest window has a system frame.
+    pub has_frame: bool,
+    /// Whether the guest keeps the window above others.
+    pub topmost: bool,
+    /// Latest icon, if the agent has sent one.
+    pub icon: Option<WindowIcon>,
 }
 
 /// Display thread to session thread event.
@@ -199,23 +237,23 @@ impl fmt::Display for DisplayError {
 
 impl Error for DisplayError {}
 
-/// A backend that executes already-ordered `WindowModel` changes.
+/// A backend that executes already-ordered display commands.
 ///
 /// This trait is intentionally smaller than the winit event loop. It lets the headless backend
 /// test the model-to-backend mapping without a display server.
 pub trait DisplayBackend {
     /// Create one native window.
-    fn create_window(&mut self, window: &RemoteWindow) -> Result<(), DisplayError>;
+    fn create_window(&mut self, window: &WindowSpec) -> Result<(), DisplayError>;
     /// Destroy one native window.
     fn destroy_window(&mut self, window_id: u32) -> Result<(), DisplayError>;
     /// Apply geometry; X11 backends also apply position, Wayland backends only apply size.
-    fn move_window(&mut self, window: &RemoteWindow) -> Result<(), DisplayError>;
+    fn move_window(&mut self, window: &WindowSpec) -> Result<(), DisplayError>;
     /// Apply title.
-    fn retitle_window(&mut self, window: &RemoteWindow) -> Result<(), DisplayError>;
+    fn retitle_window(&mut self, window: &WindowSpec) -> Result<(), DisplayError>;
     /// Apply minimized/maximized/restored state.
-    fn change_state(&mut self, window: &RemoteWindow) -> Result<(), DisplayError>;
+    fn change_state(&mut self, window: &WindowSpec) -> Result<(), DisplayError>;
     /// Apply icon if supported.
-    fn change_icon(&mut self, window: &RemoteWindow) -> Result<(), DisplayError>;
+    fn change_icon(&mut self, window: &WindowSpec) -> Result<(), DisplayError>;
     /// Accept restack notification. V1 ignores this after `WindowModel` updates ordering.
     fn restack(&mut self, stack: &[u32]) -> Result<(), DisplayError>;
     /// Present a frame.
@@ -232,52 +270,29 @@ pub trait DisplayBackend {
     fn closed(&mut self) -> Result<(), DisplayError>;
 }
 
-/// Applies one model change to a backend.
-///
-/// Unknown windows are ignored because `WindowModel` can legally emit frame races against close.
-pub fn apply_model_change<B: DisplayBackend + ?Sized>(
+/// Applies one display command to a backend.
+pub fn apply_display_command<B: DisplayBackend + ?Sized>(
     backend: &mut B,
-    model: &WindowModel,
-    change: ModelChange,
+    command: DisplayCommand,
 ) -> Result<(), DisplayError> {
-    match change {
-        ModelChange::Created(id) => {
-            if let Some(window) = model.get(id) {
-                backend.create_window(window)?;
-            }
-        }
-        ModelChange::Destroyed(id) => backend.destroy_window(id)?,
-        ModelChange::Moved(id) => {
-            if let Some(window) = model.get(id) {
-                backend.move_window(window)?;
-            }
-        }
-        ModelChange::Retitled(id) => {
-            if let Some(window) = model.get(id) {
-                backend.retitle_window(window)?;
-            }
-        }
-        ModelChange::StateChanged(id) => {
-            if let Some(window) = model.get(id) {
-                backend.change_state(window)?;
-            }
-        }
-        ModelChange::IconChanged(id) => {
-            if let Some(window) = model.get(id) {
-                backend.change_icon(window)?;
-            }
-        }
-        ModelChange::Restacked => backend.restack(model.stack())?,
-        ModelChange::Frame(frame) => {
+    match command {
+        DisplayCommand::CreateWindow(window) => backend.create_window(&window)?,
+        DisplayCommand::DestroyWindow(id) => backend.destroy_window(id)?,
+        DisplayCommand::MoveWindow(window) => backend.move_window(&window)?,
+        DisplayCommand::RetitleWindow(window) => backend.retitle_window(&window)?,
+        DisplayCommand::ChangeState(window) => backend.change_state(&window)?,
+        DisplayCommand::ChangeIcon(window) => backend.change_icon(&window)?,
+        DisplayCommand::Restack(stack) => backend.restack(&stack)?,
+        DisplayCommand::Frame(frame) => {
             let _ = backend.frame(&frame)?;
         }
-        ModelChange::CursorShape(shape) => backend.cursor_shape(&shape)?,
-        ModelChange::CursorMoved { window_id, x, y } => {
+        DisplayCommand::CursorShape(shape) => backend.cursor_shape(&shape)?,
+        DisplayCommand::CursorPosition { window_id, x, y } => {
             backend.cursor_moved(window_id, x, y)?;
         }
-        ModelChange::CursorVisibility(visible) => backend.cursor_visibility(visible)?,
-        ModelChange::AgentError { code, message } => backend.agent_error(code, &message)?,
-        ModelChange::Closed => backend.closed()?,
+        DisplayCommand::CursorVisibility(visible) => backend.cursor_visibility(visible)?,
+        DisplayCommand::AgentError { code, message } => backend.agent_error(code, &message)?,
+        DisplayCommand::Shutdown => backend.closed()?,
     }
     Ok(())
 }

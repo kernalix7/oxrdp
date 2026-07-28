@@ -1077,6 +1077,7 @@ dependencies = [
 name = "oxclient"
 version = "0.0.0"
 dependencies = [
+ "oxdisplay",
  "oxproto",
  "oxsec",
  "oxtransport",
@@ -1088,7 +1089,7 @@ dependencies = [
 name = "oxdisplay"
 version = "0.0.0"
 dependencies = [
- "oxclient",
+ "log",
  "oxproto",
  "raw-window-handle",
  "softbuffer",
