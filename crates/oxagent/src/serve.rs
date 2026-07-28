@@ -21,6 +21,7 @@ use std::time::{Duration, Instant};
 
 use oxproto::envelope::{channel, Reassembler};
 use oxproto::message::input::key_flag;
+use oxproto::message::window::window_flag;
 use oxproto::message::{
     FrameData, Message, WindowClosed, WindowGeometry, WindowOpened, WindowTitle,
 };
@@ -55,6 +56,18 @@ pub struct SourceWindow {
     pub height: u16,
     /// Guest DPI for this window.
     pub dpi: u16,
+    /// Whether the window is currently minimized.
+    pub minimized: bool,
+    /// Whether the window is currently maximized.
+    pub maximized: bool,
+    /// Whether the user can resize the window.
+    pub resizable: bool,
+    /// Whether the window has a plain, croppable native frame — see
+    /// `crate::win::enumerate::has_native_frame` on the Windows side for exactly what this
+    /// does and does not mean (it is not simply "has a title bar").
+    pub has_frame: bool,
+    /// Whether the window is marked always-on-top.
+    pub topmost: bool,
 }
 
 /// A captured frame handed to the driver.
@@ -302,6 +315,28 @@ where
     }
 }
 
+/// Pack a [`SourceWindow`]'s booleans into a `WindowOpened.flags` bitmask
+/// (`OXPROTO.md` §11, `oxproto::message::window::window_flag`).
+fn window_flags(w: &SourceWindow) -> u32 {
+    let mut flags = 0;
+    if w.resizable {
+        flags |= window_flag::RESIZABLE;
+    }
+    if w.has_frame {
+        flags |= window_flag::HAS_FRAME;
+    }
+    if w.topmost {
+        flags |= window_flag::TOPMOST;
+    }
+    if w.minimized {
+        flags |= window_flag::MINIMIZED;
+    }
+    if w.maximized {
+        flags |= window_flag::MAXIMIZED;
+    }
+    flags
+}
+
 /// Diff the platform's window list against what the client has been told.
 async fn sync_windows<W, WR>(
     writer: &mut WR,
@@ -332,7 +367,7 @@ where
                     width: w.width,
                     height: w.height,
                     dpi: w.dpi,
-                    flags: 0,
+                    flags: window_flags(w),
                     owner_id: 0,
                 }),
                 channel::WINDOW,
@@ -531,6 +566,11 @@ mod tests {
                     width: 4,
                     height: 1,
                     dpi: 96,
+                    minimized: false,
+                    maximized: false,
+                    resizable: true,
+                    has_frame: true,
+                    topmost: false,
                 }],
                 frames_left: frames,
             }
@@ -657,6 +697,90 @@ mod tests {
         }
     }
 
+    /// A [`SourceWindow`] with every flag-bearing field `false`, for building variations.
+    fn plain_window() -> SourceWindow {
+        SourceWindow {
+            handle: 1,
+            pid: 1,
+            app_id: "a.exe".into(),
+            title: "t".into(),
+            x: 0,
+            y: 0,
+            width: 1,
+            height: 1,
+            dpi: 96,
+            minimized: false,
+            maximized: false,
+            resizable: false,
+            has_frame: false,
+            topmost: false,
+        }
+    }
+
+    #[test]
+    fn window_flags_packs_every_bit_correctly() {
+        use oxproto::message::window::window_flag;
+
+        assert_eq!(
+            window_flags(&plain_window()),
+            0,
+            "nothing set, nothing packed"
+        );
+
+        assert_eq!(
+            window_flags(&SourceWindow {
+                resizable: true,
+                ..plain_window()
+            }),
+            window_flag::RESIZABLE
+        );
+        assert_eq!(
+            window_flags(&SourceWindow {
+                has_frame: true,
+                ..plain_window()
+            }),
+            window_flag::HAS_FRAME
+        );
+        assert_eq!(
+            window_flags(&SourceWindow {
+                topmost: true,
+                ..plain_window()
+            }),
+            window_flag::TOPMOST
+        );
+        assert_eq!(
+            window_flags(&SourceWindow {
+                minimized: true,
+                ..plain_window()
+            }),
+            window_flag::MINIMIZED
+        );
+        assert_eq!(
+            window_flags(&SourceWindow {
+                maximized: true,
+                ..plain_window()
+            }),
+            window_flag::MAXIMIZED
+        );
+
+        assert_eq!(
+            window_flags(&SourceWindow {
+                resizable: true,
+                has_frame: true,
+                topmost: true,
+                minimized: true,
+                maximized: true,
+                ..plain_window()
+            }),
+            window_flag::RESIZABLE
+                | window_flag::HAS_FRAME
+                | window_flag::TOPMOST
+                | window_flag::MINIMIZED
+                | window_flag::MAXIMIZED,
+            "every bit set must survive independently"
+        );
+    }
+
     fn hello(token: &str) -> Message {
         hello_with_features(token, feature::FRAME_ACK)
     }
@@ -688,6 +812,8 @@ mod tests {
 
     #[tokio::test]
     async fn streams_a_window_and_its_frames() {
+        use oxproto::message::window::window_flag;
+
         let (mut client, agent) = tokio::io::duplex(256 * 1024);
         let mut source = FakeSource::one_window(3);
 
@@ -726,6 +852,9 @@ mod tests {
         assert_eq!(w.app_id, "notepad.exe");
         assert_eq!(w.video_channel, channel::VIDEO_BASE);
         assert_eq!((w.x, w.y, w.width, w.height), (10, 20, 4, 1));
+        // `FakeSource::one_window` reports resizable+framed, not topmost/minimized/maximized —
+        // `window_flags` must reflect exactly that, not the old hardcoded `0`.
+        assert_eq!(w.flags, window_flag::RESIZABLE | window_flag::HAS_FRAME);
 
         let mut frames = 0;
         while frames < 2 {

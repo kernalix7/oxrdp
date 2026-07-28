@@ -37,6 +37,9 @@ windows = { version = "0.58", features = [
     "Win32_UI_WindowsAndMessaging",
     "Win32_UI_HiDpi",
     "Win32_Graphics_Dwm",
+    # ClientToScreen, for distinguishing a plain native caption from a DWM frame-extended one
+    # (Windows Terminal-style) when computing WindowOpened's HAS_FRAME flag.
+    "Win32_Graphics_Gdi",
     # Window -> owning process resolution (app identity / WM_CLASS)
     "Win32_System_Threading",
     # Input injection (P3)

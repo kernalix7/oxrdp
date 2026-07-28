@@ -9,13 +9,15 @@
 //! Windows.Graphics.Capture actually captures. Reporting the frame bounds keeps the client's
 //! native window aligned with the pixels, and keeps input coordinates correct.
 
-use windows::Win32::Foundation::{BOOL, HWND, LPARAM, RECT, TRUE};
+use windows::Win32::Foundation::{BOOL, HWND, LPARAM, POINT, RECT, TRUE};
 use windows::Win32::Graphics::Dwm::{
     DwmGetWindowAttribute, DWMWA_CLOAKED, DWMWA_EXTENDED_FRAME_BOUNDS,
 };
+use windows::Win32::Graphics::Gdi::ClientToScreen;
 use windows::Win32::UI::WindowsAndMessaging::{
     EnumWindows, GetShellWindow, GetWindowLongPtrW, GetWindowRect, GetWindowTextLengthW,
-    GetWindowTextW, IsIconic, IsWindowVisible, GWL_EXSTYLE, GWL_STYLE, WS_CHILD, WS_EX_TOOLWINDOW,
+    GetWindowTextW, IsIconic, IsWindowVisible, IsZoomed, GWL_EXSTYLE, GWL_STYLE, WS_CAPTION,
+    WS_CHILD, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_THICKFRAME,
 };
 
 /// A shareable top-level application window on the guest.
@@ -35,6 +37,15 @@ pub struct WindowInfo {
     pub height: u16,
     /// Whether the window is minimized (its geometry is meaningless while it is).
     pub minimized: bool,
+    /// Whether the window is currently maximized.
+    pub maximized: bool,
+    /// Whether the user can resize the window (`WS_THICKFRAME`).
+    pub resizable: bool,
+    /// Whether the window has a plain, croppable native caption — see [`has_native_frame`] for
+    /// exactly what this does and does not mean.
+    pub has_frame: bool,
+    /// Whether the window is marked always-on-top (`WS_EX_TOPMOST`).
+    pub topmost: bool,
 }
 
 /// Enumerate visible, titled, non-cloaked top-level application windows.
@@ -118,6 +129,9 @@ fn describe_window(hwnd: HWND) -> Option<WindowInfo> {
             return None;
         }
 
+        let style = GetWindowLongPtrW(hwnd, GWL_STYLE) as u32;
+        let ex_style = GetWindowLongPtrW(hwnd, GWL_EXSTYLE) as u32;
+
         Some(WindowInfo {
             hwnd: hwnd.0 as isize,
             title,
@@ -126,8 +140,50 @@ fn describe_window(hwnd: HWND) -> Option<WindowInfo> {
             width: width.min(u16::MAX as i32) as u16,
             height: height.min(u16::MAX as i32) as u16,
             minimized,
+            maximized: IsZoomed(hwnd).as_bool(),
+            resizable: style & WS_THICKFRAME.0 != 0,
+            has_frame: has_native_frame(hwnd, style, &rect),
+            topmost: ex_style & WS_EX_TOPMOST.0 != 0,
         })
     }
+}
+
+/// A handful of physical pixels of slack for measurement rounding in [`has_native_frame`]. Any
+/// genuine system caption is tens of pixels tall even at the smallest supported scale factor,
+/// so this cannot misclassify a real one — it only correctly rejects a near-zero gap.
+const FRAME_EXTENSION_TOLERANCE_PX: i32 = 8;
+
+/// Whether `hwnd` has a plain, native Windows caption that is safe to treat as croppable chrome
+/// — the meaning `WindowOpened.flags`' `HAS_FRAME` bit carries on the wire (`OXPROTO.md` §11):
+/// **true** means the client may crop the captured pixels down to the client area and wrap them
+/// in its own native decoration; **false** means it must render the captured frame border-to-
+/// border, exactly as captured, because there is either no frame at all (a tooltip, a splash
+/// screen) or a frame whose content is not plain system chrome.
+///
+/// `WS_CAPTION` alone is not sufficient. Windows Terminal (and other apps that call
+/// `DwmExtendFrameIntoClientArea` to draw a custom tab strip / search box in the caption band)
+/// keep `WS_CAPTION` set purely to retain Aero Snap and the system menu, while the pixels in
+/// that band are the app's own UI, not a generic title bar — cropping them would slice off real
+/// content, not chrome. The reliable signal is *where the client area actually starts*: for a
+/// plain captioned window it begins a caption's height below the frame's top edge (in screen
+/// coordinates); for a frame-extended window it begins right at — or within a few pixels of —
+/// the frame's own top, because the app has claimed that space for itself. Comparing
+/// `ClientToScreen` against the same extended frame bounds `frame_bounds` already computes (so
+/// this needs no extra DWM query) distinguishes the two without knowing anything
+/// app-specific.
+fn has_native_frame(hwnd: HWND, style: u32, frame: &RECT) -> bool {
+    if style & WS_CAPTION.0 == 0 {
+        return false;
+    }
+    let mut origin = POINT::default();
+    // SAFETY: `hwnd` is the same handle `describe_window` is already querying; `origin` is a
+    // valid, uniquely-owned out-parameter for the duration of this call.
+    if !unsafe { ClientToScreen(hwnd, &mut origin) }.as_bool() {
+        // Cannot tell: assume no croppable frame rather than guessing wrong and cropping into
+        // real content.
+        return false;
+    }
+    origin.y.saturating_sub(frame.top) >= FRAME_EXTENSION_TOLERANCE_PX
 }
 
 /// DWM extended frame bounds (what is actually drawn), falling back to `GetWindowRect`.

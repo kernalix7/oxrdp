@@ -185,6 +185,16 @@ impl crate::serve::WindowSource for WinWindowSource {
                     height: w.height,
                     // TODO(P4): report the window's real per-monitor DPI.
                     dpi: 96,
+                    // Always `false` here: the filter above already dropped minimized windows,
+                    // so no `WindowInfo` with `minimized: true` ever reaches this point. Wired
+                    // through anyway so `sync_windows` computes `flags` from the real field
+                    // rather than a hardcoded constant, and so it takes over correctly if that
+                    // filter is ever relaxed.
+                    minimized: w.minimized,
+                    maximized: w.maximized,
+                    resizable: w.resizable,
+                    has_frame: w.has_frame,
+                    topmost: w.topmost,
                 }
             })
             .collect()
