@@ -15,9 +15,6 @@ oxrdp-channels = { path = "../oxrdp-channels" }
 oxrdp-rail = { path = "../oxrdp-rail" }
 oxrdp-crypto = { path = "../oxrdp-crypto" }
 oxrdp-io = { path = "../oxrdp-io" }
-oxrdp-display = { path = "../oxrdp-display" }
-oxrdp-render = { path = "../oxrdp-render" }
-oxrdp-input = { path = "../oxrdp-input" }
 
 [lints]
 workspace = true

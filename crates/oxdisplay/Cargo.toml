@@ -1,0 +1,20 @@
+[package]
+name = "oxdisplay"
+description = "Linux client display layer: winit native windows plus a softbuffer CPU presenter for oxproto frames."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+
+[dependencies]
+oxclient = { path = "../oxclient" }
+oxproto = { path = "../oxproto" }
+raw-window-handle = "0.6"
+softbuffer = "0.4"
+tokio = { version = "1", features = ["sync"] }
+winit = "0.30"
+x11rb = "0.13"
+
+[lints]
+workspace = true

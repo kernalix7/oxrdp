@@ -46,6 +46,16 @@ pub struct RemoteWindow {
     pub minimized: bool,
     /// Whether the guest reports the window maximized.
     pub maximized: bool,
+    /// Whether the guest window can be resized by the user. A backend uses this to decide
+    /// whether its native window is resizable — without it every window becomes fixed-size or
+    /// every window becomes resizable, and both are wrong for some app.
+    pub resizable: bool,
+    /// Whether the guest window has a system frame. A backend that draws its own decoration
+    /// for a frameless window (a tooltip, a menu) would put a title bar where the app expects
+    /// none.
+    pub has_frame: bool,
+    /// Whether the guest keeps the window above others.
+    pub topmost: bool,
     /// Latest icon, if the agent has sent one.
     pub icon: Option<WindowIcon>,
 }
@@ -65,6 +75,9 @@ impl RemoteWindow {
             owner_id: m.owner_id,
             minimized: m.flags & window_flag::MINIMIZED != 0,
             maximized: m.flags & window_flag::MAXIMIZED != 0,
+            resizable: m.flags & window_flag::RESIZABLE != 0,
+            has_frame: m.flags & window_flag::HAS_FRAME != 0,
+            topmost: m.flags & window_flag::TOPMOST != 0,
             icon: None,
         }
     }
@@ -331,6 +344,35 @@ mod tests {
         );
         assert!(m.is_empty());
         assert!(m.stack().is_empty());
+    }
+
+    #[test]
+    fn window_flags_are_decoded_for_the_backend() {
+        let mut m = WindowModel::new();
+        let mut ev = opened(1, "Tooltip");
+        if let ClientEvent::WindowOpened(ref mut w) = ev {
+            // A frameless, non-resizable, always-on-top window — a tooltip or a menu.
+            w.flags = window_flag::TOPMOST;
+        }
+        m.apply(ev);
+        let w = m.get(1).unwrap();
+        assert!(w.topmost);
+        assert!(
+            !w.resizable,
+            "a backend must not offer to resize a fixed window"
+        );
+        assert!(
+            !w.has_frame,
+            "a backend must not decorate a frameless window"
+        );
+
+        let mut ev = opened(2, "Editor");
+        if let ClientEvent::WindowOpened(ref mut w) = ev {
+            w.flags = window_flag::RESIZABLE | window_flag::HAS_FRAME;
+        }
+        m.apply(ev);
+        let w = m.get(2).unwrap();
+        assert!(w.resizable && w.has_frame && !w.topmost);
     }
 
     #[test]
