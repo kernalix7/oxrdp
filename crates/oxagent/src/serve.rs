@@ -21,9 +21,9 @@ use std::time::{Duration, Instant};
 
 use oxproto::envelope::{channel, Reassembler};
 use oxproto::message::input::key_flag;
-use oxproto::message::window::window_flag;
+use oxproto::message::window::{window_flag, window_show};
 use oxproto::message::{
-    FrameData, Message, WindowClosed, WindowGeometry, WindowOpened, WindowTitle,
+    FrameData, Message, WindowClosed, WindowGeometry, WindowOpened, WindowState, WindowTitle,
 };
 use oxproto::{feature, msg_type};
 use oxtransport::{read_message, write_raw};
@@ -116,10 +116,15 @@ struct WindowStream {
     handle: isize,
     video_channel: u16,
     budget: FrameBudget,
-    /// Last geometry announced, so a move/resize is only sent when it actually changes.
+    /// Last geometry announced, so a move/resize is only sent when it actually changes. Not
+    /// updated while the window is minimized — see `sync_windows`.
     geometry: (i32, i32, u16, u16),
     /// Last title announced.
     title: String,
+    /// Last show state announced (`window_show` value: `NORMAL`/`MINIMIZED`/`MAXIMIZED`).
+    /// Doubles as the reason `pump_frames` stops capturing this window: while it reads
+    /// `MINIMIZED`, `next_frame` is never called for this window's handle at all.
+    show_state: u8,
 }
 
 /// Run one authenticated session to completion.
@@ -337,6 +342,19 @@ fn window_flags(w: &SourceWindow) -> u32 {
     flags
 }
 
+/// A [`SourceWindow`]'s show state as a `window_show` value. `minimized` wins over `maximized`
+/// in the (physically impossible on Win32 — `IsIconic`/`IsZoomed` are mutually exclusive) case
+/// both are somehow set, rather than picking arbitrarily between two contradictory signals.
+fn show_state(w: &SourceWindow) -> u8 {
+    if w.minimized {
+        window_show::MINIMIZED
+    } else if w.maximized {
+        window_show::MAXIMIZED
+    } else {
+        window_show::NORMAL
+    }
+}
+
 /// Diff the platform's window list against what the client has been told.
 async fn sync_windows<W, WR>(
     writer: &mut WR,
@@ -381,6 +399,7 @@ where
                     budget: FrameBudget::new(params.max_frames_in_flight),
                     geometry: (w.x, w.y, w.width, w.height),
                     title: w.title.clone(),
+                    show_state: show_state(w),
                 },
             );
             continue;
@@ -391,23 +410,33 @@ where
         let Some(stream) = streams.get_mut(&tracked.window_id) else {
             continue;
         };
-        let geometry = (w.x, w.y, w.width, w.height);
-        if stream.geometry != geometry {
-            stream.geometry = geometry;
-            // A resize invalidates frames already in flight for the old size.
-            stream.budget.restart();
-            send(
-                writer,
-                &Message::WindowGeometry(WindowGeometry {
-                    window_id: tracked.window_id,
-                    x: w.x,
-                    y: w.y,
-                    width: w.width,
-                    height: w.height,
-                }),
-                channel::WINDOW,
-            )
-            .await?;
+        // Geometry is skipped entirely while minimized: a minimized window's frame bounds are
+        // not real geometry (typically 0×0, sometimes an off-screen icon-sized rect), and
+        // sending that would make the client resize its native window to nothing. `stream.
+        // geometry` is deliberately left untouched too — Windows normally restores a window to
+        // the same position/size it had before minimizing, so on restore this comparison finds
+        // nothing changed and correctly sends no update; if it truly moved while minimized
+        // (rare — some app programmatically repositioned it), the next tick's real comparison
+        // catches that once `w.minimized` goes false again.
+        if !w.minimized {
+            let geometry = (w.x, w.y, w.width, w.height);
+            if stream.geometry != geometry {
+                stream.geometry = geometry;
+                // A resize invalidates frames already in flight for the old size.
+                stream.budget.restart();
+                send(
+                    writer,
+                    &Message::WindowGeometry(WindowGeometry {
+                        window_id: tracked.window_id,
+                        x: w.x,
+                        y: w.y,
+                        width: w.width,
+                        height: w.height,
+                    }),
+                    channel::WINDOW,
+                )
+                .await?;
+            }
         }
         if stream.title != w.title {
             stream.title.clone_from(&w.title);
@@ -416,6 +445,26 @@ where
                 &Message::WindowTitle(WindowTitle {
                     window_id: tracked.window_id,
                     title: w.title.clone(),
+                }),
+                channel::WINDOW,
+            )
+            .await?;
+        }
+        // `flags` is reserved on the wire (`oxproto::message::window::WindowState`) — RESIZABLE/
+        // HAS_FRAME/TOPMOST have no field to carry a post-`WindowOpened` change through, only
+        // the show state does. Those three essentially never change for a live window in
+        // practice (unlike minimize/maximize/restore, which are routine), so that gap is left
+        // unaddressed here rather than inventing meaning for a reserved field — see the P3
+        // report to the team lead.
+        let new_show_state = show_state(w);
+        if stream.show_state != new_show_state {
+            stream.show_state = new_show_state;
+            send(
+                writer,
+                &Message::WindowState(WindowState {
+                    window_id: tracked.window_id,
+                    state: new_show_state,
+                    flags: 0,
                 }),
                 channel::WINDOW,
             )
@@ -458,6 +507,18 @@ where
         let Some(stream) = streams.get_mut(&id) else {
             continue;
         };
+        // A minimized window has nothing worth capturing — its content is not on screen, and
+        // what `Windows.Graphics.Capture` actually hands back for a minimized window (fresh
+        // frames, stale ones, or none at all) is not something this file can determine by
+        // reading the code, so the safest and simplest answer is to never find out: just don't
+        // poll it. `next_frame` is not called at all while `show_state` reads `MINIMIZED`, which
+        // also means `WinWindowSource` never even creates the `WindowCapture` for a window that
+        // starts out minimized, and — since the existing capture is left alone, not torn down,
+        // for one that *becomes* minimized — resumes instantly with no re-creation stutter on
+        // restore.
+        if stream.show_state == window_show::MINIMIZED {
+            continue;
+        }
         // Without acks there is no feedback to pace against, so send every capture and let the
         // transport apply back-pressure.
         if acks_enabled && !stream.budget.has_headroom() {
@@ -592,6 +653,41 @@ mod tests {
                 height: 1,
                 data: vec![0xAB; 16],
             })
+        }
+    }
+
+    /// A single window with real geometry, for the minimize/restore tests below.
+    fn minimizable_window() -> SourceWindow {
+        SourceWindow {
+            handle: 0x2000,
+            pid: 7,
+            app_id: "app.exe".into(),
+            title: "Title".into(),
+            x: 5,
+            y: 5,
+            width: 100,
+            height: 50,
+            dpi: 96,
+            minimized: false,
+            maximized: false,
+            resizable: true,
+            has_frame: true,
+            topmost: false,
+        }
+    }
+
+    /// A `WindowSource` reporting a single window whose fields the test can mutate between
+    /// ticks (minimize, restore, resize, ...) — `FakeSource`'s window list is fixed at
+    /// construction, which cannot express a transition happening mid-session.
+    struct MutableSource(std::sync::Arc<std::sync::Mutex<SourceWindow>>);
+
+    impl WindowSource for MutableSource {
+        fn live_windows(&mut self) -> Vec<SourceWindow> {
+            vec![self.0.lock().unwrap().clone()]
+        }
+
+        fn next_frame(&mut self, _handle: isize) -> Option<SourceFrame> {
+            None
         }
     }
 
@@ -778,6 +874,36 @@ mod tests {
                 | window_flag::MINIMIZED
                 | window_flag::MAXIMIZED,
             "every bit set must survive independently"
+        );
+    }
+
+    #[test]
+    fn show_state_prioritizes_minimized_over_maximized() {
+        use oxproto::message::window::window_show;
+
+        assert_eq!(show_state(&plain_window()), window_show::NORMAL);
+        assert_eq!(
+            show_state(&SourceWindow {
+                minimized: true,
+                ..plain_window()
+            }),
+            window_show::MINIMIZED
+        );
+        assert_eq!(
+            show_state(&SourceWindow {
+                maximized: true,
+                ..plain_window()
+            }),
+            window_show::MAXIMIZED
+        );
+        assert_eq!(
+            show_state(&SourceWindow {
+                minimized: true,
+                maximized: true,
+                ..plain_window()
+            }),
+            window_show::MINIMIZED,
+            "minimized wins in the physically-impossible case both are set"
         );
     }
 
@@ -1318,5 +1444,233 @@ mod tests {
 
         drop(client);
         let _ = agent_task.await;
+    }
+
+    #[tokio::test]
+    async fn minimizing_reports_window_state_not_a_close_and_reopen() {
+        use oxproto::message::window::window_show;
+
+        let state = std::sync::Arc::new(std::sync::Mutex::new(minimizable_window()));
+        let (mut client, agent) = tokio::io::duplex(64 * 1024);
+
+        let agent_task = tokio::spawn({
+            let state = std::sync::Arc::clone(&state);
+            async move {
+                let mut source = MutableSource(state);
+                let mut sink = NoopSink;
+                run_session(
+                    agent,
+                    &mut source,
+                    &mut sink,
+                    SessionParams {
+                        target_fps: 240,
+                        max_frames_in_flight: 2,
+                    },
+                    11,
+                    "secret",
+                )
+                .await
+            }
+        });
+
+        let mut r = Reassembler::new();
+        write_message(&mut client, &hello("secret"), channel::CONTROL)
+            .await
+            .unwrap();
+        let opened = wait_for_window_opened(&mut client, &mut r).await;
+
+        state.lock().unwrap().minimized = true;
+
+        // Before the fix, `live_windows()` dropped a minimized window entirely, so the driver
+        // saw it vanish from the live set and reported `WindowClosed` — then `WindowOpened`
+        // again on restore, losing everything the client was tracking about it. It must instead
+        // stay the *same* window and just change show state.
+        let mut saw_state = None;
+        for _ in 0..32 {
+            match read_message(&mut client, &mut r).await.unwrap().unwrap() {
+                Message::WindowState(s) => {
+                    saw_state = Some(s);
+                    break;
+                }
+                Message::WindowClosed(_) => panic!("minimizing must not close the window"),
+                Message::WindowOpened(_) => panic!("minimizing must not re-open the window"),
+                _ => continue,
+            }
+        }
+        let state_msg = saw_state.expect("a WindowState should have been sent");
+        assert_eq!(state_msg.window_id, opened.window_id);
+        assert_eq!(state_msg.state, window_show::MINIMIZED);
+
+        drop(client);
+        let _ = agent_task.await;
+    }
+
+    #[tokio::test]
+    async fn minimizing_and_restoring_sends_no_degenerate_geometry() {
+        use oxproto::message::window::window_show;
+
+        let state = std::sync::Arc::new(std::sync::Mutex::new(minimizable_window()));
+        let (mut client, agent) = tokio::io::duplex(64 * 1024);
+
+        let agent_task = tokio::spawn({
+            let state = std::sync::Arc::clone(&state);
+            async move {
+                let mut source = MutableSource(state);
+                let mut sink = NoopSink;
+                run_session(
+                    agent,
+                    &mut source,
+                    &mut sink,
+                    SessionParams {
+                        target_fps: 240,
+                        max_frames_in_flight: 2,
+                    },
+                    12,
+                    "secret",
+                )
+                .await
+            }
+        });
+
+        let mut r = Reassembler::new();
+        write_message(&mut client, &hello("secret"), channel::CONTROL)
+            .await
+            .unwrap();
+        let opened = wait_for_window_opened(&mut client, &mut r).await;
+        let (orig_width, orig_height) = (opened.width, opened.height);
+
+        // Minimize: the real platform would now report ~0×0 (`describe_window` allows that
+        // while `IsIconic`); simulated directly here since this test is platform-independent.
+        {
+            let mut w = state.lock().unwrap();
+            w.minimized = true;
+            w.width = 0;
+            w.height = 0;
+        }
+
+        let mut saw_minimized = false;
+        for _ in 0..32 {
+            match read_message(&mut client, &mut r).await.unwrap().unwrap() {
+                Message::WindowState(s) if s.state == window_show::MINIMIZED => {
+                    saw_minimized = true;
+                    break;
+                }
+                Message::WindowGeometry(g) => {
+                    panic!("must never send geometry while minimized, got {g:?}")
+                }
+                _ => continue,
+            }
+        }
+        assert!(saw_minimized, "the minimize transition should be reported");
+
+        // Restore to exactly the original geometry — Windows' normal behavior, and the case
+        // that must produce no `WindowGeometry` at all, since nothing about the real geometry
+        // changed across the round trip.
+        {
+            let mut w = state.lock().unwrap();
+            w.minimized = false;
+            w.width = orig_width;
+            w.height = orig_height;
+        }
+
+        let mut saw_restored = false;
+        for _ in 0..32 {
+            match read_message(&mut client, &mut r).await.unwrap().unwrap() {
+                Message::WindowState(s) if s.state == window_show::NORMAL => {
+                    saw_restored = true;
+                    break;
+                }
+                Message::WindowGeometry(g) => {
+                    panic!("restoring to the same geometry must not re-announce it, got {g:?}")
+                }
+                _ => continue,
+            }
+        }
+        assert!(saw_restored, "the restore transition should be reported");
+
+        drop(client);
+        let _ = agent_task.await;
+    }
+
+    #[tokio::test]
+    async fn frames_are_not_pumped_for_a_minimized_window() {
+        /// Panics if asked for a frame while the shared window state says minimized — proving
+        /// `pump_frames` itself skips a minimized window, rather than this test merely
+        /// happening not to observe a `FrameData` for one.
+        struct PanicsIfPolledWhileMinimized(std::sync::Arc<std::sync::Mutex<SourceWindow>>);
+        impl WindowSource for PanicsIfPolledWhileMinimized {
+            fn live_windows(&mut self) -> Vec<SourceWindow> {
+                vec![self.0.lock().unwrap().clone()]
+            }
+            fn next_frame(&mut self, _handle: isize) -> Option<SourceFrame> {
+                assert!(
+                    !self.0.lock().unwrap().minimized,
+                    "next_frame must never be called for a minimized window"
+                );
+                Some(SourceFrame {
+                    width: 1,
+                    height: 1,
+                    data: vec![0xAB],
+                })
+            }
+        }
+
+        let state = std::sync::Arc::new(std::sync::Mutex::new(minimizable_window()));
+        let (mut client, agent) = tokio::io::duplex(64 * 1024);
+
+        let agent_task = tokio::spawn({
+            let state = std::sync::Arc::clone(&state);
+            async move {
+                let mut source = PanicsIfPolledWhileMinimized(state);
+                let mut sink = NoopSink;
+                run_session(
+                    agent,
+                    &mut source,
+                    &mut sink,
+                    SessionParams {
+                        target_fps: 240,
+                        max_frames_in_flight: 2,
+                    },
+                    13,
+                    "secret",
+                )
+                .await
+            }
+        });
+
+        let mut r = Reassembler::new();
+        write_message(&mut client, &hello("secret"), channel::CONTROL)
+            .await
+            .unwrap();
+        let _ = wait_for_window_opened(&mut client, &mut r).await;
+
+        // Sanity: frames really do flow while not minimized, so the mock proves something.
+        let mut saw_frame = false;
+        for _ in 0..32 {
+            match read_message(&mut client, &mut r).await.unwrap().unwrap() {
+                Message::FrameData(_) => {
+                    saw_frame = true;
+                    break;
+                }
+                _ => continue,
+            }
+        }
+        assert!(saw_frame, "frames should flow for a non-minimized window");
+
+        state.lock().unwrap().minimized = true;
+
+        // Give the driver several ticks (240 fps ⇒ ~4ms each) to act on the new state without
+        // reading anything: once minimized, no further messages are expected at all (geometry
+        // is suppressed and nothing else changes), so waiting on `read_message` here would just
+        // hang. If `pump_frames` called `next_frame` while minimized, the mock would already
+        // have panicked inside the spawned task by the time this returns.
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        drop(client);
+        let result = agent_task.await;
+        assert!(
+            result.is_ok(),
+            "the session task must not have panicked: {result:?}"
+        );
     }
 }

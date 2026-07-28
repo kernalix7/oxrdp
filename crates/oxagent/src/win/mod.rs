@@ -170,8 +170,15 @@ impl crate::serve::WindowSource for WinWindowSource {
         self.captures.retain(|handle, _| alive.contains(handle));
 
         live.into_iter()
-            // A minimized window has no meaningful geometry and nothing to capture.
-            .filter(|w| !w.minimized)
+            // Minimized windows are *not* filtered out here. They used to be, on the theory
+            // that a minimized window "has nothing to capture" — but `live_windows()` is also
+            // what the registry diffs to decide a window closed (`WindowRegistry::retain_live`
+            // in `crate::serve`), so dropping a minimized window from this list made the driver
+            // report it as closed, and then re-open it as a brand-new window on restore, losing
+            // its position, size, stacking and identity from the client's point of view. The
+            // window stays tracked and reported; `crate::serve::pump_frames` is what actually
+            // stops capturing it while minimized, based on the `MINIMIZED` show state carried
+            // in `WindowOpened`/`WindowState`, not by making it disappear here.
             .map(|w| {
                 let identity = appid::identify(HWND(w.hwnd as *mut core::ffi::c_void));
                 crate::serve::SourceWindow {
@@ -185,11 +192,6 @@ impl crate::serve::WindowSource for WinWindowSource {
                     height: w.height,
                     // TODO(P4): report the window's real per-monitor DPI.
                     dpi: 96,
-                    // Always `false` here: the filter above already dropped minimized windows,
-                    // so no `WindowInfo` with `minimized: true` ever reaches this point. Wired
-                    // through anyway so `sync_windows` computes `flags` from the real field
-                    // rather than a hardcoded constant, and so it takes over correctly if that
-                    // filter is ever relaxed.
                     minimized: w.minimized,
                     maximized: w.maximized,
                     resizable: w.resizable,
