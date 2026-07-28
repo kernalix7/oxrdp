@@ -717,6 +717,35 @@ impl ClientClock {
     }
 }
 
+/// Render a `WindowOpened.flags` bitmask as the set of named flags it carries.
+///
+/// Unknown bits are reported as a residual hex value rather than dropped, so a client built
+/// against an older protocol revision does not silently hide what a newer agent is saying.
+fn describe_window_flags(flags: u32) -> String {
+    use oxproto::message::window::window_flag;
+    const NAMED: [(u32, &str); 5] = [
+        (window_flag::RESIZABLE, "resizable"),
+        (window_flag::HAS_FRAME, "has_frame"),
+        (window_flag::TOPMOST, "topmost"),
+        (window_flag::MINIMIZED, "minimized"),
+        (window_flag::MAXIMIZED, "maximized"),
+    ];
+    let mut parts: Vec<String> = NAMED
+        .iter()
+        .filter(|(bit, _)| flags & bit != 0)
+        .map(|(_, name)| (*name).to_string())
+        .collect();
+    let residual = flags & !NAMED.iter().fold(0, |acc, (bit, _)| acc | bit);
+    if residual != 0 {
+        parts.push(format!("unknown:{residual:#x}"));
+    }
+    if parts.is_empty() {
+        "none".to_string()
+    } else {
+        parts.join(",")
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -828,34 +857,5 @@ mod tests {
         ]))
         .expect_err("a host:port without ':' must be rejected");
         assert!(err.contains(':'));
-    }
-}
-
-/// Render a `WindowOpened.flags` bitmask as the set of named flags it carries.
-///
-/// Unknown bits are reported as a residual hex value rather than dropped, so a client built
-/// against an older protocol revision does not silently hide what a newer agent is saying.
-fn describe_window_flags(flags: u32) -> String {
-    use oxproto::message::window::window_flag;
-    const NAMED: [(u32, &str); 5] = [
-        (window_flag::RESIZABLE, "resizable"),
-        (window_flag::HAS_FRAME, "has_frame"),
-        (window_flag::TOPMOST, "topmost"),
-        (window_flag::MINIMIZED, "minimized"),
-        (window_flag::MAXIMIZED, "maximized"),
-    ];
-    let mut parts: Vec<String> = NAMED
-        .iter()
-        .filter(|(bit, _)| flags & bit != 0)
-        .map(|(_, name)| (*name).to_string())
-        .collect();
-    let residual = flags & !NAMED.iter().fold(0, |acc, (bit, _)| acc | bit);
-    if residual != 0 {
-        parts.push(format!("unknown:{residual:#x}"));
-    }
-    if parts.is_empty() {
-        "none".to_string()
-    } else {
-        parts.join(",")
     }
 }
