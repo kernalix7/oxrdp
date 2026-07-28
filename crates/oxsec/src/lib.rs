@@ -77,6 +77,7 @@ impl AgentIdentity {
                     .map_err(SecError::Io)?;
                 fs::write(key_path, pem_block("PRIVATE KEY", &identity.key_der)?)
                     .map_err(SecError::Io)?;
+                restrict_key_permissions(key_path)?;
                 Ok(identity)
             }
             _ => Err(SecError::IncompleteIdentityFiles),
@@ -127,13 +128,23 @@ pub fn client_config_pinned(spki_pin_hex: &str) -> Result<Arc<rustls::ClientConf
 /// Constant-time comparison of an authentication token, for the agent's handshake.
 /// Returns true only on an exact match. Must not short-circuit on the first differing byte
 /// and must not leak the expected length through timing in a way that reveals the secret.
+///
+/// The byte loop below runs for `expected.len()` iterations — the server's own fixed,
+/// attacker-independent value — never `presented.len()`. `presented` is whatever an
+/// unauthenticated peer chose to send, and looping on its length would make this function's
+/// cost a function of that choice: every `Option::get` bounds check inside the loop is a
+/// branch on "is this index still within the secret," so driving the loop by the attacker's
+/// own input lets them vary how many of those branches land in-bounds versus out simply by
+/// varying how much they send, which is exactly the kind of length-correlated timing this
+/// function's contract forbids. Bounding the loop by `expected.len()` instead makes every call
+/// take the same number of iterations regardless of what the peer sends.
 pub fn verify_token(expected: &str, presented: &str) -> bool {
     let expected = expected.as_bytes();
     let presented = presented.as_bytes();
     let mut diff = expected.len() ^ presented.len();
 
-    for (index, presented_byte) in presented.iter().copied().enumerate() {
-        let expected_byte = expected.get(index).copied().unwrap_or(0);
+    for (index, expected_byte) in expected.iter().copied().enumerate() {
+        let presented_byte = presented.get(index).copied().unwrap_or(0);
         diff |= usize::from(expected_byte ^ presented_byte);
     }
 
@@ -320,6 +331,30 @@ fn ct_eq(left: &[u8; 32], right: &[u8; 32]) -> bool {
     diff == 0
 }
 
+/// Restrict a freshly written private key file to the owner only, where the platform lets us
+/// do that without `unsafe`.
+///
+/// `fs::write` creates a new file with whatever the umask (POSIX) or inherited ACL (Windows)
+/// leaves it at — on a POSIX system that is commonly world-readable (mode 0644 under a typical
+/// umask). A private key any other local account can read defeats the whole pinning model in
+/// `client_config_pinned`/`PinnedServerVerifier`: whoever can read it can present the exact
+/// certificate a client already trusts and finish the TLS handshake as this agent, no network
+/// position beyond reaching the client needed. There is no safe way to tighten a Windows ACL
+/// without unsafe FFI, and this crate is `#![forbid(unsafe_code)]`; on Windows the file keeps
+/// its parent directory's inherited ACL, which is a gap a deployment must close itself (e.g. by
+/// placing the key under a directory only the agent's own account can read).
+#[cfg(unix)]
+fn restrict_key_permissions(path: &Path) -> Result<(), SecError> {
+    use std::os::unix::fs::PermissionsExt;
+    fs::set_permissions(path, fs::Permissions::from_mode(0o600)).map_err(SecError::Io)
+}
+
+/// No-op placeholder documenting the gap — see the `#[cfg(unix)]` version's doc comment.
+#[cfg(not(unix))]
+fn restrict_key_permissions(_path: &Path) -> Result<(), SecError> {
+    Ok(())
+}
+
 fn pem_block(label: &str, der: &[u8]) -> Result<String, SecError> {
     const TABLE: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
 
@@ -382,6 +417,29 @@ mod tests {
         );
     }
 
+    /// A freshly generated private key must not be readable by anyone but the owner. `fs::write`
+    /// alone leaves it at the umask's default (commonly 0644, world-readable), which would let
+    /// any other local account read it and impersonate this agent to a client that already
+    /// trusts its pin — see `restrict_key_permissions`'s doc comment.
+    #[cfg(unix)]
+    #[test]
+    fn generated_key_file_is_not_group_or_world_readable() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let cert_path = dir.path().join("agent-cert.pem");
+        let key_path = dir.path().join("agent-key.pem");
+        AgentIdentity::load_or_generate(&cert_path, &key_path, "guest").expect("generated");
+
+        let mode = fs::metadata(&key_path).expect("key metadata").permissions().mode();
+        assert_eq!(
+            mode & 0o777,
+            0o600,
+            "key file mode was {:o}, expected 0600 (owner read/write only)",
+            mode & 0o777
+        );
+    }
+
     #[test]
     fn load_or_generate_persists_identity() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -434,6 +492,26 @@ mod tests {
         assert!(!verify_token("s3cret", "wrong"));
         assert!(!verify_token("s3cret", "s3c"));
         assert!(!verify_token("s3cret", ""));
+    }
+
+    /// The comparison loop is bounded by `expected.len()`, not `presented.len()` (see the
+    /// function's doc comment). These cover both directions of length mismatch explicitly,
+    /// since that is exactly the boundary the loop direction changed.
+    #[test]
+    fn verify_token_rejects_regardless_of_which_side_is_longer() {
+        // `presented` longer than `expected`, sharing `expected` as an exact prefix — the old
+        // presented-driven loop would have walked past `expected`'s end reading zeros; the
+        // fixed, expected-driven loop never looks past `expected.len()` at all. Either way the
+        // length check must still catch it.
+        assert!(!verify_token("s3cret", "s3cretXX"));
+        // `presented` shorter than `expected`, an exact prefix of it.
+        assert!(!verify_token("s3cretXX", "s3cret"));
+        // Same length, differ only in the last byte — must not match on a partial prefix.
+        assert!(!verify_token("s3cret", "s3creX"));
+        // Both empty is a degenerate exact match.
+        assert!(verify_token("", ""));
+        assert!(!verify_token("", "x"));
+        assert!(!verify_token("x", ""));
     }
 
     #[test]

@@ -76,7 +76,12 @@ pub trait Presenter {
     /// Native surface size changed.
     fn resize(&mut self, id: u32, width: u32, height: u32) -> Result<(), PresentError>;
 
-    /// Decode and present one frame.
+    /// Present one frame.
+    ///
+    /// Frames arrive already decoded: `oxclient::decode` turns whatever codec was negotiated
+    /// into `RAW_BGRA` before the frame crosses to this thread, which is what keeps this layer
+    /// codec-agnostic and keeps [`CpuPresenter`] a `memcpy`. A frame in any other codec is a bug
+    /// upstream, not something to decode here.
     fn present(&mut self, id: u32, frame: &FrameData) -> Result<PresentTimes, PresentError>;
 
     /// Re-present the most recent frame for expose/redraw.

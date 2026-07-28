@@ -7,9 +7,17 @@ license.workspace = true
 authors.workspace = true
 repository.workspace = true
 
+[features]
+default = ["h264"]
+# Software H.264 decode via Cisco's openh264. On by default; turning it off drops the
+# dependency (and its vendored C) and makes the client advertise `RAW_BGRA` only, so the
+# validated bring-up path survives on a machine where the codec will not build.
+h264 = ["dep:openh264"]
+
 [dependencies]
 tokio = { version = "1", features = ["io-util", "net", "rt-multi-thread", "macros"] }
 tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12", "logging"] }
+openh264 = { version = "0.9", optional = true }
 oxdisplay = { path = "../oxdisplay" }
 oxproto = { path = "../oxproto" }
 oxtransport = { path = "../oxtransport" }
