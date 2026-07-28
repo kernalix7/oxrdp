@@ -431,7 +431,10 @@ mod tests {
         let key_path = dir.path().join("agent-key.pem");
         AgentIdentity::load_or_generate(&cert_path, &key_path, "guest").expect("generated");
 
-        let mode = fs::metadata(&key_path).expect("key metadata").permissions().mode();
+        let mode = fs::metadata(&key_path)
+            .expect("key metadata")
+            .permissions()
+            .mode();
         assert_eq!(
             mode & 0o777,
             0o600,
