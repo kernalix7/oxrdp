@@ -26,7 +26,7 @@ use oxproto::message::{
     Close, Error as ProtoError, FrameData, Message, WindowClosed, WindowGeometry, WindowOpened,
     WindowState, WindowTitle,
 };
-use oxproto::{error_code, feature, msg_type};
+use oxproto::{close_reason, error_code, feature, msg_type};
 use oxtransport::{read_message, write_message, write_raw};
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
 use tokio::sync::{mpsc, Semaphore};
@@ -176,9 +176,13 @@ where
         .await
         {
             Ok(result) => result?,
-            // The peer is simply dropped, nothing is written back: a peer that has not sent a
-            // complete `ClientHello` in the whole pre-auth window is exactly the kind of peer
-            // this deadline exists to stop spending time on, and a reply is more time spent.
+            // The peer is simply dropped, nothing is written back — deliberately, not because
+            // `close_reason::IDLE_TIMEOUT` doesn't fit (it does, precisely). A well-behaved
+            // client that stalled would appreciate knowing why; a peer holding the connection
+            // open on purpose (a TCP zero-window stall is the textbook version) could just as
+            // easily make the write itself hang, which would spend more of exactly the time
+            // this deadline exists to stop spending. `write_message` here has no timeout of its
+            // own to bound that risk, so silence is the safer default until one is added.
             Err(_elapsed) => return Err(HandshakeError::Timeout),
         }
     };
@@ -201,11 +205,13 @@ where
             channel::CONTROL,
         )
         .await;
-        // OXPROTO.md §15: reason 3 is "error" — the same reason every other post-`Error`
-        // `Close` in this crate uses (see `crate::handshake::reject`).
+        // The same reason every other post-`Error` `Close` in this crate uses (see
+        // `crate::handshake::reject`).
         let _ = write_message(
             &mut writer,
-            &Message::Close(Close { reason: 3 }),
+            &Message::Close(Close {
+                reason: close_reason::ERROR,
+            }),
             channel::CONTROL,
         )
         .await;

@@ -12,7 +12,7 @@ use std::io;
 
 use oxproto::envelope::{channel, Reassembler};
 use oxproto::message::{Close, DisplayLayout, Error as ProtoError, Message, ServerHello};
-use oxproto::{codec, error_code, feature, MIN_SUPPORTED_VERSION, PROTOCOL_VERSION};
+use oxproto::{close_reason, codec, error_code, feature, MIN_SUPPORTED_VERSION, PROTOCOL_VERSION};
 use oxtransport::{read_message, write_message};
 use tokio::io::{AsyncRead, AsyncWrite};
 
@@ -47,7 +47,8 @@ pub enum HandshakeError {
     },
     /// TLS accept and the `ClientHello` read, together, did not complete within the
     /// pre-authentication deadline (`crate::serve::run_session`'s DoS hardening). Nothing is
-    /// sent to the peer before this is returned — see the call site for why not.
+    /// sent to the peer before this is returned, even though `close_reason::IDLE_TIMEOUT`
+    /// exists and would fit — see the call site for why silence is still the safer default.
     Timeout,
     /// The peer authenticated successfully, but a session was already active; `Error` + `Close`
     /// were already sent before this was returned.
@@ -194,7 +195,9 @@ where
     .await;
     let _ = write_message(
         stream,
-        &Message::Close(Close { reason: 3 }),
+        &Message::Close(Close {
+            reason: close_reason::ERROR,
+        }),
         channel::CONTROL,
     )
     .await;
