@@ -166,7 +166,9 @@ pub enum DisplayEvent {
         /// Window id.
         window_id: u32,
     },
-    /// Local window size changed.
+    /// Local window size changed — because the user resized it, or because the window manager
+    /// sized it while placing it. This layer cannot tell those apart and does not try; the
+    /// session layer decides what is worth telling the guest (see `oxclient::geometry`).
     ResizeRequested {
         /// Window id.
         window_id: u32,
@@ -175,7 +177,12 @@ pub enum DisplayEvent {
         /// New height.
         height: u16,
     },
-    /// Local X11 window position changed.
+    /// Local X11 window position changed, in **host screen** coordinates. Never emitted on
+    /// Wayland, per `docs/design/client-display.md` §4 rule 3.
+    ///
+    /// These coordinates are meaningless on the guest — a host multi-monitor desktop reaches
+    /// positions no guest desktop has room for — so they must be translated, not forwarded.
+    /// Like [`Self::ResizeRequested`], this reports the window manager as readily as the user.
     MoveRequested {
         /// Window id.
         window_id: u32,

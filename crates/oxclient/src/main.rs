@@ -13,6 +13,7 @@ use std::process::ExitCode;
 use std::time::Instant;
 
 use oxclient::decode::{self, WindowDecoders};
+use oxclient::geometry::GeometrySync;
 use oxclient::session::{ClientSession, SessionConfig};
 use oxclient::{ClientEvent, ModelChange, RemoteWindow, WindowModel};
 use oxdisplay::{CommandSender, CpuPresenter, DisplayCommand, DisplayEvent, WindowSpec};
@@ -21,7 +22,8 @@ use oxproto::message::{
     Close, DisplayLayout, Error as ProtoError, FrameAck, FrameData, KeyEvent, ModifierSync, Output,
     PointerEvent, TextInput, WindowControl,
 };
-use oxproto::{error_code, feature, Message};
+use oxproto::{close_reason, error_code, feature, Message};
+use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::TcpStream;
 use tokio::sync::{mpsc, oneshot};
 use tokio_rustls::client::TlsStream;
@@ -163,8 +165,11 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                 message: message.clone(),
             }))
             .await?;
-        // OXPROTO.md §15: reason 3 is "error".
-        session.send(&Message::Close(Close { reason: 3 })).await?;
+        session
+            .send(&Message::Close(Close {
+                reason: close_reason::ERROR,
+            }))
+            .await?;
         return Err(Box::new(io::Error::new(
             io::ErrorKind::InvalidData,
             message,
@@ -226,8 +231,8 @@ async fn connect_session(
     Ok(ClientSession::connect(tls_stream, &config).await?)
 }
 
-async fn run_headless(
-    session: &mut ClientSession<TlsStream<TcpStream>>,
+async fn run_headless<S: AsyncRead + AsyncWrite + Unpin>(
+    session: &mut ClientSession<S>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     // Per-window frame counters, so the rate-limit below is per window rather than global.
     let mut frame_counts: HashMap<u32, u64> = HashMap::new();
@@ -289,13 +294,14 @@ async fn run_windowed(
     }
 }
 
-async fn run_session_task(
-    mut session: ClientSession<TlsStream<TcpStream>>,
+async fn run_session_task<S: AsyncRead + AsyncWrite + Unpin>(
+    mut session: ClientSession<S>,
     commands: CommandSender,
     mut display_events: mpsc::UnboundedReceiver<DisplayEvent>,
 ) -> io::Result<()> {
     let mut model = WindowModel::new();
     let mut decoders = WindowDecoders::new();
+    let mut geometry = GeometrySync::new();
     let clock = ClientClock::new();
 
     loop {
@@ -314,8 +320,38 @@ async fn run_session_task(
                 };
                 let closed = matches!(event, ClientEvent::Closed(_));
                 for change in model.apply(event) {
-                    if let ModelChange::Destroyed(window_id) = change {
-                        decoders.forget(window_id);
+                    // Every geometry change the client is about to cause itself — creating a
+                    // native window, or applying the guest's own move — is recorded before the
+                    // display layer acts on it, so the window manager events it provokes are
+                    // recognised as echoes rather than as the user acting.
+                    match &change {
+                        ModelChange::Created(id) => {
+                            if let Some(window) = model.get(*id) {
+                                geometry.created(
+                                    Instant::now(),
+                                    *id,
+                                    window.x,
+                                    window.y,
+                                    (window.width, window.height),
+                                );
+                            }
+                        }
+                        ModelChange::Moved(id) => {
+                            if let Some(window) = model.get(*id) {
+                                geometry.guest_moved(
+                                    Instant::now(),
+                                    *id,
+                                    window.x,
+                                    window.y,
+                                    (window.width, window.height),
+                                );
+                            }
+                        }
+                        ModelChange::Destroyed(id) => {
+                            decoders.forget(*id);
+                            geometry.forget(*id);
+                        }
+                        _ => {}
                     }
                     let command = match change {
                         // Decode happens here rather than in the display layer so that what
@@ -364,7 +400,9 @@ async fn run_session_task(
                 let Some(event) = event else {
                     return Ok(());
                 };
-                if let Err(error) = handle_display_event(&mut session, &clock, event).await {
+                if let Err(error) =
+                    handle_display_event(&mut session, &clock, &model, &mut geometry, event).await
+                {
                     let _ = commands.send(DisplayCommand::Shutdown);
                     return Err(error);
                 }
@@ -429,9 +467,11 @@ fn window_spec(window: &RemoteWindow) -> WindowSpec {
     }
 }
 
-async fn handle_display_event(
-    session: &mut ClientSession<TlsStream<TcpStream>>,
+async fn handle_display_event<S: AsyncRead + AsyncWrite + Unpin>(
+    session: &mut ClientSession<S>,
     clock: &ClientClock,
+    model: &WindowModel,
+    geometry: &mut GeometrySync,
     event: DisplayEvent,
 ) -> io::Result<()> {
     match event {
@@ -521,40 +561,50 @@ async fn handle_display_event(
             .await?;
         }
         DisplayEvent::CloseRequested { .. } => {}
+        // The display layer reports what the host window manager did, which is not the same
+        // thing as what the user asked for: a WM places and sizes every window the moment it is
+        // created. `GeometrySync` is what tells the two apart, and what turns a host-screen
+        // position into one that means something on the guest.
         DisplayEvent::ResizeRequested {
             window_id,
             width,
             height,
         } if session.has_feature(feature::WINDOW_CONTROL) => {
-            send_window_control(
-                session,
-                WindowControl {
-                    window_id,
-                    action: window_action::RESIZE,
-                    x: 0,
-                    y: 0,
-                    width,
-                    height,
-                },
-            )
-            .await?;
+            if let Some((width, height)) =
+                geometry.resized(Instant::now(), model, window_id, width, height)
+            {
+                send_window_control(
+                    session,
+                    WindowControl {
+                        window_id,
+                        action: window_action::RESIZE,
+                        x: 0,
+                        y: 0,
+                        width,
+                        height,
+                    },
+                )
+                .await?;
+            }
         }
         DisplayEvent::ResizeRequested { .. } => {}
         DisplayEvent::MoveRequested { window_id, x, y }
             if session.has_feature(feature::WINDOW_CONTROL) =>
         {
-            send_window_control(
-                session,
-                WindowControl {
-                    window_id,
-                    action: window_action::MOVE,
-                    x,
-                    y,
-                    width: 0,
-                    height: 0,
-                },
-            )
-            .await?;
+            if let Some((x, y)) = geometry.moved(Instant::now(), window_id, x, y) {
+                send_window_control(
+                    session,
+                    WindowControl {
+                        window_id,
+                        action: window_action::MOVE,
+                        x,
+                        y,
+                        width: 0,
+                        height: 0,
+                    },
+                )
+                .await?;
+            }
         }
         DisplayEvent::MoveRequested { .. } => {}
         DisplayEvent::Minimized {
@@ -594,15 +644,15 @@ async fn handle_display_event(
     Ok(())
 }
 
-async fn send_window_control(
-    session: &mut ClientSession<TlsStream<TcpStream>>,
+async fn send_window_control<S: AsyncRead + AsyncWrite + Unpin>(
+    session: &mut ClientSession<S>,
     control: WindowControl,
 ) -> io::Result<()> {
     session.send(&Message::WindowControl(control)).await
 }
 
-async fn send_frame_ack(
-    session: &mut ClientSession<TlsStream<TcpStream>>,
+async fn send_frame_ack<S: AsyncRead + AsyncWrite + Unpin>(
+    session: &mut ClientSession<S>,
     window_id: u32,
     frame_id: u64,
     decoded_us: u64,
@@ -748,10 +798,274 @@ fn describe_window_flags(flags: u32) -> String {
 
 #[cfg(test)]
 mod tests {
+    use std::time::Duration;
+
+    use oxclient::geometry::SETTLE;
+    use oxproto::envelope::{channel, Reassembler};
+    use oxproto::message::window::window_flag;
+    use oxproto::message::{ServerHello, WindowOpened};
+    use oxtransport::{read_message, write_message};
+    use tokio::io::DuplexStream;
+
     use super::*;
 
     fn args(values: &[&str]) -> Vec<String> {
         values.iter().map(|s| s.to_string()).collect()
+    }
+
+    fn test_config() -> SessionConfig {
+        SessionConfig {
+            auth_token: "token".into(),
+            client_name: "test".into(),
+            codecs: decode::preferred_codecs(),
+            display: DisplayLayout {
+                outputs: vec![Output {
+                    id: 0,
+                    x: 0,
+                    y: 0,
+                    width: 1920,
+                    height: 1080,
+                    scale_num: 1,
+                    scale_den: 1,
+                    refresh_mhz: 60_000,
+                }],
+            },
+        }
+    }
+
+    /// A live session against an in-memory peer, with `WINDOW_CONTROL` negotiated.
+    ///
+    /// The returned stream is the agent's end: whatever the client sends can be read from it,
+    /// which is the only way to assert on what the guest would actually be told to do.
+    async fn connected_session() -> (ClientSession<DuplexStream>, DuplexStream, Reassembler) {
+        let (client_io, mut server_io) = tokio::io::duplex(64 * 1024);
+        let server = tokio::spawn(async move {
+            let mut reassembler = Reassembler::new();
+            let hello = read_message(&mut server_io, &mut reassembler)
+                .await
+                .expect("the client's hello arrives")
+                .expect("and decodes");
+            assert!(matches!(hello, Message::ClientHello(_)));
+            write_message(
+                &mut server_io,
+                &Message::ServerHello(ServerHello {
+                    version: 1,
+                    features: feature::WINDOW_CONTROL,
+                    session_id: 1,
+                    codec: oxproto::codec::RAW_BGRA,
+                }),
+                channel::CONTROL,
+            )
+            .await
+            .expect("the hello is written");
+            (server_io, reassembler)
+        });
+
+        let session = ClientSession::connect(client_io, &test_config())
+            .await
+            .expect("the handshake completes");
+        let (server_io, reassembler) = server.await.expect("the peer task finishes");
+        assert!(session.has_feature(feature::WINDOW_CONTROL));
+        (session, server_io, reassembler)
+    }
+
+    fn model_with(
+        window_id: u32,
+        x: i32,
+        y: i32,
+        width: u16,
+        height: u16,
+        flags: u32,
+    ) -> WindowModel {
+        let mut model = WindowModel::new();
+        model.apply(ClientEvent::WindowOpened(WindowOpened {
+            window_id,
+            video_channel: channel::VIDEO_BASE,
+            pid: 1,
+            app_id: "app.exe".into(),
+            title: "app".into(),
+            x,
+            y,
+            width,
+            height,
+            dpi: 96,
+            flags,
+            owner_id: 0,
+        }));
+        model
+    }
+
+    /// A tracker for a window the host WM has already placed at `placed`, long enough ago that
+    /// the settling window has closed by the time the code under test reads the clock.
+    fn settled_geometry(
+        window_id: u32,
+        guest: (i32, i32),
+        size: (u16, u16),
+        placed: (i32, i32),
+    ) -> GeometrySync {
+        let past = Instant::now() - SETTLE - Duration::from_secs(1);
+        let mut geometry = GeometrySync::new();
+        geometry.created(past, window_id, guest.0, guest.1, size);
+        assert_eq!(geometry.moved(past, window_id, placed.0, placed.1), None);
+        geometry
+    }
+
+    /// Asks the client to close a window, which always produces a message.
+    ///
+    /// Used as a sentinel: if the next thing the agent reads is this close, nothing the test
+    /// fed in beforehand was sent.
+    async fn send_sentinel(
+        session: &mut ClientSession<DuplexStream>,
+        clock: &ClientClock,
+        model: &WindowModel,
+        geometry: &mut GeometrySync,
+        window_id: u32,
+    ) {
+        handle_display_event(
+            session,
+            clock,
+            model,
+            geometry,
+            DisplayEvent::CloseRequested { window_id },
+        )
+        .await
+        .expect("the sentinel is sent");
+    }
+
+    async fn next_control(
+        server_io: &mut DuplexStream,
+        reassembler: &mut Reassembler,
+    ) -> WindowControl {
+        match read_message(server_io, reassembler)
+            .await
+            .expect("a message arrives")
+            .expect("and decodes")
+        {
+            Message::WindowControl(control) => control,
+            other => panic!("expected WindowControl, got {:#04x}", other.msg_type()),
+        }
+    }
+
+    /// Connecting must not rearrange the guest. This is the regression: the host window manager
+    /// places and sizes every native window as it is created, and forwarding those events moved
+    /// four guest windows off a 1280x800 desktop and shrank one to 1x52.
+    #[tokio::test]
+    async fn a_freshly_created_window_sends_no_geometry_to_the_agent() {
+        let (mut session, mut server_io, mut reassembler) = connected_session().await;
+        let clock = ClientClock::new();
+        let model = model_with(1, 100, 200, 800, 600, window_flag::RESIZABLE);
+        let mut geometry = GeometrySync::new();
+        geometry.created(Instant::now(), 1, 100, 200, (800, 600));
+
+        // Exactly what the host WM did in the failure, replayed.
+        for event in [
+            DisplayEvent::MoveRequested {
+                window_id: 1,
+                x: 3257,
+                y: 2262,
+            },
+            DisplayEvent::ResizeRequested {
+                window_id: 1,
+                width: 122,
+                height: 47,
+            },
+        ] {
+            handle_display_event(&mut session, &clock, &model, &mut geometry, event)
+                .await
+                .expect("the event is handled");
+        }
+
+        send_sentinel(&mut session, &clock, &model, &mut geometry, 1).await;
+        assert_eq!(
+            next_control(&mut server_io, &mut reassembler).await.action,
+            window_action::CLOSE,
+            "the WM's placement must not have reached the agent"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_non_resizable_window_never_sends_a_resize() {
+        let (mut session, mut server_io, mut reassembler) = connected_session().await;
+        let clock = ClientClock::new();
+        // charmap: a fixed-size dialog, which the failure shrank to 1x52.
+        let model = model_with(1, 100, 200, 322, 197, window_flag::HAS_FRAME);
+        let mut geometry = settled_geometry(1, (100, 200), (322, 197), (259, 2262));
+
+        handle_display_event(
+            &mut session,
+            &clock,
+            &model,
+            &mut geometry,
+            DisplayEvent::ResizeRequested {
+                window_id: 1,
+                width: 1,
+                height: 52,
+            },
+        )
+        .await
+        .expect("the event is handled");
+
+        send_sentinel(&mut session, &clock, &model, &mut geometry, 1).await;
+        assert_eq!(
+            next_control(&mut server_io, &mut reassembler).await.action,
+            window_action::CLOSE,
+            "a fixed-size window must never be asked to resize"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_user_drag_sends_a_guest_space_move() {
+        let (mut session, mut server_io, mut reassembler) = connected_session().await;
+        let clock = ClientClock::new();
+        let model = model_with(1, 100, 200, 800, 600, window_flag::RESIZABLE);
+        // The window sits at guest (100,200) but at host (3257,2262) on a multi-monitor desktop.
+        let mut geometry = settled_geometry(1, (100, 200), (800, 600), (3257, 2262));
+
+        handle_display_event(
+            &mut session,
+            &clock,
+            &model,
+            &mut geometry,
+            DisplayEvent::MoveRequested {
+                window_id: 1,
+                x: 3297,
+                y: 2247,
+            },
+        )
+        .await
+        .expect("the event is handled");
+
+        let control = next_control(&mut server_io, &mut reassembler).await;
+        assert_eq!(control.action, window_action::MOVE);
+        // The guest is told about the displacement applied to its own position, never about a
+        // host screen coordinate it has no room for.
+        assert_eq!((control.x, control.y), (140, 185));
+    }
+
+    #[tokio::test]
+    async fn a_user_resize_of_a_resizable_window_reaches_the_agent() {
+        let (mut session, mut server_io, mut reassembler) = connected_session().await;
+        let clock = ClientClock::new();
+        let model = model_with(1, 100, 200, 800, 600, window_flag::RESIZABLE);
+        let mut geometry = settled_geometry(1, (100, 200), (800, 600), (100, 200));
+
+        handle_display_event(
+            &mut session,
+            &clock,
+            &model,
+            &mut geometry,
+            DisplayEvent::ResizeRequested {
+                window_id: 1,
+                width: 1024,
+                height: 768,
+            },
+        )
+        .await
+        .expect("the event is handled");
+
+        let control = next_control(&mut server_io, &mut reassembler).await;
+        assert_eq!(control.action, window_action::RESIZE);
+        assert_eq!((control.width, control.height), (1024, 768));
     }
 
     #[test]

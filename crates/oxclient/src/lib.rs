@@ -8,9 +8,11 @@
 #![forbid(unsafe_code)]
 
 pub mod decode;
+pub mod geometry;
 pub mod model;
 pub mod session;
 
 pub use decode::{DecodeError, Decoder, WindowDecoders};
+pub use geometry::GeometrySync;
 pub use model::{ModelChange, RemoteWindow, WindowModel};
 pub use session::{ClientEvent, ClientSession, SessionConfig};
