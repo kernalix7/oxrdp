@@ -7,4 +7,4 @@
 
 pub mod stream;
 
-pub use stream::{read_message, read_reassembled, write_message, write_raw};
+pub use stream::{read_message, read_reassembled, write_message, write_raw, ChunkReader};

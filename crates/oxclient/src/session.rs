@@ -8,8 +8,8 @@ use std::io;
 use oxproto::envelope::{channel, Reassembler};
 use oxproto::message::{ClientHello, DisplayLayout, Message, Ping, Pong};
 use oxproto::{error_code, feature, MIN_SUPPORTED_VERSION, PROTOCOL_VERSION};
-use oxtransport::{read_message, write_message};
-use tokio::io::{AsyncRead, AsyncWrite};
+use oxtransport::{read_message, write_message, ChunkReader};
+use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
 
 /// What the display/render layer reacts to.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -60,6 +60,16 @@ pub struct SessionConfig {
 pub struct ClientSession<S> {
     stream: S,
     reassembler: Reassembler,
+    /// Read progress, kept here rather than in the read future so that cancelling
+    /// [`ClientSession::next_event`] does not lose a partially-read chunk.
+    chunks: ChunkReader,
+    /// Bytes encoded but not yet handed to the stream, and how many of them have gone out.
+    ///
+    /// Every write goes through this buffer for two reasons. It makes writing resumable, for the
+    /// same reason reads are; and it keeps writes ordered, so a pong that was interrupted
+    /// half-written can never end up with another message spliced into the middle of it.
+    pending_out: Vec<u8>,
+    pending_written: usize,
     /// Protocol version both peers agreed on.
     pub version: u16,
     /// Features both peers advertised.
@@ -92,6 +102,9 @@ impl<S: AsyncRead + AsyncWrite + Unpin> ClientSession<S> {
                     return Ok(Self {
                         stream,
                         reassembler,
+                        chunks: ChunkReader::new(),
+                        pending_out: Vec::new(),
+                        pending_written: 0,
                         version: sh.version,
                         features: sh.features & feature::SUPPORTED,
                         codec: sh.codec,
@@ -130,14 +143,37 @@ impl<S: AsyncRead + AsyncWrite + Unpin> ClientSession<S> {
     /// Read the next event, answering protocol housekeeping (ping/pong) transparently.
     ///
     /// Returns `Ok(None)` when the peer closes the connection.
+    ///
+    /// # Cancellation
+    ///
+    /// Cancel-safe: all read and write progress is held in `self`, so dropping this future
+    /// part-way through a chunk loses nothing and the next call resumes where it stopped. This
+    /// is what makes it usable as a `tokio::select!` branch — the windowed client selects
+    /// between this and the display's input events. An earlier version read through
+    /// [`read_reassembled`], whose progress lived in the future: cancelling it discarded the
+    /// bytes already consumed, the next read began mid-chunk, and the session died with a bogus
+    /// "chunk payload exceeds MAX_CHUNK_PAYLOAD" once a payload byte was mistaken for a length.
     pub async fn next_event(&mut self) -> io::Result<Option<ClientEvent>> {
         loop {
-            let msg = match read_message(&mut self.stream, &mut self.reassembler).await {
-                Ok(Some(msg)) => msg,
-                // An unimplemented message type is skipped rather than fatal.
-                Ok(None) => continue,
+            // Drain anything queued (a pong from a previous iteration) before blocking on the
+            // read, so housekeeping cannot sit in the buffer while the peer waits for it.
+            self.flush_pending().await?;
+
+            let raw = match self
+                .chunks
+                .next_message(&mut self.stream, &mut self.reassembler)
+                .await
+            {
+                Ok(raw) => raw,
                 Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => return Ok(None),
                 Err(e) => return Err(e),
+            };
+            let msg = match Message::decode_known(raw.msg_type, &raw.payload)
+                .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?
+            {
+                Some(msg) => msg,
+                // An unimplemented message type is skipped rather than fatal.
+                None => continue,
             };
 
             let event = match msg {
@@ -148,7 +184,8 @@ impl<S: AsyncRead + AsyncWrite + Unpin> ClientSession<S> {
                         // The agent owns the clock; the client echoes rather than inventing.
                         agent_us: 0,
                     });
-                    write_message(&mut self.stream, &pong, channel::CONTROL).await?;
+                    // Queue rather than write: the next iteration flushes it, resumably.
+                    self.queue(&pong)?;
                     continue;
                 }
                 Message::Pong(_) => continue,
@@ -175,7 +212,42 @@ impl<S: AsyncRead + AsyncWrite + Unpin> ClientSession<S> {
 
     /// Send a message to the agent (input, acks, window control, quality hints).
     pub async fn send(&mut self, msg: &Message) -> io::Result<()> {
-        write_message(&mut self.stream, msg, channel::CONTROL).await
+        self.queue(msg)?;
+        self.flush_pending().await
+    }
+
+    /// Append a message's chunks to the outgoing buffer.
+    fn queue(&mut self, msg: &Message) -> io::Result<()> {
+        let chunks = msg
+            .to_chunks(channel::CONTROL)
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
+        for chunk in &chunks {
+            self.pending_out.extend_from_slice(chunk);
+        }
+        Ok(())
+    }
+
+    /// Write out whatever is queued.
+    ///
+    /// Cancel-safe in the part that matters: `write` reports exactly how many bytes it took and
+    /// consumes nothing when cancelled, and the count lives in `self`, so an interrupted write
+    /// resumes mid-buffer instead of re-sending or losing bytes. The trailing `flush` only
+    /// pushes bytes the stream has already accepted, so repeating it after a cancellation is
+    /// harmless.
+    async fn flush_pending(&mut self) -> io::Result<()> {
+        while self.pending_written < self.pending_out.len() {
+            let n = self
+                .stream
+                .write(&self.pending_out[self.pending_written..])
+                .await?;
+            if n == 0 {
+                return Err(io::Error::from(io::ErrorKind::WriteZero));
+            }
+            self.pending_written += n;
+        }
+        self.pending_out.clear();
+        self.pending_written = 0;
+        self.stream.flush().await
     }
 
     /// Send a liveness probe.

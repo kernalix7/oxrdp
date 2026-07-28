@@ -12,5 +12,10 @@ tokio = { version = "1", features = ["io-util", "net", "rt", "macros"] }
 oxproto = { path = "../oxproto" }
 oxrdp-pdu = { path = "../oxrdp-pdu" }
 
+[dev-dependencies]
+# `time` is only needed by the cancellation tests, which use `timeout` to drop a read future
+# part-way through a chunk.
+tokio = { version = "1", features = ["io-util", "net", "rt", "macros", "time"] }
+
 [lints]
 workspace = true
