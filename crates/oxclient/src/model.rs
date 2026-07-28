@@ -307,7 +307,8 @@ impl WindowModel {
 mod tests {
     use super::*;
     use oxproto::message::{
-        Close, CursorPosition, CursorVisibility, Error as ProtoError, WindowClosed, WindowZOrder,
+        close_reason, Close, CursorPosition, CursorVisibility, Error as ProtoError, WindowClosed,
+        WindowZOrder,
     };
 
     fn opened(id: u32, title: &str) -> ClientEvent {
@@ -568,7 +569,9 @@ mod tests {
             }]
         );
         assert_eq!(
-            m.apply(ClientEvent::Closed(Close { reason: 0 })),
+            m.apply(ClientEvent::Closed(Close {
+                reason: close_reason::NORMAL
+            })),
             vec![ModelChange::Closed]
         );
     }

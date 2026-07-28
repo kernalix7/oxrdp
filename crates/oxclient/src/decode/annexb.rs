@@ -65,15 +65,30 @@ mod tests {
 
     #[test]
     fn skips_nal_types_it_has_no_use_for() {
-        // Access unit delimiter, SEI and filler may precede the slice (§9.1) and must not stop
-        // the scan or count as an error.
+        // The full keyframe layout OXPROTO.md §9.1 mandates: an access unit delimiter first if
+        // present, then SEI, then the parameter sets, then the slice, then anything else.
         let access_unit = [
             0, 0, 0, 1, 0x09, 0x10, // AUD
             0, 0, 0, 1, 0x06, 0x05, 0x01, 0x00, // SEI
-            0, 0, 0, 1, 0x0c, 0xff, 0xff, // filler
+            0, 0, 0, 1, 0x67, 0x42, 0x00, 0x1e, // SPS
+            0, 0, 0, 1, 0x68, 0xce, 0x3c, 0x80, // PPS
             0, 0, 0, 1, 0x65, 0x88, // IDR slice
+            0, 0, 0, 1, 0x0c, 0xff, 0x80, // filler
         ];
         assert!(contains_idr(&access_unit));
+    }
+
+    #[test]
+    fn finds_an_idr_wherever_it_sits() {
+        // §9.1 pins the order, but the scan does not depend on it: a decoder that only accepts
+        // the layout it expects turns an encoder's ordering bug into a window that never
+        // starts, which is a worse failure than tolerating the bug.
+        let out_of_order = [
+            0, 0, 0, 1, 0x0c, 0xff, 0x80, // filler ahead of everything
+            0, 0, 0, 1, 0x65, 0x88, // IDR slice
+            0, 0, 0, 1, 0x67, 0x42, 0x00, 0x1e, // SPS after the slice
+        ];
+        assert!(contains_idr(&out_of_order));
     }
 
     #[test]
