@@ -4,6 +4,7 @@
 mod appid;
 pub mod capture;
 pub mod enumerate;
+mod input;
 
 use std::process::ExitCode;
 
@@ -19,6 +20,7 @@ use crate::config::AgentConfig;
 use crate::serve::{run_session, SessionParams};
 use capture::WindowCapture;
 use enumerate::enumerate_windows;
+use input::WinInputSink;
 
 /// Opt into per-monitor DPI awareness.
 ///
@@ -124,7 +126,8 @@ pub fn run_agent(config: &AgentConfig, print_pin: bool) -> ExitCode {
                 max_frames_in_flight: config.max_frames_in_flight,
             };
             let mut source = WinWindowSource::new();
-            match run_session(tls, &mut source, params, session_id, &token).await {
+            let mut sink = WinInputSink::new();
+            match run_session(tls, &mut source, &mut sink, params, session_id, &token).await {
                 Ok(negotiated) => eprintln!(
                     "oxagent: session {session_id} with '{}' ended",
                     negotiated.client_name

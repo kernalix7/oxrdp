@@ -11,6 +11,7 @@
 
 pub mod config;
 pub mod handshake;
+pub mod input;
 pub mod pacing;
 pub mod registry;
 pub mod serve;

@@ -20,6 +20,7 @@ use std::io;
 use std::time::{Duration, Instant};
 
 use oxproto::envelope::{channel, Reassembler};
+use oxproto::message::input::key_flag;
 use oxproto::message::{
     FrameData, Message, WindowClosed, WindowGeometry, WindowOpened, WindowTitle,
 };
@@ -29,6 +30,7 @@ use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
 use tokio::sync::mpsc;
 
 use crate::handshake::{negotiate, HandshakeError, Negotiated};
+use crate::input::InputSink;
 use crate::pacing::FrameBudget;
 use crate::registry::WindowRegistry;
 
@@ -111,9 +113,10 @@ struct WindowStream {
 ///
 /// Returns when the client disconnects or the transport fails. The handshake happens here, so
 /// a caller that gets an error never had an authenticated peer.
-pub async fn run_session<S, W>(
+pub async fn run_session<S, W, I>(
     stream: S,
     source: &mut W,
+    sink: &mut I,
     params: SessionParams,
     session_id: u64,
     expected_token: &str,
@@ -121,6 +124,7 @@ pub async fn run_session<S, W>(
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
     W: WindowSource,
+    I: InputSink,
 {
     let (mut reader, mut writer) = tokio::io::split(stream);
 
@@ -164,10 +168,16 @@ where
     let mut registry = WindowRegistry::new();
     let mut streams: HashMap<u32, WindowStream> = HashMap::new();
     let acks_enabled = negotiated.features & feature::FRAME_ACK != 0;
+    // TextInput and WindowControl are optional features (OXPROTO.md §8, §13): a client that
+    // never negotiated them can still send the message (unknown-but-well-formed is not a
+    // protocol error), it just should not silently work.
+    let text_input_enabled = negotiated.features & feature::TEXT_INPUT != 0;
+    let window_control_enabled = negotiated.features & feature::WINDOW_CONTROL != 0;
 
     let outcome = drive(
         &mut writer,
         source,
+        sink,
         &mut rx,
         &mut ticker,
         &mut registry,
@@ -175,6 +185,8 @@ where
         &params,
         started,
         acks_enabled,
+        text_input_enabled,
+        window_control_enabled,
     )
     .await;
 
@@ -186,9 +198,10 @@ where
 
 /// The steady-state loop: announce window changes, send frames, apply acks and input.
 #[allow(clippy::too_many_arguments)]
-async fn drive<W, WR>(
+async fn drive<W, WR, I>(
     writer: &mut WR,
     source: &mut W,
+    sink: &mut I,
     rx: &mut mpsc::Receiver<Message>,
     ticker: &mut tokio::time::Interval,
     registry: &mut WindowRegistry,
@@ -196,10 +209,13 @@ async fn drive<W, WR>(
     params: &SessionParams,
     started: Instant,
     acks_enabled: bool,
+    text_input_enabled: bool,
+    window_control_enabled: bool,
 ) -> io::Result<()>
 where
     W: WindowSource,
     WR: AsyncWrite + Unpin,
+    I: InputSink,
 {
     loop {
         tokio::select! {
@@ -227,8 +243,53 @@ where
                         });
                         send(writer, &pong, channel::CONTROL).await?;
                     }
-                    // Input and window control are accepted and ignored until P3 wires
-                    // injection; dropping them is better than tearing the session down.
+                    Message::PointerEvent(p) => {
+                        // `streams` is exactly the set of windows this session has announced
+                        // and not yet closed, keyed by the same `window_id` the wire uses — so
+                        // a miss here is "unknown or already-gone window", dropped rather than
+                        // injected into whatever window happens to have focus.
+                        if let Some(stream) = streams.get(&p.window_id) {
+                            sink.pointer_event(
+                                stream.handle,
+                                p.x,
+                                p.y,
+                                p.buttons,
+                                p.wheel_x,
+                                p.wheel_y,
+                            );
+                        }
+                    }
+                    Message::KeyEvent(k) => {
+                        // No `window_id`: keyboard input always targets whatever window is
+                        // currently focused, which the sink establishes via `PointerEvent` /
+                        // `WindowControl::ACTIVATE` (OXPROTO.md §13).
+                        sink.key_event(k.scancode, k.flags & key_flag::EXTENDED != 0, k.is_pressed());
+                    }
+                    Message::TextInput(t) => {
+                        if text_input_enabled {
+                            sink.text_input(&t.text);
+                        }
+                    }
+                    Message::ModifierSync(m) => {
+                        sink.modifier_sync(m.modifiers, m.locks);
+                    }
+                    // Gated on WINDOW_CONTROL by the match guard: a client that never
+                    // negotiated it falls through to the catch-all below and is dropped.
+                    Message::WindowControl(w) if window_control_enabled => {
+                        if let Some(stream) = streams.get(&w.window_id) {
+                            sink.window_control(
+                                stream.handle,
+                                w.action,
+                                w.x,
+                                w.y,
+                                w.width,
+                                w.height,
+                            );
+                        }
+                    }
+                    // Anything else — handshake types replayed after negotiation, agent-to-
+                    // client-only types echoed back — is accepted and ignored (protocol rule
+                    // 6): dropping it is better than tearing the session down.
                     _ => {}
                 }
             }
@@ -494,11 +555,119 @@ mod tests {
         }
     }
 
+    /// An [`InputSink`] that does nothing — for tests exercising everything except input.
+    struct NoopSink;
+    impl InputSink for NoopSink {
+        fn pointer_event(&mut self, _: isize, _: i32, _: i32, _: u8, _: i16, _: i16) {}
+        fn key_event(&mut self, _: u16, _: bool, _: bool) {}
+        fn text_input(&mut self, _: &str) {}
+        fn modifier_sync(&mut self, _: u16, _: u8) {}
+        fn window_control(&mut self, _: isize, _: u8, _: i32, _: i32, _: u16, _: u16) {}
+    }
+
+    /// One recorded call to an [`InputSink`] method, for asserting exactly what the driver
+    /// forwarded and with which arguments.
+    #[derive(Debug, Clone, PartialEq)]
+    enum SinkCall {
+        Pointer {
+            handle: isize,
+            x: i32,
+            y: i32,
+            buttons: u8,
+            wheel_x: i16,
+            wheel_y: i16,
+        },
+        Key {
+            scancode: u16,
+            extended: bool,
+            pressed: bool,
+        },
+        Text(String),
+        ModifierSync {
+            modifiers: u16,
+            locks: u8,
+        },
+        WindowControl {
+            handle: isize,
+            action: u8,
+            x: i32,
+            y: i32,
+            width: u16,
+            height: u16,
+        },
+    }
+
+    /// An [`InputSink`] that reports every call over a channel, so a test can assert on calls
+    /// as they arrive without reaching into the sink after the session task has moved it.
+    struct RecordingSink(mpsc::UnboundedSender<SinkCall>);
+
+    impl InputSink for RecordingSink {
+        fn pointer_event(
+            &mut self,
+            handle: isize,
+            x: i32,
+            y: i32,
+            buttons: u8,
+            wheel_x: i16,
+            wheel_y: i16,
+        ) {
+            let _ = self.0.send(SinkCall::Pointer {
+                handle,
+                x,
+                y,
+                buttons,
+                wheel_x,
+                wheel_y,
+            });
+        }
+
+        fn key_event(&mut self, scancode: u16, extended: bool, pressed: bool) {
+            let _ = self.0.send(SinkCall::Key {
+                scancode,
+                extended,
+                pressed,
+            });
+        }
+
+        fn text_input(&mut self, text: &str) {
+            let _ = self.0.send(SinkCall::Text(text.to_string()));
+        }
+
+        fn modifier_sync(&mut self, modifiers: u16, locks: u8) {
+            let _ = self.0.send(SinkCall::ModifierSync { modifiers, locks });
+        }
+
+        fn window_control(
+            &mut self,
+            handle: isize,
+            action: u8,
+            x: i32,
+            y: i32,
+            width: u16,
+            height: u16,
+        ) {
+            let _ = self.0.send(SinkCall::WindowControl {
+                handle,
+                action,
+                x,
+                y,
+                width,
+                height,
+            });
+        }
+    }
+
     fn hello(token: &str) -> Message {
+        hello_with_features(token, feature::FRAME_ACK)
+    }
+
+    /// Like [`hello`], but with a caller-chosen feature set — for tests where negotiating (or
+    /// not negotiating) `TEXT_INPUT`/`WINDOW_CONTROL` is the point.
+    fn hello_with_features(token: &str, features: u64) -> Message {
         Message::ClientHello(ClientHello {
             version_min: 1,
             version_max: 1,
-            features: feature::FRAME_ACK,
+            features,
             auth_token: token.into(),
             client_name: "test".into(),
             codecs: vec![oxproto::codec::RAW_BGRA],
@@ -524,9 +693,11 @@ mod tests {
 
         let agent_task = tokio::spawn(async move {
             let mut source = FakeSource::one_window(3);
+            let mut sink = NoopSink;
             run_session(
                 agent,
                 &mut source,
+                &mut sink,
                 SessionParams {
                     target_fps: 240,
                     max_frames_in_flight: 2,
@@ -590,7 +761,16 @@ mod tests {
         let (mut client, agent) = tokio::io::duplex(64 * 1024);
         let agent_task = tokio::spawn(async move {
             let mut source = Forbidden;
-            run_session(agent, &mut source, SessionParams::default(), 1, "secret").await
+            let mut sink = NoopSink;
+            run_session(
+                agent,
+                &mut source,
+                &mut sink,
+                SessionParams::default(),
+                1,
+                "secret",
+            )
+            .await
         });
 
         write_message(&mut client, &hello("wrong"), channel::CONTROL)
@@ -630,9 +810,11 @@ mod tests {
         let (mut client, agent) = tokio::io::duplex(64 * 1024);
         let agent_task = tokio::spawn(async move {
             let mut source = Vanishing { polls: 0 };
+            let mut sink = NoopSink;
             run_session(
                 agent,
                 &mut source,
+                &mut sink,
                 SessionParams {
                     target_fps: 240,
                     max_frames_in_flight: 2,
@@ -665,6 +847,344 @@ mod tests {
         assert_eq!(
             saw_close, saw_open,
             "and then reported closed by the same id"
+        );
+
+        drop(client);
+        let _ = agent_task.await;
+    }
+
+    /// Read messages from `client` until a `WindowOpened` arrives, and return it — every
+    /// input test needs a real `window_id` to target before it can prove anything about
+    /// dispatch to that window.
+    async fn wait_for_window_opened(
+        client: &mut tokio::io::DuplexStream,
+        r: &mut Reassembler,
+    ) -> WindowOpened {
+        loop {
+            match read_message(client, r).await.unwrap().unwrap() {
+                Message::WindowOpened(w) => return w,
+                _ => continue,
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn pointer_key_and_modifier_events_reach_the_sink() {
+        use oxproto::message::input::{key_flag, lock_state, modifier, pointer_button};
+        use oxproto::message::{KeyEvent, ModifierSync, PointerEvent};
+
+        let (mut client, agent) = tokio::io::duplex(64 * 1024);
+        let (tx, mut rx) = mpsc::unbounded_channel();
+
+        let agent_task = tokio::spawn(async move {
+            let mut source = FakeSource::one_window(0);
+            let mut sink = RecordingSink(tx);
+            run_session(
+                agent,
+                &mut source,
+                &mut sink,
+                SessionParams::default(),
+                3,
+                "secret",
+            )
+            .await
+        });
+
+        let mut r = Reassembler::new();
+        write_message(&mut client, &hello("secret"), channel::CONTROL)
+            .await
+            .unwrap();
+        let opened = wait_for_window_opened(&mut client, &mut r).await;
+
+        write_message(
+            &mut client,
+            &Message::PointerEvent(PointerEvent {
+                window_id: opened.window_id,
+                x: 12,
+                y: -3,
+                buttons: pointer_button::LEFT | pointer_button::RIGHT,
+                wheel_x: 0,
+                wheel_y: -120,
+                timestamp: 0,
+            }),
+            channel::INPUT,
+        )
+        .await
+        .unwrap();
+        write_message(
+            &mut client,
+            &Message::KeyEvent(KeyEvent {
+                scancode: 0x1E,
+                flags: key_flag::PRESSED,
+                timestamp: 0,
+            }),
+            channel::INPUT,
+        )
+        .await
+        .unwrap();
+        write_message(
+            &mut client,
+            &Message::ModifierSync(ModifierSync {
+                modifiers: modifier::SHIFT,
+                locks: lock_state::CAPS,
+            }),
+            channel::INPUT,
+        )
+        .await
+        .unwrap();
+
+        // `FakeSource::one_window` uses handle `0x1000` — the sink must see that native handle,
+        // not the wire `window_id`, since only the driver knows the mapping between them.
+        assert_eq!(
+            rx.recv().await.unwrap(),
+            SinkCall::Pointer {
+                handle: 0x1000,
+                x: 12,
+                y: -3,
+                buttons: pointer_button::LEFT | pointer_button::RIGHT,
+                wheel_x: 0,
+                wheel_y: -120,
+            }
+        );
+        assert_eq!(
+            rx.recv().await.unwrap(),
+            SinkCall::Key {
+                scancode: 0x1E,
+                extended: false,
+                pressed: true,
+            }
+        );
+        assert_eq!(
+            rx.recv().await.unwrap(),
+            SinkCall::ModifierSync {
+                modifiers: modifier::SHIFT,
+                locks: lock_state::CAPS,
+            }
+        );
+
+        drop(client);
+        let _ = agent_task.await;
+    }
+
+    #[tokio::test]
+    async fn window_control_targets_the_resolved_handle_when_negotiated() {
+        use oxproto::message::input::window_action;
+        use oxproto::message::WindowControl;
+
+        let (mut client, agent) = tokio::io::duplex(64 * 1024);
+        let (tx, mut rx) = mpsc::unbounded_channel();
+
+        let agent_task = tokio::spawn(async move {
+            let mut source = FakeSource::one_window(0);
+            let mut sink = RecordingSink(tx);
+            run_session(
+                agent,
+                &mut source,
+                &mut sink,
+                SessionParams::default(),
+                4,
+                "secret",
+            )
+            .await
+        });
+
+        let mut r = Reassembler::new();
+        write_message(
+            &mut client,
+            &hello_with_features("secret", feature::WINDOW_CONTROL),
+            channel::CONTROL,
+        )
+        .await
+        .unwrap();
+        let opened = wait_for_window_opened(&mut client, &mut r).await;
+
+        write_message(
+            &mut client,
+            &Message::WindowControl(WindowControl {
+                window_id: opened.window_id,
+                action: window_action::MAXIMIZE,
+                x: 0,
+                y: 0,
+                width: 0,
+                height: 0,
+            }),
+            channel::INPUT,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            rx.recv().await.unwrap(),
+            SinkCall::WindowControl {
+                handle: 0x1000,
+                action: window_action::MAXIMIZE,
+                x: 0,
+                y: 0,
+                width: 0,
+                height: 0,
+            }
+        );
+
+        drop(client);
+        let _ = agent_task.await;
+    }
+
+    #[tokio::test]
+    async fn text_input_is_forwarded_only_when_negotiated() {
+        use oxproto::message::TextInput;
+
+        /// Runs one session with `extra_features` negotiated, sends a `TextInput` followed by
+        /// a `ModifierSync` sentinel, and returns the first sink call observed — whichever of
+        /// the two actually got through.
+        async fn first_call_after_text_input(extra_features: u64) -> SinkCall {
+            let (mut client, agent) = tokio::io::duplex(64 * 1024);
+            let (tx, mut rx) = mpsc::unbounded_channel();
+
+            let agent_task = tokio::spawn(async move {
+                let mut source = FakeSource::one_window(0);
+                let mut sink = RecordingSink(tx);
+                run_session(
+                    agent,
+                    &mut source,
+                    &mut sink,
+                    SessionParams::default(),
+                    1,
+                    "secret",
+                )
+                .await
+            });
+
+            let mut r = Reassembler::new();
+            write_message(
+                &mut client,
+                &hello_with_features("secret", extra_features),
+                channel::CONTROL,
+            )
+            .await
+            .unwrap();
+            let _ = wait_for_window_opened(&mut client, &mut r).await;
+
+            write_message(
+                &mut client,
+                &Message::TextInput(TextInput { text: "hi".into() }),
+                channel::INPUT,
+            )
+            .await
+            .unwrap();
+            write_message(
+                &mut client,
+                &Message::ModifierSync(oxproto::message::ModifierSync {
+                    modifiers: 0,
+                    locks: 0,
+                }),
+                channel::INPUT,
+            )
+            .await
+            .unwrap();
+
+            let first = rx.recv().await.expect("the sentinel is always forwarded");
+            drop(client);
+            let _ = agent_task.await;
+            first
+        }
+
+        assert_eq!(
+            first_call_after_text_input(feature::TEXT_INPUT).await,
+            SinkCall::Text("hi".into()),
+            "negotiated TEXT_INPUT: the text reaches the sink before the sentinel"
+        );
+        assert_eq!(
+            first_call_after_text_input(0).await,
+            SinkCall::ModifierSync {
+                modifiers: 0,
+                locks: 0
+            },
+            "without TEXT_INPUT: the text is dropped, so the sentinel arrives first"
+        );
+    }
+
+    #[tokio::test]
+    async fn input_for_an_unknown_window_id_is_dropped() {
+        use oxproto::message::input::{modifier, window_action};
+        use oxproto::message::{ModifierSync, PointerEvent, WindowControl};
+
+        let (mut client, agent) = tokio::io::duplex(64 * 1024);
+        let (tx, mut rx) = mpsc::unbounded_channel();
+
+        let agent_task = tokio::spawn(async move {
+            let mut source = FakeSource::one_window(0);
+            let mut sink = RecordingSink(tx);
+            run_session(
+                agent,
+                &mut source,
+                &mut sink,
+                SessionParams::default(),
+                9,
+                "secret",
+            )
+            .await
+        });
+
+        let mut r = Reassembler::new();
+        write_message(
+            &mut client,
+            &hello_with_features("secret", feature::FRAME_ACK | feature::WINDOW_CONTROL),
+            channel::CONTROL,
+        )
+        .await
+        .unwrap();
+        let opened = wait_for_window_opened(&mut client, &mut r).await;
+        let bogus_id = opened.window_id + 1;
+
+        write_message(
+            &mut client,
+            &Message::PointerEvent(PointerEvent {
+                window_id: bogus_id,
+                x: 1,
+                y: 1,
+                buttons: 0,
+                wheel_x: 0,
+                wheel_y: 0,
+                timestamp: 0,
+            }),
+            channel::INPUT,
+        )
+        .await
+        .unwrap();
+        write_message(
+            &mut client,
+            &Message::WindowControl(WindowControl {
+                window_id: bogus_id,
+                action: window_action::ACTIVATE,
+                x: 0,
+                y: 0,
+                width: 0,
+                height: 0,
+            }),
+            channel::INPUT,
+        )
+        .await
+        .unwrap();
+        // A sentinel the driver always forwards, proving it kept processing after the two
+        // unresolvable ids rather than injecting them anywhere or getting stuck on them.
+        write_message(
+            &mut client,
+            &Message::ModifierSync(ModifierSync {
+                modifiers: modifier::SHIFT,
+                locks: 0,
+            }),
+            channel::INPUT,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            rx.recv().await.unwrap(),
+            SinkCall::ModifierSync {
+                modifiers: modifier::SHIFT,
+                locks: 0
+            },
+            "the bogus-window-id events must never reach the sink"
         );
 
         drop(client);

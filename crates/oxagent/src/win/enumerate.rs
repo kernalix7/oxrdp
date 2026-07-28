@@ -132,9 +132,14 @@ fn describe_window(hwnd: HWND) -> Option<WindowInfo> {
 
 /// DWM extended frame bounds (what is actually drawn), falling back to `GetWindowRect`.
 ///
+/// `pub(crate)` because [`crate::win::input`] needs the same rectangle to convert a wire
+/// `PointerEvent`'s window-relative coordinates to guest screen coordinates — it must be
+/// exactly this rectangle, not `GetWindowRect`, or clicks drift from what the user sees the
+/// captured frame land on.
+///
 /// # Safety
 /// `hwnd` must be a valid window handle.
-unsafe fn frame_bounds(hwnd: HWND) -> Option<RECT> {
+pub(crate) unsafe fn frame_bounds(hwnd: HWND) -> Option<RECT> {
     let mut rect = RECT::default();
     let hr = DwmGetWindowAttribute(
         hwnd,
