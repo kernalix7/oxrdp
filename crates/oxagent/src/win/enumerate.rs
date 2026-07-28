@@ -193,6 +193,19 @@ fn has_native_frame(hwnd: HWND, style: u32, frame: &RECT) -> bool {
 /// exactly this rectangle, not `GetWindowRect`, or clicks drift from what the user sees the
 /// captured frame land on.
 ///
+/// **Coupling to watch when `HAS_FRAME`-based cropping lands** (`docs/design/
+/// window-decorations.md`): this function reports the *whole* window today, and capture
+/// (`crate::win::capture`) still sends the whole window's pixels, so "whole window" is
+/// consistently the coordinate space everywhere — reported geometry, captured frames, and
+/// `PointerEvent`'s window-relative origin all agree. The moment the agent starts cropping a
+/// `HAS_FRAME` window's frame down to its client area, this function (and every geometry field
+/// derived from it) must switch to the client rect for that window too, or reported geometry
+/// stops matching the pixels; and `crate::win::input`'s pointer-coordinate conversion, which
+/// currently anchors on this exact rectangle, must move with it or every click on a cropped
+/// window lands off by the caption height. Populating `HAS_FRAME` does not do any of that
+/// itself — it only reports the fact; acting on it in capture/geometry/input is future work,
+/// and all three have to move together when it happens.
+///
 /// # Safety
 /// `hwnd` must be a valid window handle.
 pub(crate) unsafe fn frame_bounds(hwnd: HWND) -> Option<RECT> {

@@ -16,6 +16,13 @@
 //!   necessarily `(0, 0)` — a monitor to the left of or above the primary reports negative
 //!   `SM_XVIRTUALSCREEN`/`SM_YVIRTUALSCREEN`. Both are read fresh on every event since a
 //!   monitor can be hot-plugged mid-session.
+//!
+//!   The window-relative origin this conversion anchors on is [`enumerate::frame_bounds`] — the
+//!   *whole* window, matching what capture sends today. If `HAS_FRAME`-based cropping lands
+//!   (`docs/design/window-decorations.md`), a cropped window's reported geometry becomes its
+//!   client rect, not its frame rect, and this conversion has to switch origins with it or
+//!   every click on a cropped window lands off by the caption height — see the coupling note on
+//!   `frame_bounds` itself.
 
 use core::ffi::c_void;
 
