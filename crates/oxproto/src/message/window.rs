@@ -208,13 +208,19 @@ impl<'de> Decode<'de> for WindowTitle {
 }
 
 /// Window state update.
+///
+/// Sent whenever `state` or `flags` changes, not only on a show-state transition — see
+/// `OXPROTO.md` §11 for exactly when and what a receiver must do with each field.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WindowState {
     /// Unique window identifier.
     pub window_id: u32,
-    /// New show state (`window_show` value).
+    /// Current show state (`window_show` value) — always the complete current state, never a
+    /// delta.
     pub state: u8,
-    /// Reserved flags bitmask.
+    /// Bitmask of `window_flag` values — the same meaning as `WindowOpened.flags`, and always
+    /// the complete current bitmask, not a delta: a receiver replaces its stored flags with
+    /// this value rather than merging it in.
     pub flags: u32,
 }
 

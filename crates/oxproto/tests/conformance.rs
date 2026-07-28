@@ -10,8 +10,10 @@
 use oxproto::{
     channel, close_reason, codec, decode, encode_vec,
     message::{
-        msg_type, window::frame_flag, Close, CursorVisibility, FrameAck, FrameData, Message,
-        ModifierSync, Ping, Pong, WindowClosed, WindowGeometry, WindowZOrder,
+        msg_type,
+        window::{frame_flag, window_flag, window_show},
+        Close, CursorVisibility, FrameAck, FrameData, Message, ModifierSync, Ping, Pong,
+        WindowClosed, WindowGeometry, WindowState, WindowZOrder,
     },
 };
 
@@ -122,6 +124,47 @@ body_fixture!(
         0xC8, 0x00, 0x00, 0x00, // width: u16 LE (1024 = 0x0400)
         0x00, 0x04, // height: u16 LE (768 = 0x0300)
         0x00, 0x03,
+    ]
+);
+
+// `flags` used to be documented as reserved; §11 now defines it as carrying the same
+// `window_flag` bitmask as `WindowOpened.flags`. Both fixtures below round-trip a non-zero
+// value through the wire encoding, which was already correct (the field was always a real u32
+// on the wire, just undefined) — what changed is the meaning, not the bytes.
+body_fixture!(
+    window_state_with_flags_bytes,
+    WindowState,
+    WindowState {
+        window_id: 0x1234_5678,
+        state: window_show::NORMAL,
+        flags: window_flag::RESIZABLE | window_flag::HAS_FRAME,
+    },
+    [
+        // window_id: u32 LE
+        0x78, 0x56, 0x34, 0x12, // state: u8 (NORMAL = 0)
+        0x00, // flags: u32 LE (RESIZABLE | HAS_FRAME = 0x01 | 0x02 = 3)
+        0x03, 0x00, 0x00, 0x00,
+    ]
+);
+
+// The motivating case from `window-decorations.md`: a window entering full screen loses
+// `HAS_FRAME` and gains `TOPMOST` without its show state changing at all — `state` stays
+// `NORMAL` while `flags` is the only thing that moved. §11 calls this a normal message, not an
+// edge case, and this fixture is the byte-exact proof that `state` unchanged + `flags` changed
+// is a legal, well-defined `WindowState`.
+body_fixture!(
+    window_state_flags_change_with_state_unchanged_bytes,
+    WindowState,
+    WindowState {
+        window_id: 0x1234_5678,
+        state: window_show::NORMAL,
+        flags: window_flag::TOPMOST,
+    },
+    [
+        // window_id: u32 LE
+        0x78, 0x56, 0x34, 0x12, // state: u8 (NORMAL = 0, unchanged from the fixture above)
+        0x00, // flags: u32 LE (TOPMOST = 0x04)
+        0x04, 0x00, 0x00, 0x00,
     ]
 );
 

@@ -333,6 +333,42 @@ boxes.
 Subsequent changes arrive as `WindowGeometry`, `WindowTitle`, `WindowState`, `WindowZOrder`
 (`{ window_id, above_window_id }`, 0 = bottom), `WindowIcon`, and finally `WindowClosed`.
 
+**`WindowState`.** `{ window_id, state u8, flags u32 }`. `state` is the window's show state
+(`window_show`: 0 normal, 1 minimized, 2 maximized) — always the complete current value, never a
+delta. `flags` carries the same bitmask `WindowOpened.flags` does (`window_flag`, above), and is
+likewise always the complete current bitmask, not a delta: a receiver **replaces** whatever it
+has stored, it does not OR the new bits in. `WindowOpened` is authoritative only for the value at
+the moment a window is announced; `WindowState` is the sole vehicle for every change to either
+field after that. The agent sends one whenever *either* `state` or `flags` changes, and every
+message repeats both fields at their current value regardless of which one actually changed — a
+receiver never has to work out which half of a previous message is still valid, it just adopts
+both. A `flags` change with `state` unchanged is a normal, expected message, not an edge case:
+`RESIZABLE`, `HAS_FRAME` and `TOPMOST` can all change while a window stays in the same show
+state — entering full screen is the common case for `HAS_FRAME`, toggling always-on-top the
+common case for `TOPMOST` (`window-decorations.md`).
+
+If the change includes `HAS_FRAME`, the agent must follow it with a fresh `WindowGeometry`: that
+bit decides whether geometry is client-area or whole-window space (`window-decorations.md`), so a
+`HAS_FRAME` flip moves the coordinate space itself, and a client must not assume geometry it
+already has is still correct in the new space until that `WindowGeometry` arrives.
+
+*(Redefining `flags` from reserved to meaningful does not bump `PROTOCOL_VERSION`. Nothing has
+shipped that gives a non-zero `WindowState.flags` any behaviour on either side, so there is no
+deployed peer for this to break compatibility with — it is the additive case §17 already covers,
+not an exception to it.)*
+
+**Minimized windows stay open.** A minimized window is not closed — no `WindowClosed` is sent for
+it, and the client keeps it around (e.g. iconified in its own window manager) using the last
+geometry it was given. The agent stops sending `WindowGeometry` for a window entirely while it is
+minimized: a minimized window's OS-reported bounds are not real geometry (typically 0×0,
+sometimes an off-screen icon-sized rect), and a client that resized its native window to match
+would shrink or relocate it to nothing. The same applies to a window discovered *already*
+minimized — its first `WindowOpened` may itself carry a 0×0 or off-screen `width`/`height`. A
+client must treat that as "no usable geometry yet," not as the window's real size, and must not
+lay out around it; `WindowState` still reports `state = MINIMIZED` regardless. A real
+`WindowGeometry` resumes once the window is restored, since its position may have changed while
+iconified.
+
 **`WindowIcon` pixel format.** `{ window_id, width, height, pixels }` where the payload is
 **BGRA8 in memory order** (byte 0 = blue), **straight** alpha, top-down, tightly packed at
 `width * 4` bytes per row. Memory order, like every other pixel payload here — it is what
