@@ -8,6 +8,45 @@ All notable changes to oxrdp are documented here. The format is based on
 
 ## [Unreleased]
 
+### Security (2026-07-28)
+
+An adversarial review of the agent's network-facing surface, prompted by input injection
+landing — before it, an authentication weakness leaked pixels; now it hands an attacker
+synthetic keystrokes in an interactive Administrator session.
+
+Fixed:
+
+- **The agent's TLS private key was written world-readable** (0644 under a default umask). Any
+  local account could read it and impersonate the agent to any client trusting its pin: pinning
+  validates a public-key hash and TLS proves possession of the matching private key. TLS 1.3's
+  forward secrecy means this was never a decrypt-old-traffic bug — it was impersonate-us-from-
+  now-on. Keys are now created 0600. Windows ACL hardening remains a gap and is documented at
+  the call site rather than left implicit.
+- **`verify_token` looped over the length the unauthenticated peer chose to send**, not the
+  server's fixed token length, so the number of in-bounds index checks varied with the
+  attacker's input — narrow, but a violation of the function's own documented contract. It now
+  always runs the expected length.
+
+Outstanding, and tracked:
+
+- **An unauthenticated denial of service.** The accept loop handshakes and serves sequentially
+  with no timeout anywhere, so one idle TCP connection blocks the listener indefinitely and
+  locks out the operator. Being fixed by spawning per connection under a single pre-auth
+  deadline, with a bounded number of connections in that phase and one authenticated session at
+  a time preserved.
+- A panic in the per-connection path takes down the whole process, since sessions are awaited
+  directly rather than spawned. Per-connection spawning resolves this too.
+
+Examined and found sound: the pin is checked before any success is returned and the signature
+verifiers delegate to the pinned certificate; the pre-auth reassembly bounds hold across every
+path through `Reassembler::push`, including channel spreading and completion-and-reuse; and no
+allocation happens ahead of length validation anywhere in the decode chain.
+
+**Correction of record:** commit `2d155a5`, whose message describes the H.264 decoder, also
+contains the two `oxsec` fixes above. They were staged inadvertently with a broad `git add`
+while several changes were in the tree at once. The code in history is correct and complete;
+only that commit's message is misleading about what it carries.
+
 ### First end-to-end run (2026-07-28)
 
 A Windows application window is now captured in the guest and shown as a **native Linux
