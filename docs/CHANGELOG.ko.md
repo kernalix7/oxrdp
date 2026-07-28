@@ -9,6 +9,30 @@ oxrdp의 모든 주목할 만한 변경 사항이 여기에 기록됩니다. 형
 
 ## [Unreleased]
 
+### 첫 엔드투엔드 구동 (2026-07-28)
+
+이제 게스트에서 Windows 앱 창을 캡처해 **네이티브 Linux 창**으로 실시간 표시. 전체 경로를
+oxrdp 자체 dockur 게스트로 실제 구동: WGC 캡처 → `oxproto` 프레이밍 → SPKI 피닝과 토큰 인증을
+갖춘 TLS → `oxclient` → `oxdisplay`(winit + softbuffer). 1115×628 RAW_BGRA 를 ~21 fps로 측정,
+단일 창에서 약 470 Mbit/s — P5 H.264 인코더를 위한 구체적 사례.
+
+실제 구동으로만 발견한 버그 셋, 테스트 스위트가 잡을 수 없었던 것들:
+
+- **WGC 픽셀 포맷.** 프레임풀이 `B8G8R8A8UIntNormalizedSrgb`로 생성됨.
+  `Direct3D11CaptureFramePool`은 `B8G8R8A8UIntNormalized`와 `R16G16B16A16Float`만 받아들이고
+  그 외는 bare `E_INVALIDARG`로 거부.
+- **빈 풀 센티널.** `TryGetNextFrame`이 빈 풀을 `S_OK`를 담은 `Err`로 보고. 이를 실패로
+  취급해 호출자가 매 틱마다 캡처를 재구축, 풀이 채워질 만큼 살지 못해 스트림은 바쁜 척하면서
+  프레임을 0개 생산.
+- **취소 안전성.** `read_reassembled`이 읽기 진행 상태를 future에 보관, 청크 도중에
+  드롭된 `tokio::select!` 분기는 소비한 바이트를 잃고 스트림이 페이로드 도중에 재개. 진행
+  상태를 호출자 상태에 보관하는 `ChunkReader` 추가; `ClientSession`은 이를 통해 읽고
+  재개 가능하게 쓰기를 버퍼링.
+
+`dev/vm/oxrdp-windows.sh status`도 재작성: 예전 프로브는 건강한 에이전트를 "NOT running"으로
+보고(rustls이 절단된 핸드셰이크에 alert로 응답하지 않기 때문). 이제 진짜 TLS 핸드셰이크를
+완료하고 SPKI pin 출력, 이를 에이전트 자체 `--print-pin`과 대조해 확인.
+
 ### 방향 전환 (2026-07-02)
 
 oxrdp가 "더 나은 RDP **클라이언트**"에서 **RDP 자체를 대체**하는 목적형 저지연 remote-app
