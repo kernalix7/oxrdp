@@ -42,5 +42,6 @@ pub use oxrdp_pdu::{decode, encode_vec, Decode, DecodeError, Encode, EncodeError
 
 pub use envelope::{channel, ChunkHeader, Reassembler, CHUNK_HEADER_LEN, MAX_CHUNK_PAYLOAD};
 pub use message::{
-    codec, error_code, feature, msg_type, Message, MIN_SUPPORTED_VERSION, PROTOCOL_VERSION,
+    close_reason, codec, error_code, feature, msg_type, Message, MIN_SUPPORTED_VERSION,
+    PROTOCOL_VERSION,
 };

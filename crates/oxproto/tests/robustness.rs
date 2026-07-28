@@ -131,7 +131,9 @@ fn every_known_type_round_trips_through_the_registry() {
     use oxproto::message::*;
 
     let messages = vec![
-        Message::Close(Close { reason: 1 }),
+        Message::Close(Close {
+            reason: close_reason::GOING_AWAY,
+        }),
         Message::Ping(Ping { seq: 1, sent_us: 2 }),
         Message::Pong(Pong {
             seq: 1,

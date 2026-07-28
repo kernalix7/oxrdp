@@ -363,6 +363,7 @@ impl<'de> Decode<'de> for QualityHint {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::close_reason;
     use oxrdp_pdu::{decode, encode_vec};
 
     fn layout() -> DisplayLayout {
@@ -438,7 +439,9 @@ mod tests {
         };
         assert_eq!(decode::<Error>(&encode_vec(&e).unwrap()).unwrap(), e);
 
-        let c = Close { reason: 1 };
+        let c = Close {
+            reason: close_reason::GOING_AWAY,
+        };
         assert_eq!(decode::<Close>(&encode_vec(&c).unwrap()).unwrap(), c);
 
         let p = Ping {

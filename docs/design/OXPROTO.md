@@ -214,9 +214,12 @@ share this `frame_id`. A `FrameData` never spans more than one picture.
 
 **Parameter sets are in-band, on every keyframe, and only there.** SPS and PPS are never sent
 standalone and never out of band. Whenever `flags & KEYFRAME` is set (defined below), `data`
-begins with exactly one SPS NAL (`nal_unit_type == 7`) followed by exactly one PPS NAL
-(`nal_unit_type == 8`), each with its own start code, followed by the slice NAL(s). A
-non-keyframe `FrameData` must not contain an SPS or PPS NAL. This is the choice that lets a
+contains exactly one SPS NAL (`nal_unit_type == 7`) immediately followed by exactly one PPS NAL
+(`nal_unit_type == 8`), each with its own start code, immediately followed by the slice NAL(s).
+SPS is not necessarily the first *byte* of `data` — an access unit delimiter and/or SEI may
+precede it; see "NAL ordering" below for exactly where — but it is the first NAL that *affects
+decoding*, and nothing legal may sit between SPS and PPS or between PPS and the first slice NAL.
+A non-keyframe `FrameData` must not contain an SPS or PPS NAL. This is the choice that lets a
 client attach to an in-progress stream and decode immediately: parameter sets sent once out of
 band leave a window — a client that joins between that message and the next keyframe holds a
 bitstream it cannot parse, and this protocol has no message type for "a client just joined,
@@ -226,6 +229,28 @@ frames, and it removes the race entirely. Consequently: **the agent must send a 
 first `FrameData` for a window in every session**, including when it reports an already-open
 window to a newly-connecting or reconnecting client, so a joining client is never left waiting
 for one.
+
+**NAL ordering, and unknown NAL types.** Within `data`, NAL units appear in exactly this order:
+
+1. At most one access unit delimiter (`nal_unit_type == 9`) — if the encoder emits one at all,
+   it is the first NAL unit in `data`, full stop. This is not a constraint this document
+   invents: it is what Annex B already requires of an access unit delimiter's placement, so an
+   encoder and a decoder that both start from the base H.264 spec can never disagree about where
+   it goes.
+2. Any number of SEI messages (`6`), zero or more, in whatever order the encoder produced them.
+3. On a keyframe only: SPS (`7`) then PPS (`8`), as specified above — adjacent to each other,
+   nothing else between them, and neither present on a non-keyframe.
+4. The slice NAL(s): `5` (IDR) on a keyframe, `1` (non-IDR) otherwise — see "keyframe means IDR"
+   below.
+5. Anything else — more SEI, filler data (`12`), or any NAL type this document does not
+   otherwise name — may follow the slice NAL(s).
+
+A decoder must skip any NAL unit type it has no use for rather than treat its presence as an
+error — the same "unknown things are skipped, not fatal" rule as design rule 6 and the chunk
+envelope itself. This ordering is what makes "SPS is the first NAL that affects decoding" and
+"an access unit delimiter may appear in `data`" simultaneously true without contradiction: an
+access unit delimiter and any SEI are the only things ever allowed ahead of SPS, and an access
+unit delimiter's own position within that leading run is pinned to first.
 
 **`flags & KEYFRAME` means IDR, not "any I-frame".** An H.264 access unit can be intra-coded
 (every slice an I slice) without being an IDR: such a frame resets picture content but not the
@@ -259,11 +284,6 @@ unacknowledged frame for a window and encode only the newest content instead (§
 only safe if no future picture's decode depends on a picture the encoder might skip. Reordering
 would make a dropped frame potentially load-bearing for pictures the encoder has not produced
 yet.
-
-**Unknown NAL types.** SEI (`nal_unit_type == 6`), an access unit delimiter (`9`), filler data
-(`12`), or any other NAL type may appear in `data` alongside what is specified above. A decoder
-must skip any NAL unit type it has no use for rather than treat its presence as an error — the
-same "unknown things are skipped, not fatal" rule as design rule 6 and the chunk envelope itself.
 
 **`captured_us` / `encoded_us` under a real encoder.** Their definitions in §12 hold unchanged
 — `captured_us` is when capture completed, `encoded_us` is when the compressed bitstream for
@@ -381,7 +401,8 @@ Shapes are cached client-side by `cursor_id`; a repeated cursor costs 4 bytes, n
 3 `VERSION_MISMATCH`, 4 `UNSUPPORTED_CODEC`, 5 `WINDOW_GONE`, 6 `CAPTURE_FAILED`,
 7 `INTERNAL`, 8 `TOO_LARGE`.
 
-**`Close`** — `{ reason u16 }`: 0 normal, 1 going away, 2 idle timeout, 3 error.
+**`Close`** — `{ reason u16 }`. Reasons: 0 `close_reason::NORMAL`, 1 `GOING_AWAY`,
+2 `IDLE_TIMEOUT`, 3 `ERROR`.
 
 **`Ping`** — `{ seq u32, sent_us u64 }`; **`Pong`** — `{ seq u32, sent_us u64 (echoed),
 agent_us u64 }`. Sent every second by both sides; three missed responses declares the peer

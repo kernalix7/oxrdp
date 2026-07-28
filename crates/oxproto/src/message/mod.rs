@@ -145,6 +145,19 @@ pub mod error_code {
     pub const TOO_LARGE: u16 = 8;
 }
 
+/// Reason codes carried by [`Close`] (`OXPROTO.md` §15).
+pub mod close_reason {
+    /// Orderly shutdown; nothing went wrong.
+    pub const NORMAL: u16 = 0;
+    /// The sender is shutting down (e.g. process exit) rather than reporting a failure.
+    pub const GOING_AWAY: u16 = 1;
+    /// Closed after too long with no traffic — the `Ping`/`Pong` liveness check failed.
+    pub const IDLE_TIMEOUT: u16 = 2;
+    /// Closed because of a protocol or transport error, usually paired with a preceding
+    /// [`Error`] naming what went wrong.
+    pub const ERROR: u16 = 3;
+}
+
 /// A decoded protocol message.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Message {

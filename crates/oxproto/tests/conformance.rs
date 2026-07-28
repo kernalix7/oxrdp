@@ -8,7 +8,7 @@
 //! Run with: `cargo test -p oxproto --test conformance`.
 
 use oxproto::{
-    channel, codec, decode, encode_vec,
+    channel, close_reason, codec, decode, encode_vec,
     message::{
         msg_type, window::frame_flag, Close, CursorVisibility, FrameAck, FrameData, Message,
         ModifierSync, Ping, Pong, WindowClosed, WindowGeometry, WindowZOrder,
@@ -219,6 +219,15 @@ const IDR_SLICE_NAL: [u8; 6] = [0x65, 0x88, 0x84, 0x00, 0x10, 0xFF];
 /// A representative non-IDR (P) slice NAL (`nal_ref_idc = 2`, `nal_unit_type = 1`).
 const P_SLICE_NAL: [u8; 5] = [0x41, 0x9A, 0x24, 0x6C, 0x03];
 
+/// A representative access unit delimiter NAL (`nal_ref_idc = 0`, `nal_unit_type = 9` — Annex B
+/// requires `nal_ref_idc == 0` for this type). Per §9.1's NAL ordering rule, this is the only
+/// NAL type allowed to precede SPS *and* the only one pinned to a single legal position (first).
+const AUD_NAL: [u8; 2] = [0x09, 0xF0];
+
+/// A representative SEI NAL (`nal_ref_idc = 0`, `nal_unit_type = 6` — Annex B requires
+/// `nal_ref_idc == 0` for this type too); see [`SPS_NAL`] for why the payload is filler.
+const SEI_NAL: [u8; 4] = [0x06, 0x01, 0x02, 0x80];
+
 /// Build a `FrameData.data` payload the way §9.1 mandates: every NAL unit prefixed with the
 /// Annex-B start code, concatenated in decode order.
 fn annex_b(nals: &[&[u8]]) -> Vec<u8> {
@@ -323,6 +332,49 @@ body_fixture!(
         // data: u32 LE length (30 bytes) — fresh SPS/PPS accompanying the resize
         0x1E, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0x67, 0x42, 0x00, 0x1F, 0x8C, 0x8D, 0x40,
         0x50, //
+        0x00, 0x00, 0x00, 0x01, 0x68, 0xCE, 0x3C, 0x80, //
+        0x00, 0x00, 0x00, 0x01, 0x65, 0x88, 0x84, 0x00, 0x10, 0xFF,
+    ]
+);
+
+// The access unit delimiter and SEI are the only NAL types the ordering rule (§9.1, "NAL
+// ordering, and unknown NAL types") allows ahead of SPS, and the AUD's own position within
+// that leading run is pinned to first — this is the ordering an earlier draft of §9.1
+// contradicted by saying both "data begins with exactly one SPS NAL" and "an access unit
+// delimiter may appear in data" without saying where. This fixture is byte-exact proof the
+// two now hold together: AUD first, then SEI, then the mandatory SPS/PPS/IDR sequence.
+body_fixture!(
+    h264_keyframe_with_aud_and_sei_bytes,
+    FrameData,
+    FrameData {
+        window_id: 0x1122_3344,
+        frame_id: 4,
+        codec: codec::H264,
+        flags: frame_flag::KEYFRAME,
+        width: 800,
+        height: 600,
+        captured_us: 400_000,
+        encoded_us: 405_000,
+        data: annex_b(&[&AUD_NAL, &SEI_NAL, &SPS_NAL, &PPS_NAL, &IDR_SLICE_NAL]),
+    },
+    [
+        // window_id: u32 LE
+        0x44, 0x33, 0x22, 0x11, // frame_id: u64 LE (lo32, hi32) = 4
+        0x04, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // codec: H264 (2)
+        0x02, // flags: KEYFRAME (bit0)
+        0x01, // width: u16 LE (800)
+        0x20, 0x03, // height: u16 LE (600)
+        0x58, 0x02, // captured_us: u64 LE (400_000 = 0x0006_1A80)
+        0x80, 0x1A, 0x06, 0x00, 0x00, 0x00, 0x00, 0x00,
+        // encoded_us: u64 LE (405_000 = 0x0006_2E08)
+        0x08, 0x2E, 0x06, 0x00, 0x00, 0x00, 0x00, 0x00, // data: u32 LE length (44 bytes)
+        0x2C, 0x00, 0x00, 0x00,
+        // data: start-code + AUD(9) — first NAL, full stop (§9.1)
+        0x00, 0x00, 0x00, 0x01, 0x09, 0xF0, //
+        // start-code + SEI(6) — precedes SPS/PPS, itself not a parameter set
+        0x00, 0x00, 0x00, 0x01, 0x06, 0x01, 0x02, 0x80, //
+        // start-code + SPS(7) + start-code + PPS(8) + start-code + IDR slice(5)
+        0x00, 0x00, 0x00, 0x01, 0x67, 0x42, 0x00, 0x1F, 0x8C, 0x8D, 0x40, 0x50, //
         0x00, 0x00, 0x00, 0x01, 0x68, 0xCE, 0x3C, 0x80, //
         0x00, 0x00, 0x00, 0x01, 0x65, 0x88, 0x84, 0x00, 0x10, 0xFF,
     ]
@@ -439,4 +491,14 @@ fn type_registry_matches_spec() {
     assert_eq!(msg_type::CURSOR_SHAPE, 0x40);
     assert_eq!(msg_type::CURSOR_POSITION, 0x41);
     assert_eq!(msg_type::CURSOR_VISIBILITY, 0x42);
+}
+
+/// `Close.reason` values (`OXPROTO.md` §15) are a wire contract too: a peer already deployed
+/// interprets these numerically, so pin them the same way the type registry above is pinned.
+#[test]
+fn close_reason_matches_spec() {
+    assert_eq!(close_reason::NORMAL, 0);
+    assert_eq!(close_reason::GOING_AWAY, 1);
+    assert_eq!(close_reason::IDLE_TIMEOUT, 2);
+    assert_eq!(close_reason::ERROR, 3);
 }
