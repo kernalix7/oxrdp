@@ -13,3 +13,6 @@
 # dev orchestration usage log
 dev/.cloud-usage.tsv
 **/.cloud-usage.tsv
+
+# staging scratch for guest deployment
+.tmp/

@@ -3,8 +3,9 @@
 Snapshot for continuing this project in another tool (e.g. opencode). Everything needed to
 resume is here; the full history is in git (`github.com/kernalix7/oxrdp`, branch `main`).
 
-Last state: **P1 in progress — protocol v1 complete, agent captures, client handshakes.**
-See [Roadmap & next steps](#8-roadmap--next-steps).
+Last state: **P1d done — the agent serves authenticated TLS sessions and streams windows; the
+client connects end to end and models window state. Display architecture decided; P2b (first
+pixels) next.** See [Roadmap & next steps](#8-roadmap--next-steps).
 
 ## 1. TL;DR
 
@@ -16,7 +17,17 @@ See [Roadmap & next steps](#8-roadmap--next-steps).
 - The earlier **RDP-client** stack was built and **validated end-to-end against a real Windows
   guest** (through MCS channel join) before the pivot. It is **shelved** but kept in git; its
   client shells + codec base are reused.
-- Build is green: `cargo test --workspace` = **122 tests**, `cargo clippy --workspace -- -D warnings`
+- **The agent now serves.** TLS with a pinned self-signed identity (`oxsec`), a
+  token-authenticated handshake, and per-window frame streaming with flow control (P1d). **The
+  client connects end to end**: `oxclient` performs the handshake and turns the event stream
+  into an ordered `WindowModel` a display backend can execute against. Neither side has been run
+  against a real Windows guest yet, and nothing presents a pixel — that is P2b.
+- **The client display/render architecture is decided**:
+  [`design/client-display.md`](design/client-display.md) — winit + an x11rb sidecar owns
+  windowing (permanent), a CPU `softbuffer` presenter blits first pixels (P2b), a `wgpu`
+  presenter in a new `oxrender` crate arrives only at P5 (H.264). Supersedes the `DisplayBackend`
+  sketch in `ARCHITECTURE.md` §3.
+- Build is green: `cargo test --workspace` = **179 tests**, `cargo clippy --workspace -- -D warnings`
   clean on Linux *and* on the Windows target, and the agent **cross-compiles from Linux** to
   `x86_64-pc-windows-gnu` (also enforced in CI).
 - A multi-agent **gap audit** (56 verified findings) drove a protocol redesign and a round of
@@ -59,19 +70,39 @@ justified by latency + full control.
 ## 4. Crate map (`crates/`)
 
 Active (new direction):
-- `oxproto` — the protocol: chunk framing (`envelope`), the message registry and all bodies
-  (`message/{control,window,input}.rs`), wire primitives (`wire`). Implements
-  [`design/OXPROTO.md`](design/OXPROTO.md). ✅ 26 unit + 6 robustness tests, plus `fuzz/`.
+- `oxproto` — the protocol: chunk framing (`envelope`, now bounding pre-auth reassembly state to
+  64 pending channels / 64 MiB total — that state is allocated before the handshake), the
+  message registry and all bodies (`message/{control,window,input}.rs`), wire primitives
+  (`wire`). Implements [`design/OXPROTO.md`](design/OXPROTO.md). ✅ 28 unit + 6 robustness tests,
+  plus `fuzz/` (`message`, `reassembly`).
 - `oxtransport` — async chunk IO over any tokio stream; delegates reassembly to
   `oxproto::Reassembler`. ✅ 5 tests including an interleaved-channel head-of-line test.
+- `oxsec` — TLS identity, pinning and token verification for the agent link: a self-signed
+  identity persisted on first run, an SPKI-pin `ServerCertVerifier` used by the client (the pin
+  authenticates, not the hostname), and a constant-time token comparison. Not the old
+  `oxrdp-crypto::TofuVerifier`. ✅ 7 tests.
+- `oxagent` — the Windows guest agent. **No longer a skeleton**: key/value config loading (a
+  wildcard bind address is refused outright), an auth-gated handshake, a per-window frame-pacing
+  budget (drop the oldest unacked frame rather than queue — queueing is the bufferbloat this
+  project exists to avoid), a window registry (protocol ids are never reused within a session),
+  and `serve.rs` — the session driver that streams windows over TLS with flow control. The
+  platform sits behind a `WindowSource` trait, so the driver itself is unit-tested on Linux; only
+  the trait implementation (WGC capture, Win32 enumeration) is Windows-only. Cross-compiles; not
+  yet run inside a guest. ✅ 33 tests.
 - `oxclient` — the Linux client session: handshake, feature negotiation, ping/pong housekeeping,
-  and a `ClientEvent` stream. ✅ 3 tests. Next: drive a display backend with it.
-- `oxagent` — the Windows guest agent. Window enumeration (cloaked/tool/child/shell filtered, DWM
-  extended frame bounds) and WGC per-window capture to BGRA. Cross-compiles; **no listener yet**.
+  and a `ClientEvent` stream (✅ 3 tests, `session.rs`), plus a `WindowModel` that turns that
+  stream into an ordered, backend-independent list of instructions — create/retitle/restack —
+  without retaining frame pixels (✅ 9 tests, `model.rs`). The `oxclient` binary is a bring-up CLI
+  that connects over pinned TLS and prints the event stream, acking frames; it renders nothing
+  (✅ 6 tests, `main.rs`). No display backend is wired in yet — that is P2b.
 
-Reused shells (still skeletons): `oxrdp-render` (wgpu + VA-API), `oxrdp-display` (X11/Wayland),
-`oxrdp-input`. `oxrdp-crypto` holds the old TLS glue — its `TofuVerifier` accepts any certificate
-and **must not** be reused for the agent connection as-is.
+The client display/render architecture is decided but not yet built — see
+[`design/client-display.md`](design/client-display.md). `oxrdp-display`, `oxrdp-render` and
+`oxrdp-input` are **slated for deletion** (empty, pre-pivot skeletons); they are replaced by a
+new `oxdisplay` crate (winit + an x11rb sidecar + a CPU `softbuffer` presenter, created at P2b)
+and a new `oxrender` crate (`wgpu` + VA-API H.264 decode, created at P5, not before). `oxrdp-crypto`
+holds the old TLS glue — its `TofuVerifier` accepts any certificate and **must not** be reused
+for the agent connection; `oxsec` is its replacement.
 
 Shelved (RDP-specific, kept in git): `oxrdp-pdu`'s RDP PDUs — **but its `codec`/`cursor`/`error`
 are the reused base for `oxproto`** — plus `oxrdp-core`, `oxrdp-io`, `oxrdp-cli` (the RDP client
@@ -82,7 +113,7 @@ driver that reached MCS channel join against real Windows).
 ```bash
 # Linux workspace (agent builds as a stub here)
 cargo build --workspace
-cargo test  --workspace                       # 122 tests
+cargo test  --workspace                       # 179 tests
 cargo clippy --workspace --all-targets -- -D warnings
 cargo fmt --all -- --check
 
@@ -92,8 +123,19 @@ cargo build -p oxagent --target x86_64-pc-windows-gnu
 
 cargo clippy -p oxagent --target x86_64-pc-windows-gnu --all-targets -- -D warnings
 
-# Fuzz the protocol decoder (needs nightly; fuzz/ is its own workspace)
+# Run the agent (in the guest). token_path must already contain the shared secret; the TLS
+# identity is generated and persisted on first run at cert_path/key_path. Default bind is
+# 127.0.0.1:7644 — a wildcard address is refused at config-parse time.
+oxagent.exe --print-pin                        # prints the SPKI pin the client must trust, exits
+oxagent.exe --config oxagent.conf              # serves one authenticated session at a time
+
+# Connect the bring-up client CLI from Linux — prints the event stream, acks frames, renders
+# nothing (no display backend exists yet):
+cargo run -p oxclient -- HOST:7644 --pin <spki-hex> --token-file token.txt
+
+# Fuzz the protocol decoder and the reassembler (needs nightly; fuzz/ is its own workspace)
 cargo +nightly fuzz run message
+cargo +nightly fuzz run reassembly
 
 # The shelved RDP client (still works, reaches MCS channel join):
 cargo run -p oxrdp-cli -- 127.0.0.1:3390 WPX-User    # OXRDP_DEBUG=1 for phase/hex logging
@@ -138,33 +180,40 @@ model; not used in favor of the leaner `oxgen.sh` REST path.
 ✅ P1b window enumeration (filtered, DWM frame bounds, DPI-aware) + oxtransport
 ✅ P1c agent capture — WGC per-window BGRA frames (cross-compile-validated, not yet run in a guest)
 ✅ P2a client session — handshake, features, ping/pong, ClientEvent stream
+✅ P1d agent serve — TLS (oxsec) + auth-gated handshake, window registry, per-window frame
+      pacing/flow control, serve.rs session driver (unit-tested on Linux via WindowSource).
+      Client connects end to end and models window state (WindowModel). Neither side has run
+      against a real Windows guest yet.
 
-▶  P1d AGENT SERVE. Give oxagent a listener and stream:
-      1. TLS + auth first (SECURITY.md); bind an explicit interface, never 0.0.0.0.
-      2. TcpListener → accept → ClientHello (constant-time token compare) → ServerHello.
-      3. Window-event thread → WindowOpened/Closed/Geometry/Title on channel 3.
-      4. Capture thread per window → FrameData(RAW_BGRA) on its video channel, through a
-         *bounded* channel so a slow network back-pressures capture.
-      5. Honour FrameAck: at most 2 unacked frames per window; drop stale rather than queue.
-      Deps to add: tokio, oxtransport, rustls (server side), and the runtime model in
-      design/agent-runtime.md.
-
-   P2b CLIENT PRESENT. WindowOpened → a native window (oxrdp-display, X11 first),
-      FrameData(RAW_BGRA) → wgpu texture → present (oxrdp-render). **First end-to-end pixels.**
-      Bring-up target is 800x600 @30fps (~460 Mbit/s); RAW_BGRA does not scale past that.
+▶  P2b CLIENT PRESENT — architecture decided, see design/client-display.md; **wgpu is not part
+      of this milestone**. New `oxdisplay` crate: winit owns the event loop and one native
+      window per remote window (X11 first; an x11rb sidecar sets WM_TRANSIENT_FOR, which winit
+      does not expose); a CPU presenter on `softbuffer` blits FrameData(RAW_BGRA) — a bounded
+      memcpy, no GPU device at all. `oxrdp-display`/`oxrdp-render`/`oxrdp-input` are deleted, not
+      filled in. **First end-to-end pixels.** Bring-up target 800x600@30fps (~460 Mbit/s);
+      RAW_BGRA does not scale past that.
+      Before building it out: spike S1 (winit-X11 multi-toplevel identity + transient-for
+      sidecar smoke test, ~1-2 days) — failure means a native x11rb backend behind the same
+      `Presenter`/`DisplayWindow` trait seam, not a change to the seam itself.
 
    P3  Input round-trip: Linux input → PointerEvent/KeyEvent/TextInput → SendInput on the guest.
        Also WindowControl (close/resize/activate), or the native windows stay puppets.
    P4  Multi-window: SetWinEventHook instead of polling, z-order, icons, app identity → WM_CLASS.
-   P5  Media Foundation H.264 (replace RAW_BGRA), QUIC transport, clipboard/audio.
+       Spike S2 (winit-Wayland identity, transient-for, xdg-toplevel-icon) settles winit vs
+       smithay-client-toolkit for the Wayland backend, needed before this milestone.
+   P5  Media Foundation H.264 (replace RAW_BGRA) via a new `oxrender` crate — a `wgpu` GPU
+       presenter (device built via `wgpu_hal` so DMA-BUF import can be enabled), VA-API decode,
+       an NV12→RGB shader. Spike S3 (VA-API → wgpu upload path: DMA-BUF import vs
+       vaDeriveImage/vaMapBuffer copy, run on the target GPU) settles the upload path and the
+       NVIDIA decision before this is built. QUIC transport, clipboard/audio also land here.
    P6  Latency harness: the protocol already carries captured_us/encoded_us and FrameAck —
        build the measurement rig and publish numbers against FreeRDP. This is the claim the
        whole pivot rests on; it must be measured, not asserted.
 ```
 
-**Before starting P1d**, skim `design/AUDIT-2026-07.md` §agent-capture: it lists the WGC and
-session pitfalls (elevated windows, lock screen, WARP fallback, frame-pool recreation) that will
-otherwise be discovered at runtime in the guest.
+**Before starting P2b**, read [`design/client-display.md`](design/client-display.md) in full —
+it is normative for the `oxdisplay` seam (`DisplayCommand`/`DisplayEvent`/`Presenter` trait), the
+X11-vs-Wayland geometry policy (§4), and cursor handling (§5), not just a decision summary.
 
 ## 9. Key technical learnings (don't relearn these)
 

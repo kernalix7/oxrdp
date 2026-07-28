@@ -50,6 +50,36 @@ git 히스토리에 남기고 **셸빙**; 클라 셸(TLS·전송·wgpu 디코드
   핸들/제목/좌표), windows-gnu 크로스컴파일 검증. `oxtransport`가 tokio 스트림 위로 oxproto
   메시지를 프레이밍(`read_message_bytes`/`write_message`, 64 MiB 가드). `oxproto`가
   `decode`/`encode_vec` 코덱 진입점을 re-export. 90 테스트.
+- **`oxsec` — 에이전트 링크용 TLS.** 최초 실행 시 생성해 디스크에 저장하는 자체서명 에이전트
+  identity, 호스트네임 검증 대신 클라이언트가 쓰는 SPKI-pin `ServerCertVerifier`(pin이 상대를
+  인증하며 이름을 인증하는 게 아님), 핸드셰이크용 상수 시간 토큰 비교. 어떤 인증서든 받아들이는
+  기존 `oxrdp-crypto::TofuVerifier`는 화면을 공유하고 입력을 주입하는 서버를 인증하기엔 부적합해
+  재사용하지 않음. 7개 테스트.
+- **P1d — 에이전트 세션 드라이버.** `oxagent`에 key/value 설정 로더(와일드카드 바인드 주소는
+  기본값으로 피하는 게 아니라 아예 거부), 인증 전에는 메시지 정확히 하나만 받아들이는 인증
+  게이트 핸드셰이크, 가장 오래된 미확인 프레임을 대기시키지 않고 드롭하는 창별 프레임 페이싱
+  버짓(대역폭 저하를 무한 지연으로 바꾸는 큐잉이야말로 이 프로젝트가 피하려는 실패), 세션 동안
+  프로토콜 id가 재사용되지 않는 창 레지스트리(OS는 네이티브 핸들을 재사용하는데, 재사용된 id는
+  잘못된 네이티브 창에 새 픽셀을 그리게 됨), 그리고 이를 엮는 드라이버 `serve.rs`(핸드셰이크·창
+  라이프사이클 diff·페이싱·ack 처리) 추가. 플랫폼은 `WindowSource` 트레이트 뒤에 있어 이 전부가
+  리눅스 빌드 호스트에서 유닛 테스트됨 — 트레이트 구현만 Windows 전용. 리뷰 결과 새로 들어온
+  코드를 추가 하드닝: envelope의 예약 플래그 비트는 이제 거부 대신 무시(전방 호환성), 인증 전에
+  할당되는 재조립 상태는 이제 채널 64개·64 MiB로 상한을 둬 인증 전 메모리 증폭 경로를 차단.
+  33개 테스트.
+- **클라이언트 세션·창 모델·CLI.** `oxclient`에 원시 `ClientEvent` 스트림을 디스플레이 백엔드가
+  실행할 순서 있는 명령 목록 — 이 네이티브 창 생성, 제목 변경, 재스택 — 으로 바꾸는 `WindowModel`
+  추가. 각 백엔드가 프로토콜 메시지를 직접 diff할 필요가 없어짐; 프레임은 크고 비디오 속도로
+  도착하므로 프레임 픽셀은 의도적으로 보관하지 않음. 새 `oxclient` 바이너리는 브링업 CLI —
+  pinned TLS로 에이전트에 연결해 핸드셰이크를 수행하고 이벤트 스트림을 출력하며, 에이전트의
+  페이싱 버짓이 전진하도록 프레임을 ack함. 토큰은 파일에서만 읽음 — `--token`을 커맨드라인에
+  주면 거부(argv는 같은 사용자로 도는 다른 프로세스가 읽을 수 있음). 179개 테스트.
+- **클라이언트 디스플레이/렌더 아키텍처 확정.** `docs/design/client-display.md`가 리눅스
+  클라이언트의 윈도잉·프레젠테이션 스택을 확정: `winit`과 `x11rb` property 사이드카가 네이티브
+  창을 영구적으로 소유, `softbuffer` 기반 CPU presenter가 첫 픽셀(P2b)에서
+  `FrameData(RAW_BGRA)`를 blit — `wgpu`도 GPU 코드도 없음 — H.264 마일스톤(P5)에서만 새
+  `oxrender` 크레이트의 `wgpu` presenter가 들어옴. `docs/ARCHITECTURE.md` §3의 `DisplayBackend`
+  스케치와 `docs/HANDOFF.md`가 전에 담고 있던 "FrameData → wgpu texture" 표현을 대체.
+  `oxrdp-display`·`oxrdp-render`·`oxrdp-input`은 삭제 대상으로 표시(내용을 채우지 않음).
 
 ### Highlights
 

@@ -60,6 +60,41 @@ HW/SW encode, QUIC+TCP transport.
   `oxtransport` frames oxproto messages over any tokio stream (`read_message_bytes` /
   `write_message`, 64 MiB guard). `oxproto` re-exports the `decode` / `encode_vec` codec entry
   points. 90 tests.
+- **`oxsec` — TLS for the agent link.** A self-signed agent identity generated on first run and
+  persisted to disk, an SPKI-pin `ServerCertVerifier` the client uses in place of hostname
+  verification (the pin authenticates the peer, not its name), and a constant-time token
+  comparison for the handshake. Deliberately not the old `oxrdp-crypto::TofuVerifier`, which
+  accepts any certificate and has no place authenticating a server that shares screen content
+  and injects input. 7 tests.
+- **P1d — agent session driver.** `oxagent` gains a key/value config loader (a wildcard bind
+  address is refused outright, not merely defaulted away from), an auth-gated handshake that
+  admits exactly one message before authentication, a per-window frame-pacing budget that drops
+  the oldest unacknowledged frame instead of queueing behind it — queueing turns a bandwidth dip
+  into unbounded latency, the failure this project exists to avoid — a window registry whose
+  protocol ids are never reused within a session (the OS recycles native handles; a recycled id
+  would blit new pixels into the wrong native window), and `serve.rs`, the driver that ties them
+  together: handshake, window-lifecycle diffing, pacing and ack handling. The platform sits
+  behind a `WindowSource` trait, so all of this is unit-tested on the Linux build host; only the
+  trait implementation is Windows-only. A review pass hardened the newly landed code further:
+  reserved envelope flag bits are now ignored rather than rejected, for forward compatibility,
+  and reassembly state — allocated before authentication — is now capped at 64 pending channels
+  and 64 MiB total, closing a pre-auth memory-amplification path. 33 tests.
+- **Client session, window model and CLI.** `oxclient` gains a `WindowModel` that turns the raw
+  `ClientEvent` stream into an ordered list of instructions a display backend executes — create
+  this native window, retitle it, restack it — instead of every backend diffing protocol
+  messages itself; it deliberately does not retain frame pixels, since frames are large and
+  arrive at video rate. A new `oxclient` binary is a bring-up CLI: it connects to the agent over
+  pinned TLS, performs the handshake, and prints the event stream while acking frames so the
+  agent's pacing budget can advance. The token is only ever read from a file — `--token` on the
+  command line is refused, because argv is world-readable. 179 tests.
+- **Client display/render architecture decided.** `docs/design/client-display.md` settles the
+  Linux client's windowing and presentation stack: `winit` plus an `x11rb` property sidecar owns
+  native windows permanently, a CPU presenter on `softbuffer` blits `FrameData(RAW_BGRA)` for
+  first pixels (P2b) — no `wgpu`, no GPU code at all — and a `wgpu` presenter in a new `oxrender`
+  crate arrives only at the H.264 milestone (P5). Supersedes the `DisplayBackend` sketch in
+  `docs/ARCHITECTURE.md` §3 and the "FrameData → wgpu texture" phrasing `docs/HANDOFF.md`
+  previously carried. `oxrdp-display`, `oxrdp-render` and `oxrdp-input` are marked for deletion,
+  not filled in.
 
 ### Highlights (RDP-client era — shelved)
 

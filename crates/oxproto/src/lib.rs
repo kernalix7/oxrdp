@@ -31,6 +31,7 @@
 #![forbid(unsafe_code)]
 
 pub mod envelope;
+pub mod latency;
 pub mod message;
 pub mod wire;
 
