@@ -16,3 +16,6 @@ dev/.cloud-usage.tsv
 
 # staging scratch for guest deployment
 .tmp/
+
+# oxrdp's own Windows guest (disk image, shared folder, generated password)
+.vm/
