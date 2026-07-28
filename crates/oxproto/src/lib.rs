@@ -33,6 +33,7 @@
 pub mod envelope;
 pub mod latency;
 pub mod message;
+pub mod scancode;
 pub mod wire;
 
 /// Codec entry points, re-exported so callers can `oxproto::decode` / `oxproto::encode_vec`

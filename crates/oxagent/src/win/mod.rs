@@ -1,6 +1,7 @@
 //! Windows-only agent internals: window enumeration and per-window capture.
 #![cfg(windows)]
 
+mod appid;
 pub mod capture;
 pub mod enumerate;
 
@@ -168,19 +169,20 @@ impl crate::serve::WindowSource for WinWindowSource {
         live.into_iter()
             // A minimized window has no meaningful geometry and nothing to capture.
             .filter(|w| !w.minimized)
-            .map(|w| crate::serve::SourceWindow {
-                handle: w.hwnd,
-                // TODO(P4): resolve the owning process and its executable name so the client
-                // can set a correct WM_CLASS. Until then every window reports the same app id.
-                pid: 0,
-                app_id: "windows-app".to_string(),
-                title: w.title,
-                x: w.x,
-                y: w.y,
-                width: w.width,
-                height: w.height,
-                // TODO(P4): report the window's real per-monitor DPI.
-                dpi: 96,
+            .map(|w| {
+                let identity = appid::identify(HWND(w.hwnd as *mut core::ffi::c_void));
+                crate::serve::SourceWindow {
+                    handle: w.hwnd,
+                    pid: identity.as_ref().map_or(0, |i| i.pid),
+                    app_id: identity.map_or_else(|| "windows-app".to_string(), |i| i.app_id),
+                    title: w.title,
+                    x: w.x,
+                    y: w.y,
+                    width: w.width,
+                    height: w.height,
+                    // TODO(P4): report the window's real per-monitor DPI.
+                    dpi: 96,
+                }
             })
             .collect()
     }

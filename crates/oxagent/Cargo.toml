@@ -37,6 +37,8 @@ windows = { version = "0.58", features = [
     "Win32_UI_WindowsAndMessaging",
     "Win32_UI_HiDpi",
     "Win32_Graphics_Dwm",
+    # Window -> owning process resolution (app identity / WM_CLASS)
+    "Win32_System_Threading",
     # Input injection (P3)
     "Win32_UI_Input_KeyboardAndMouse",
     # Encoding (P5)
