@@ -63,6 +63,49 @@ where the same setup previously produced twelve to twenty-eight rejections. The 
 log carries the direct proof that B-frames are gone — every delta slice now reports
 `ref_idc=3`, where the rejected frames had been `ref_idc=0` non-reference pictures.
 
+### The capture-to-encode stage, fully accounted for (2026-07-30)
+
+The agent now times every piece of the largest stage. On the guest, release, one run:
+
+```
+tick_to_capture      295 us   (p95 100,916)
+pool_acquire           5 us
+copy_resource         15 us
+map                1,199 us
+readback_copy        953 us
+convert            1,118 us
+process_input        214 us
+process_output        14 us
+                   ------
+sum of medians     3,812 us
+```
+
+The client measured `capture->encode` at 3,720 µs p50 in the same run, so the sum of medians
+lands within 2.5% of the stage it claims to explain. Nothing is unattributed any more.
+
+Two things follow, and the second is more important than the first.
+
+**The GPU readback, not the colour conversion, is the largest cost.** `map` at 1,199 µs plus
+`readback_copy` at 953 µs is 2.15 ms — more than the 1,118 µs conversion. `map` being the bigger
+half is the predicted shape: `CopyResource` only queues GPU work, while `Map` on a staging
+texture must block until it completes, so on a virtualised GPU this is where the wait across the
+boundary appears. That changes what the deferred D3D11 video-processor path is worth: keeping the
+frame on the GPU would remove the map, the readback *and* the conversion together — 3.3 ms of a
+3.7 ms stage — rather than the conversion alone, which is what a SIMD pass would address.
+
+**`tick_to_capture` has a median of 295 µs and a p95 of 100,916 µs.** A 340x spread on the gap
+between the ticker firing and capture starting is not jitter. `drive()` handles the tick in a
+single task: `sync_windows` and then `pump_frames`, both of which `await` socket writes. So a
+send that blocks stalls the loop, and the next tick's capture is delayed behind it — for every
+window, not just the one that was slow.
+
+That makes the unexplained `encode->arrival` tail and these capture stalls candidates for being
+**one phenomenon rather than two**: a slow send delays the next capture, which delays the next
+send. Four separate explanations for that tail have now been eliminated inside the transport
+stage; this is the first evidence that the coupling lives outside it, in the agent's own loop
+structure. It is an architecture question — capture, encode and send are one serial decision —
+rather than a tuning one.
+
 ### Latency, measured for the first time (2026-07-29)
 
 This project exists because RDP has structural latency limits a purpose-built protocol can beat.
