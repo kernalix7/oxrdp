@@ -212,6 +212,21 @@ pub fn run_agent(config: &AgentConfig, print_pin: bool) -> ExitCode {
                             continue;
                         }
                     };
+                    // The protocol's whole reason to exist is latency; Nagle's algorithm fights
+                    // that on a link that mixes small control/input messages with bulk frame
+                    // data — the client already disables it (`oxclient/src/main.rs`) for the
+                    // same reason, but this is the side that sends the frames, which is the
+                    // worse side to leave it on. A guest measurement found the classic Nagle /
+                    // delayed-ACK stall (~40ms, both peers' default) dominating this session's
+                    // p95/p99 end-to-end latency while leaving the median untouched — exactly
+                    // the signature of a stream alternating small writes with an occasional
+                    // large one, which every window's frame stream is. Logged and not fatal: a
+                    // session with Nagle still enabled is degraded, not unusable, and dropping
+                    // an otherwise-good connection over one socket option would be a worse
+                    // outcome than the option itself.
+                    if let Err(e) = tcp.set_nodelay(true) {
+                        eprintln!("oxagent: {peer}: set_nodelay failed (continuing degraded): {e}");
+                    }
 
                     // Reject before spending a TLS accept's worth of work on a connection that
                     // has nowhere to go: with `PRE_AUTH_CONCURRENCY` already saturated,
