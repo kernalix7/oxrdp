@@ -63,6 +63,43 @@ where the same setup previously produced twelve to twenty-eight rejections. The 
 log carries the direct proof that B-frames are gone — every delta slice now reports
 `ref_idc=3`, where the rejected frames had been `ref_idc=0` non-reference pictures.
 
+### Latency, measured for the first time (2026-07-29)
+
+This project exists because RDP has structural latency limits a purpose-built protocol can beat.
+That claim had never been checked. It has now, against the live guest, release builds on both
+sides, 426 frames presented:
+
+```
+capture->encode  p50   5,845 us
+encode->arrival  p50   3,419 us   p95  46,347   p99  50,347   (+/- clock error)
+arrival->decode  p50   5,863 us
+decode->present  p50   1,501 us
+client total     p50   7,299 us
+END TO END       p50  18,205 us   p95  60,025   p99  66,211
+```
+
+**18 ms median, capture to present** — through a VM port forward, with a software H.264 encoder
+and a software decoder, and no GPU anywhere in the path. The tail is the finding: p95 and p99 are
+three times the median, and almost all of it sits in `encode->arrival`, the transport hop, which
+has no business costing 46 ms over loopback. That is where to look next, not at the codec.
+
+Three things this measurement establishes beyond the numbers:
+
+- **The client sent no pings and discarded every pong.** `ClockSync` had never had any data, so
+  no offset could ever have been computed. Wiring it up was not enough; the exchange it depends
+  on did not exist.
+- **Build profile dominates everything.** The same measurement on debug builds reported
+  `arrival->decode` at 75 ms where release reports 5.9 ms, and put the bottleneck in a completely
+  different stage. A latency figure without its build profile is not a figure.
+- **Only one of the four stages crosses clocks.** Capture-to-encode, arrival-to-decode and
+  decode-to-present are each differences between two readings of the same clock, so they are
+  exact regardless of how far apart the two ends' clocks are; only `encode->arrival` and the
+  total inherit the offset error, and the report prints the round trip so a reader can size it.
+
+It measures **capture to present**, and says so in its own header. The guest's compositor before
+capture and the local display server after present are outside every process involved; a real
+glass-to-glass figure needs a camera pointed at two screens.
+
 ### Security (2026-07-28)
 
 An adversarial review of the agent's network-facing surface, prompted by input injection
