@@ -19,6 +19,15 @@
 //!   sheared image.
 //! - Each `Direct3D11CaptureFrame` is dropped at the end of the iteration; holding frames
 //!   starves the pool.
+//! - **The readback is timed and split, permanently.** A guest latency measurement found
+//!   `capture->encode` costing roughly 6ms more than the H.264 encoder's own colour conversion
+//!   and compute (`crate::win::encode`) could account for, with nobody having looked at capture
+//!   itself. `try_next_frame` times the frame-pool acquire, the GPU-side copy, the CPU-blocking
+//!   `Map`, and the actual row-by-row memcpy separately, for the first `DIAGNOSTIC_FRAME_LIMIT`
+//!   frames of every window — the leading suspect going in was `Map`, which is where a staging
+//!   texture readback actually pays the cost of crossing the PCIe boundary on a virtualised GPU,
+//!   but the log says what it says rather than what was expected, the same way this project's
+//!   last two latency guesses both turned out to need correcting by the data.
 
 use windows::core::{Interface, Result as WinResult};
 use windows::Graphics::Capture::{
@@ -74,7 +83,19 @@ pub struct WindowCapture {
     staging: Option<(ID3D11Texture2D, u32, u32)>,
     /// Size the frame pool is currently configured for.
     pool_size: SizeInt32,
+    /// Native handle, kept only for `DIAGNOSTIC_FRAME_LIMIT` logging.
+    handle: isize,
+    /// How many frames this instance has captured so far, counted only up to
+    /// `DIAGNOSTIC_FRAME_LIMIT`.
+    frames_seen: u32,
 }
+
+/// How many frames, per [`WindowCapture`], to log the readback timing split of — the same
+/// bounded, permanent-diagnostic shape as `crate::win::encode`'s constant of the same name, and
+/// `crate::serve`'s `CAPTURE_DIAGNOSTIC_FRAME_LIMIT`, kept local rather than shared since each
+/// lives on a different side of a Windows/platform-independent boundary this crate otherwise
+/// keeps strict.
+const DIAGNOSTIC_FRAME_LIMIT: u32 = 100;
 
 impl WindowCapture {
     /// Begin capturing `hwnd`.
@@ -115,6 +136,8 @@ impl WindowCapture {
             d3d_device,
             staging: None,
             pool_size,
+            handle: hwnd.0 as isize,
+            frames_seen: 0,
         })
     }
 
@@ -139,11 +162,13 @@ impl WindowCapture {
         // empty pool as an error is worse: the caller drops the capture and rebuilds it on the
         // next tick, so the pool is destroyed before it can ever fill, and the stream produces
         // exactly zero frames forever while looking busy.
+        let pool_acquire_start = std::time::Instant::now();
         let frame = match self.frame_pool.TryGetNextFrame() {
             Ok(frame) => frame,
             Err(e) if e.code().is_ok() || e.code() == E_POINTER => return Ok(None),
             Err(e) => return Err(e),
         };
+        let pool_acquire_us = pool_acquire_start.elapsed().as_micros() as u64;
 
         // A resized window changes ContentSize; the pool must be rebuilt or every later
         // frame is captured at the stale size.
@@ -171,18 +196,29 @@ impl WindowCapture {
         unsafe { texture.GetDesc(&mut desc) };
 
         let staging = self.staging_texture(&desc)?;
+        let copy_start = std::time::Instant::now();
         // SAFETY: both resources are valid and have identical descriptions apart from usage.
         unsafe { self.context.CopyResource(&staging, &texture) };
+        let copy_resource_us = copy_start.elapsed().as_micros() as u64;
 
         let mut mapped = D3D11_MAPPED_SUBRESOURCE::default();
+        let map_start = std::time::Instant::now();
         // SAFETY: staging texture is CPU-readable; unmapped below on every path.
         unsafe {
             self.context
                 .Map(&staging, 0, D3D11_MAP_READ, 0, Some(&mut mapped))?
         };
+        // `Map` on a staging texture is where a GPU→CPU readback actually pays for itself: it
+        // has to wait for `CopyResource`'s GPU-side work to finish before the mapping can be
+        // handed back, which on a virtualised GPU means a PCIe-boundary DMA wait `CopyResource`
+        // issuing the copy does not itself incur. Timed separately from `CopyResource` for
+        // exactly that reason — the two calls have very different cost profiles even though
+        // they are both "the readback" from outside this function.
+        let map_us = map_start.elapsed().as_micros() as u64;
 
         let row_bytes = desc.Width as usize * 4;
         let mut bgra = vec![0u8; row_bytes * desc.Height as usize];
+        let readback_copy_start = std::time::Instant::now();
         // SAFETY: `pData` points to at least `RowPitch * Height` bytes; we copy exactly
         // `row_bytes` per row, which is <= RowPitch.
         unsafe {
@@ -195,6 +231,19 @@ impl WindowCapture {
                 );
             }
             self.context.Unmap(&staging, 0);
+        }
+        let readback_copy_us = readback_copy_start.elapsed().as_micros() as u64;
+
+        if self.frames_seen < DIAGNOSTIC_FRAME_LIMIT {
+            self.frames_seen += 1;
+            eprintln!(
+                "oxagent: capture: window={:#x} frame={} pool_acquire_us={pool_acquire_us} \
+                 copy_resource_us={copy_resource_us} map_us={map_us} \
+                 readback_copy_us={readback_copy_us} total_capture_us={}",
+                self.handle,
+                self.frames_seen,
+                pool_acquire_us + copy_resource_us + map_us + readback_copy_us
+            );
         }
 
         Ok(Some(Frame {

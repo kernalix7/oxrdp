@@ -138,7 +138,16 @@ struct WindowStream {
     /// keyframe is actually sent. Meaningless, and untouched, for `RAW_BGRA`, which has no such
     /// concept.
     needs_keyframe: bool,
+    /// How many `tick_to_capture_us` samples have been logged for this window so far, counted
+    /// only up to `CAPTURE_DIAGNOSTIC_FRAME_LIMIT` — see `pump_frames`.
+    capture_diag_logged: u32,
 }
+
+/// How many `tick_to_capture_us` samples, per window, to log — the same bounded,
+/// permanent-diagnostic shape as `crate::win::encode`'s `DIAGNOSTIC_FRAME_LIMIT`, kept as its
+/// own constant rather than shared: this one lives on the platform-independent side and measures
+/// scheduling delay within `pump_frames` itself, not anything about the encoder.
+const CAPTURE_DIAGNOSTIC_FRAME_LIMIT: u32 = 100;
 
 /// Tracks which kinds of input this session has already logged the first occurrence of.
 ///
@@ -482,8 +491,23 @@ where
             }
 
             _ = ticker.tick() => {
+                // Taken here, not inside `pump_frames`, so a later window's
+                // `tick_to_capture_us` also reflects `sync_windows`' own cost this tick, not
+                // just the windows processed before it — the gap `pump_frames`'s doc means by
+                // "the tick firing", not just "this function being entered".
+                let tick_started = Instant::now();
                 sync_windows(writer, source, encoder, registry, streams, params).await?;
-                pump_frames(writer, source, encoder, streams, started, acks_enabled, codec).await?;
+                pump_frames(
+                    writer,
+                    source,
+                    encoder,
+                    streams,
+                    started,
+                    tick_started,
+                    acks_enabled,
+                    codec,
+                )
+                .await?;
             }
         }
     }
@@ -578,6 +602,7 @@ where
                     // time to a client that only just attached, whether or not the window
                     // itself is new. `RAW_BGRA` ignores this field entirely.
                     needs_keyframe: true,
+                    capture_diag_logged: 0,
                 },
             );
             continue;
@@ -712,6 +737,14 @@ where
 /// Even on the `H264` path, a submitted frame may have nothing ready to send this tick — a real
 /// encoder's output can lag its input by a frame or more, so "captured a frame" and "have
 /// something to send" are not the same event once a codec is doing real work.
+///
+/// `tick_started` is when this tick fired, taken by the caller before `sync_windows` — a guest
+/// measurement found `capture->encode` costing roughly 6ms more than the encoder's own conversion
+/// and compute could account for, and nobody had checked whether any of that was scheduling delay
+/// inside this loop rather than the capture call itself. `tick_to_capture_us`, logged per window
+/// right before `source.next_frame`, answers that: near-zero for the first window processed each
+/// tick, and rising for later ones exactly to the extent earlier windows' work delayed them —
+/// which is real, attributable cost, not measurement noise.
 #[allow(clippy::too_many_arguments)]
 async fn pump_frames<W, WR, E>(
     writer: &mut WR,
@@ -719,6 +752,7 @@ async fn pump_frames<W, WR, E>(
     encoder: &mut E,
     streams: &mut HashMap<u32, WindowStream>,
     started: Instant,
+    tick_started: Instant,
     acks_enabled: bool,
     codec: u8,
 ) -> io::Result<()>
@@ -752,10 +786,19 @@ where
         if acks_enabled && !stream.budget.has_headroom() {
             // Still capture: `on_captured` displaces the stale frame rather than queueing.
         }
+        let tick_to_capture_us = tick_started.elapsed().as_micros() as u64;
         let Some(frame) = source.next_frame(stream.handle) else {
             continue;
         };
         let captured_us = elapsed_us(started);
+
+        if stream.capture_diag_logged < CAPTURE_DIAGNOSTIC_FRAME_LIMIT {
+            stream.capture_diag_logged += 1;
+            eprintln!(
+                "oxagent: capture: window={:#x} frame={} tick_to_capture_us={tick_to_capture_us}",
+                stream.handle, stream.capture_diag_logged
+            );
+        }
 
         // Submitted before the `failed` check below so a construction failure discovered on
         // *this* call already routes this very frame through the fallback, rather than losing
