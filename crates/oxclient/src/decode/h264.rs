@@ -32,6 +32,10 @@ pub struct H264Decoder {
     inner: OpenH264Decoder,
     /// Set until a frame that can start a GOP arrives; frames are dropped while it holds.
     awaiting_keyframe: bool,
+    /// Whether the §9.1 parameter-set violation has already been reported for this stream.
+    warned_about_parameter_sets: bool,
+    /// Frames discarded since this decoder last held a usable reference picture.
+    dropped_while_resyncing: u32,
 }
 
 impl H264Decoder {
@@ -48,6 +52,8 @@ impl H264Decoder {
         Ok(Self {
             inner,
             awaiting_keyframe: true,
+            warned_about_parameter_sets: false,
+            dropped_while_resyncing: 0,
         })
     }
 
@@ -55,6 +61,43 @@ impl H264Decoder {
     #[must_use]
     pub fn awaiting_keyframe(&self) -> bool {
         self.awaiting_keyframe
+    }
+
+    /// Says what a rejected access unit actually contained.
+    ///
+    /// A codec error code says only that something was refused. What is needed to find the bug
+    /// is the shape of the access unit that was refused — which NAL units, in what order, how
+    /// big — because that is what shows whether the encoder sent something `OXPROTO.md` §9.1
+    /// does not allow. Only on the rejection path, and at debug level, so a healthy stream stays
+    /// silent.
+    fn report_rejection(&mut self, frame: &FrameData) {
+        log::debug!(
+            "window {} frame {} rejected: {} bytes, keyframe={}, contents: {}",
+            frame.window_id,
+            frame.frame_id,
+            frame.data.len(),
+            frame.is_keyframe(),
+            annexb::describe(&frame.data)
+        );
+
+        // Parameter sets on a non-keyframe are forbidden by §9.1, and an encoder that emits them
+        // will keep doing it, so this is worth saying out loud rather than leaving in a debug
+        // log. Once per decoder: a periodic fault would otherwise repeat forever.
+        if !frame.is_keyframe()
+            && !self.warned_about_parameter_sets
+            && annexb::has_parameter_sets(&frame.data)
+        {
+            self.warned_about_parameter_sets = true;
+            log::warn!(
+                "window {} frame {} carries parameter sets on a non-keyframe, which \
+                 OXPROTO.md §9.1 forbids: {}",
+                frame.window_id,
+                frame.frame_id,
+                annexb::describe(&frame.data)
+            );
+        }
+
+        dump_rejected(frame);
     }
 }
 
@@ -71,7 +114,22 @@ impl Decoder for H264Decoder {
             // headers are the bitstream's own answer; either is enough, so a mislabelled
             // keyframe does not strand the window, but neither is relaxed to "intra".
             if !(frame.is_keyframe() || annexb::contains_idr(&frame.data)) {
+                self.dropped_while_resyncing = self.dropped_while_resyncing.saturating_add(1);
                 return Ok(None);
+            }
+            // What a rejection actually costs is not one frame — it is every frame until the
+            // agent's next keyframe, because nothing in between can be decoded without the
+            // reference picture that was lost. A periodic encoder fault therefore does far more
+            // visible damage than its period suggests, and that is worth saying rather than
+            // leaving to be inferred from a window that looks frozen.
+            if self.dropped_while_resyncing > 0 {
+                log::debug!(
+                    "window {} resynchronised at frame {} after discarding {} frames",
+                    frame.window_id,
+                    frame.frame_id,
+                    self.dropped_while_resyncing
+                );
+                self.dropped_while_resyncing = 0;
             }
             self.awaiting_keyframe = false;
         }
@@ -134,12 +192,33 @@ impl Decoder for H264Decoder {
                 data,
             })),
             Err(error) => {
+                self.report_rejection(&frame);
                 // One bad frame is not a dead session: drop the reference chain and wait for the
                 // agent's next keyframe rather than predicting from a picture we do not have.
                 self.awaiting_keyframe = true;
                 Err(error)
             }
         }
+    }
+}
+
+/// Writes a rejected access unit to `$OXCLIENT_DUMP_REJECTED/window-<id>-frame-<id>.h264`.
+///
+/// The NAL summary says what the access unit was made of; this hands over the bytes themselves,
+/// for when that is not enough and the question becomes what is *inside* a NAL rather than which
+/// ones are present. Off unless the variable is set, and failures to write are ignored — a
+/// debugging aid must never be able to make the session worse than the bug it is chasing.
+fn dump_rejected(frame: &FrameData) {
+    let Ok(directory) = std::env::var("OXCLIENT_DUMP_REJECTED") else {
+        return;
+    };
+    let path = std::path::Path::new(&directory).join(format!(
+        "window-{}-frame-{}.h264",
+        frame.window_id, frame.frame_id
+    ));
+    match std::fs::write(&path, &frame.data) {
+        Ok(()) => log::debug!("wrote the rejected access unit to {}", path.display()),
+        Err(error) => log::debug!("could not write {}: {error}", path.display()),
     }
 }
 

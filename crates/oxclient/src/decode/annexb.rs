@@ -42,6 +42,99 @@ pub fn contains_idr(data: &[u8]) -> bool {
     false
 }
 
+/// Sequence parameter set.
+const NAL_SPS: u8 = 7;
+/// Picture parameter set.
+const NAL_PPS: u8 = 8;
+
+/// Every NAL unit in an Annex-B payload: its type, and its length in bytes with the header
+/// included and the start code excluded.
+///
+/// Allocates, so this is for diagnostics rather than the decode path.
+#[must_use]
+pub fn units(data: &[u8]) -> Vec<(u8, usize)> {
+    let mut starts = Vec::new();
+    let mut index = 0;
+    while index + 3 < data.len() {
+        if data[index] == 0 && data[index + 1] == 0 && data[index + 2] == 1 {
+            starts.push(index + 3);
+            index += 4;
+        } else {
+            index += 1;
+        }
+    }
+
+    starts
+        .iter()
+        .enumerate()
+        .map(|(position, &start)| {
+            // A unit runs to the start code of the next one. That start code is three bytes,
+            // with a fourth leading zero when the encoder used the long form, and both have to
+            // be excluded or every length is reported three or four bytes too long.
+            let end = starts.get(position + 1).map_or(data.len(), |&next| {
+                let short = next.saturating_sub(3);
+                if short > start && data[short - 1] == 0 {
+                    short - 1
+                } else {
+                    short
+                }
+            });
+            (data[start] & 0x1f, end.saturating_sub(start))
+        })
+        .collect()
+}
+
+/// Whether an Annex-B payload carries a sequence or picture parameter set.
+///
+/// `OXPROTO.md` §9.1 allows these only on a keyframe, so a non-keyframe for which this is true
+/// is an encoder bug rather than something a decoder should accommodate.
+#[must_use]
+pub fn has_parameter_sets(data: &[u8]) -> bool {
+    units(data)
+        .into_iter()
+        .any(|(nal_type, _)| nal_type == NAL_SPS || nal_type == NAL_PPS)
+}
+
+/// A one-line summary of what an access unit contains: NAL types in order, with lengths.
+///
+/// This is what turns "the decoder was unhappy" into "the decoder was unhappy about *this*".
+/// A codec error code says only that something was rejected; the shape of the access unit is
+/// what says whether the encoder sent something it should not have.
+#[must_use]
+pub fn describe(data: &[u8]) -> String {
+    let units = units(data);
+    if units.is_empty() {
+        return format!("no NAL units in {} bytes", data.len());
+    }
+    units
+        .into_iter()
+        .map(|(nal_type, len)| format!("{}({len})", name(nal_type)))
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// The H.264 name for a NAL unit type, for the ones worth naming.
+fn name(nal_type: u8) -> String {
+    match nal_type {
+        1 => "slice".to_string(),
+        2..=4 => format!("partition-{nal_type}"),
+        5 => "IDR".to_string(),
+        6 => "SEI".to_string(),
+        7 => "SPS".to_string(),
+        8 => "PPS".to_string(),
+        9 => "AUD".to_string(),
+        10 => "end-of-sequence".to_string(),
+        11 => "end-of-stream".to_string(),
+        12 => "filler".to_string(),
+        13 => "SPS-extension".to_string(),
+        14 => "prefix".to_string(),
+        15 => "subset-SPS".to_string(),
+        19 => "auxiliary-slice".to_string(),
+        20 => "slice-extension".to_string(),
+        other => format!("type-{other}"),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -102,6 +195,60 @@ mod tests {
             0, 0, 0, 1, 0x68, 0xce, 0x3c, 0x80, // PPS
         ];
         assert!(!contains_idr(&parameter_sets));
+    }
+
+    #[test]
+    fn units_report_each_nal_type_and_length() {
+        // A keyframe in the layout §9.1 mandates. Lengths are the NAL unit itself: header byte
+        // included, start code excluded. Getting that wrong by the three or four bytes of the
+        // next start code is the obvious way for this to be quietly useless.
+        let access_unit = [
+            0, 0, 0, 1, 0x67, 0x42, 0x00, 0x1e, // SPS, 4 bytes
+            0, 0, 0, 1, 0x68, 0xce, 0x3c, // PPS, 3 bytes
+            0, 0, 1, 0x65, 0x88, 0x84, 0x21, 0x11, // IDR, 5 bytes, short start code
+        ];
+
+        assert_eq!(units(&access_unit), vec![(7, 4), (8, 3), (5, 5)]);
+    }
+
+    #[test]
+    fn describe_names_the_units_in_order() {
+        let access_unit = [
+            0, 0, 0, 1, 0x09, 0x10, // AUD
+            0, 0, 0, 1, 0x67, 0x42, 0x00, 0x1e, // SPS
+            0, 0, 0, 1, 0x68, 0xce, 0x3c, // PPS
+            0, 0, 0, 1, 0x65, 0x88, 0x84, // IDR
+        ];
+
+        assert_eq!(describe(&access_unit), "AUD(2) SPS(4) PPS(3) IDR(3)");
+    }
+
+    #[test]
+    fn describe_says_so_when_there_is_nothing_to_describe() {
+        // A payload with no start codes at all is itself the finding.
+        assert_eq!(
+            describe(&[0xde, 0xad, 0xbe, 0xef]),
+            "no NAL units in 4 bytes"
+        );
+        assert_eq!(describe(&[]), "no NAL units in 0 bytes");
+    }
+
+    #[test]
+    fn describe_names_unknown_types_rather_than_hiding_them() {
+        assert_eq!(describe(&[0, 0, 0, 1, 0x18, 0x00]), "type-24(2)");
+    }
+
+    #[test]
+    fn parameter_sets_are_detected_for_the_rule_that_forbids_them() {
+        // §9.1 allows these only on a keyframe, so this is what makes an encoder that repeats
+        // them on a delta frame visible rather than merely suspected.
+        let with_sps = [0, 0, 0, 1, 0x67, 0x42, 0, 0, 0, 1, 0x41, 0x9a];
+        let with_pps = [0, 0, 0, 1, 0x68, 0xce, 0, 0, 0, 1, 0x41, 0x9a];
+        let delta_only = [0, 0, 0, 1, 0x41, 0x9a, 0x00];
+
+        assert!(has_parameter_sets(&with_sps));
+        assert!(has_parameter_sets(&with_pps));
+        assert!(!has_parameter_sets(&delta_only));
     }
 
     #[test]
