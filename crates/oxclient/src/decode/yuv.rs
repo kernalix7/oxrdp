@@ -89,29 +89,183 @@ pub fn i420_to_bgra(planes: I420Planes<'_>) -> Option<Vec<u8>> {
         return None;
     }
     let len = planes.width.checked_mul(planes.height)?.checked_mul(4)?;
-    let mut bgra = Vec::with_capacity(len);
+    // Zeroed rather than `with_capacity` + push: allocating the whole output up front lets the
+    // row loop write through a slice, which is what removes the per-byte capacity check and the
+    // per-pixel bounds check. Large zeroed allocations come from the allocator as untouched
+    // pages, so this is not a memset the old path avoided — the pages are faulted in on write
+    // either way.
+    let mut bgra = vec![0u8; len];
 
-    // Scalar on purpose. This is the hot loop of the decode path (~2 MB of output per 800x600
-    // frame) and the obvious next step is 8 pixels at a time with `wide` or `std::simd`, reading
-    // one chroma sample per two luma samples. Do that here, behind this same signature, once
-    // there is a profile that says it matters — not before, and not with hand-written intrinsics.
+    convert_picture(planes, &mut bgra);
+    Some(bgra)
+}
+
+/// Converts a whole picture, eight pixels at a time where the CPU allows it.
+///
+/// `multiversion` compiles this once per target below and picks between them **at run time**,
+/// from what the CPU actually reports — so one binary runs on a machine without AVX2 and still
+/// uses AVX2 on a machine that has it. Compiling the whole crate with `-C target-feature=+avx2`
+/// would be the other way to reach those instructions, and it is the wrong way: the binary then
+/// dies with an illegal instruction on any older CPU.
+///
+/// The dispatch happens once per picture, not per row and certainly not per pixel. The row
+/// helper is `#[inline(always)]` so it is compiled into each target's clone and inherits that
+/// clone's instruction set; a helper that is merely `#[inline]` would silently be built once, at
+/// baseline, and the SIMD would evaporate.
+///
+/// No `unsafe` appears here or anywhere in this crate: `multiversion` generates the feature
+/// dispatch and `wide` wraps the vector types, and `oxclient` keeps `#![forbid(unsafe_code)]`,
+/// which the compiler enforces against macro-generated code too.
+#[multiversion::multiversion(targets("x86_64+avx2", "x86_64+sse4.1", "aarch64+neon"))]
+fn convert_picture<'planes>(planes: I420Planes<'planes>, out: &mut [u8]) {
+    let chroma_width = planes.width.div_ceil(2);
     for row in 0..planes.height {
-        let y_row = row * planes.y_stride;
-        let u_row = (row / 2) * planes.u_stride;
-        let v_row = (row / 2) * planes.v_stride;
-        for col in 0..planes.width {
-            let luma = Y_SCALE * (i32::from(planes.y[y_row + col]) - 16);
-            let cb = i32::from(planes.u[u_row + col / 2]) - 128;
-            let cr = i32::from(planes.v[v_row + col / 2]) - 128;
-            bgra.push(clamp_u8(luma + B_U * cb));
-            bgra.push(clamp_u8(luma + G_U * cb + G_V * cr));
-            bgra.push(clamp_u8(luma + R_V * cr));
-            // Opaque. The presenter's target is softbuffer's `0x00RRGGBB`, whose top byte is
-            // ignored, and the RAW_BGRA frames the agent already sends carry 0xFF here.
-            bgra.push(0xff);
+        let luma = &planes.y[row * planes.y_stride..][..planes.width];
+        let cb = &planes.u[(row / 2) * planes.u_stride..][..chroma_width];
+        let cr = &planes.v[(row / 2) * planes.v_stride..][..chroma_width];
+        let out = &mut out[row * planes.width * 4..][..planes.width * 4];
+        convert_row_vector(luma, cb, cr, out);
+    }
+}
+
+/// Eight pixels per step: eight luma samples against four chroma samples.
+///
+/// The arithmetic is the same Q16 fixed point as [`convert_row`], lane for lane, so the output is
+/// **bit-identical** to the scalar reference rather than merely close — which is what lets the
+/// tests assert equality instead of a tolerance, and keeps a frame from looking different on two
+/// machines. Floating-point lanes would have been faster to write and would have given up both.
+#[inline(always)]
+fn convert_row_vector(luma: &[u8], cb: &[u8], cr: &[u8], out: &mut [u8]) {
+    use wide::i32x8;
+
+    const SHIFT: i32 = 16;
+    let scale = i32x8::from([Y_SCALE; 8]);
+    let half = i32x8::from([HALF; 8]);
+    let floor = i32x8::from([0; 8]);
+    let ceiling = i32x8::from([255; 8]);
+    let blue_u = i32x8::from([B_U; 8]);
+    let green_u = i32x8::from([G_U; 8]);
+    let green_v = i32x8::from([G_V; 8]);
+    let red_v = i32x8::from([R_V; 8]);
+
+    let mut octets = out.chunks_exact_mut(32);
+    for (((out, luma), cb), cr) in octets
+        .by_ref()
+        .zip(luma.chunks_exact(8))
+        .zip(cb.chunks_exact(4))
+        .zip(cr.chunks_exact(4))
+    {
+        let y = i32x8::from([
+            i32::from(luma[0]) - 16,
+            i32::from(luma[1]) - 16,
+            i32::from(luma[2]) - 16,
+            i32::from(luma[3]) - 16,
+            i32::from(luma[4]) - 16,
+            i32::from(luma[5]) - 16,
+            i32::from(luma[6]) - 16,
+            i32::from(luma[7]) - 16,
+        ]) * scale;
+        // Each chroma sample covers two pixels, so it occupies two lanes.
+        let u = i32x8::from([
+            i32::from(cb[0]) - 128,
+            i32::from(cb[0]) - 128,
+            i32::from(cb[1]) - 128,
+            i32::from(cb[1]) - 128,
+            i32::from(cb[2]) - 128,
+            i32::from(cb[2]) - 128,
+            i32::from(cb[3]) - 128,
+            i32::from(cb[3]) - 128,
+        ]);
+        let v = i32x8::from([
+            i32::from(cr[0]) - 128,
+            i32::from(cr[0]) - 128,
+            i32::from(cr[1]) - 128,
+            i32::from(cr[1]) - 128,
+            i32::from(cr[2]) - 128,
+            i32::from(cr[2]) - 128,
+            i32::from(cr[3]) - 128,
+            i32::from(cr[3]) - 128,
+        ]);
+
+        let blue = ((y + u * blue_u + half) >> SHIFT)
+            .max(floor)
+            .min(ceiling)
+            .to_array();
+        let green = ((y + u * green_u + v * green_v + half) >> SHIFT)
+            .max(floor)
+            .min(ceiling)
+            .to_array();
+        let red = ((y + v * red_v + half) >> SHIFT)
+            .max(floor)
+            .min(ceiling)
+            .to_array();
+
+        for (lane, pixel) in out.chunks_exact_mut(4).enumerate() {
+            pixel[0] = blue[lane] as u8;
+            pixel[1] = green[lane] as u8;
+            pixel[2] = red[lane] as u8;
+            pixel[3] = 0xff;
         }
     }
-    Some(bgra)
+
+    // Whatever is left of the row — up to seven pixels, and possibly an odd one — goes through
+    // the scalar reference. This is the arithmetic that a "the vector width divides the row"
+    // assumption gets wrong, so it is not reimplemented here.
+    let whole = luma.len() - luma.len() % 8;
+    if whole < luma.len() {
+        convert_row(
+            &luma[whole..],
+            &cb[whole / 2..],
+            &cr[whole / 2..],
+            octets.into_remainder(),
+        );
+    }
+}
+
+/// Converts one row, scalar: the reference implementation and the fallback.
+///
+/// This is what the vector path is checked against, and what runs on any target the dispatch
+/// above has no clone for, so it stays a complete implementation rather than an odd-pixel helper.
+///
+/// Written pairwise because 4:2:0 is pairwise: two luma samples share one chroma sample, so the
+/// three chroma-dependent products are computed once per two pixels instead of six times. The
+/// iterators are zipped rather than indexed so the bounds checks fall away.
+fn convert_row(luma: &[u8], cb: &[u8], cr: &[u8], out: &mut [u8]) {
+    debug_assert_eq!(out.len(), luma.len() * 4);
+
+    let mut pairs = out.chunks_exact_mut(8);
+    for (((out, luma), &cb), &cr) in pairs.by_ref().zip(luma.chunks_exact(2)).zip(cb).zip(cr) {
+        let (blue, green, red) = chroma_offsets(cb, cr);
+        for (pixel, &luma) in out.chunks_exact_mut(4).zip(luma) {
+            write_pixel(pixel, luma, blue, green, red);
+        }
+    }
+
+    // An odd width leaves one pixel, which shares the last chroma column with the pixel before
+    // it. This is the case that a "vector width divides the row" assumption gets wrong.
+    let tail = pairs.into_remainder();
+    if !tail.is_empty() {
+        let last = cb.len() - 1;
+        let (blue, green, red) = chroma_offsets(cb[last], cr[last]);
+        write_pixel(tail, luma[luma.len() - 1], blue, green, red);
+    }
+}
+
+/// The three chroma-dependent terms, computed once per chroma sample.
+fn chroma_offsets(cb: u8, cr: u8) -> (i32, i32, i32) {
+    let cb = i32::from(cb) - 128;
+    let cr = i32::from(cr) - 128;
+    (B_U * cb, G_U * cb + G_V * cr, R_V * cr)
+}
+
+fn write_pixel(pixel: &mut [u8], luma: u8, blue: i32, green: i32, red: i32) {
+    let luma = Y_SCALE * (i32::from(luma) - 16);
+    pixel[0] = clamp_u8(luma + blue);
+    pixel[1] = clamp_u8(luma + green);
+    pixel[2] = clamp_u8(luma + red);
+    // Opaque. The presenter's target is softbuffer's `0x00RRGGBB`, whose top byte is ignored,
+    // and the RAW_BGRA frames the agent already sends carry 0xFF here.
+    pixel[3] = 0xff;
 }
 
 fn clamp_u8(q16: i32) -> u8 {
@@ -142,6 +296,124 @@ mod tests {
             v_stride: width.div_ceil(2),
         })
         .expect("planes match the declared geometry")
+    }
+
+    /// The scalar path alone, row by row — what the vector path must reproduce exactly.
+    fn scalar_reference(planes: I420Planes<'_>) -> Vec<u8> {
+        let mut out = vec![0u8; planes.width * planes.height * 4];
+        let chroma_width = planes.width.div_ceil(2);
+        for row in 0..planes.height {
+            convert_row(
+                &planes.y[row * planes.y_stride..][..planes.width],
+                &planes.u[(row / 2) * planes.u_stride..][..chroma_width],
+                &planes.v[(row / 2) * planes.v_stride..][..chroma_width],
+                &mut out[row * planes.width * 4..][..planes.width * 4],
+            );
+        }
+        out
+    }
+
+    /// Deterministic pseudo-random planes with padded strides.
+    ///
+    /// Random rather than flat on purpose: flat planes cannot catch a lane fed from the wrong
+    /// sample, which is the characteristic SIMD bug. Deterministic so a failure is reproducible.
+    fn noisy_planes(width: usize, height: usize) -> (Vec<u8>, Vec<u8>, Vec<u8>, usize, usize) {
+        let mut state = 0x2545_f491_4f6c_dd1d_u64;
+        let mut next = move || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            (state >> 33) as u8
+        };
+        let y_stride = width + 13;
+        let chroma_stride = width.div_ceil(2) + 5;
+        let y = (0..y_stride * height).map(|_| next()).collect();
+        let u = (0..chroma_stride * height.div_ceil(2))
+            .map(|_| next())
+            .collect();
+        let v = (0..chroma_stride * height.div_ceil(2))
+            .map(|_| next())
+            .collect();
+        (y, u, v, y_stride, chroma_stride)
+    }
+
+    #[test]
+    fn the_vector_path_is_bit_identical_to_the_scalar_reference() {
+        // Every width from 1 to 40 covers each remainder modulo the eight-pixel vector step,
+        // both parities, and the widths too narrow for a single vector step at all. The larger
+        // sizes straddle the step boundary from both sides.
+        let widths = (1usize..=40).chain([63, 64, 65, 127, 128, 129, 255, 256, 257]);
+        for width in widths {
+            for height in [1usize, 2, 3, 5] {
+                let (y, u, v, y_stride, chroma_stride) = noisy_planes(width, height);
+                let planes = I420Planes {
+                    y: &y,
+                    u: &u,
+                    v: &v,
+                    width,
+                    height,
+                    y_stride,
+                    u_stride: chroma_stride,
+                    v_stride: chroma_stride,
+                };
+
+                let vector = i420_to_bgra(planes).expect("planes are addressable");
+                let scalar = scalar_reference(planes);
+
+                assert_eq!(
+                    vector.len(),
+                    width * height * 4,
+                    "wrong output length at {width}x{height}"
+                );
+                // Compared as whole buffers, then narrowed to the first differing pixel so a
+                // failure names the pixel rather than dumping a megabyte.
+                if vector != scalar {
+                    let at = vector
+                        .iter()
+                        .zip(&scalar)
+                        .position(|(a, b)| a != b)
+                        .expect("the buffers differ somewhere");
+                    panic!(
+                        "vector and scalar differ at {width}x{height}, byte {at} \
+                         (pixel {}, channel {}): {} vs {}",
+                        at / 4,
+                        at % 4,
+                        vector[at],
+                        scalar[at]
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn both_paths_clamp_the_whole_input_range_the_same_way() {
+        // A row that sweeps luma across its full range against extreme chroma drives every
+        // pixel past both ends of the clamp, in both implementations.
+        let width: usize = 256;
+        let height: usize = 2;
+        let y: Vec<u8> = (0..width * height).map(|i| (i % 256) as u8).collect();
+        let u: Vec<u8> = (0..width.div_ceil(2) * height.div_ceil(2))
+            .map(|i| if i % 2 == 0 { 0 } else { 255 })
+            .collect();
+        let v: Vec<u8> = (0..width.div_ceil(2) * height.div_ceil(2))
+            .map(|i| if i % 3 == 0 { 255 } else { 0 })
+            .collect();
+        let planes = I420Planes {
+            y: &y,
+            u: &u,
+            v: &v,
+            width,
+            height,
+            y_stride: width,
+            u_stride: width.div_ceil(2),
+            v_stride: width.div_ceil(2),
+        };
+
+        assert_eq!(
+            i420_to_bgra(planes).expect("addressable"),
+            scalar_reference(planes)
+        );
     }
 
     #[test]

@@ -1078,6 +1078,67 @@ mod tests {
         assert_eq!((control.x, control.y), (140, 185));
     }
 
+    /// `--headless` decodes inline, which is deliberate — it has no display and no input path to
+    /// protect. What it must not lose by staying inline is the acknowledgement of a frame that
+    /// produced no picture: §12's in-flight budget applies to it exactly as it does to the
+    /// windowed path, and a frame swallowed silently would hold a slot in that budget forever.
+    #[tokio::test]
+    async fn headless_acknowledges_a_frame_it_could_not_decode() {
+        let (client_io, mut server_io) = tokio::io::duplex(64 * 1024);
+
+        let server = tokio::spawn(async move {
+            let mut reassembler = Reassembler::new();
+            let _ = read_message(&mut server_io, &mut reassembler).await;
+            write_message(
+                &mut server_io,
+                &Message::ServerHello(ServerHello {
+                    version: 1,
+                    features: feature::FRAME_ACK,
+                    session_id: 1,
+                    codec: oxproto::codec::RAW_BGRA,
+                }),
+                channel::CONTROL,
+            )
+            .await
+            .expect("hello");
+
+            // A RAW_BGRA frame whose payload is too short for its geometry: the decoder rejects
+            // it, so nothing is ever presented for it.
+            let mut broken = raw_frame(1, 9);
+            if let Message::FrameData(frame) = &mut broken {
+                frame.data.truncate(3);
+            }
+            write_message(&mut server_io, &broken, channel::VIDEO_BASE)
+                .await
+                .expect("frame");
+
+            read_message(&mut server_io, &mut reassembler)
+                .await
+                .expect("a message arrives")
+                .expect("and decodes")
+        });
+
+        let mut session = ClientSession::connect(client_io, &test_config())
+            .await
+            .expect("handshake");
+        // Run the loop alongside the peer rather than to completion: it ends only when the peer
+        // closes, and the peer is what this test reads the acknowledgement from.
+        let headless = tokio::spawn(async move {
+            let _ = run_headless(&mut session).await;
+        });
+
+        let ack = tokio::time::timeout(Duration::from_secs(5), server)
+            .await
+            .expect("an undecodable frame must still be acknowledged")
+            .expect("peer");
+        headless.abort();
+
+        match ack {
+            Message::FrameAck(ack) => assert_eq!((ack.window_id, ack.frame_id), (1, 9)),
+            other => panic!("expected FrameAck, got {:#04x}", other.msg_type()),
+        }
+    }
+
     /// A display thread that can be frozen mid-frame.
     ///
     /// Blocking in `send` is exactly what a worker busy decoding looks like from the session
