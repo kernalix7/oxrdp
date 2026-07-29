@@ -435,7 +435,18 @@ Shapes are cached client-side by `cursor_id`; a repeated cursor costs 4 bytes, n
 
 **`Error`** — `{ code u16, message string }`. Codes: 1 `PROTOCOL`, 2 `AUTH_FAILED`,
 3 `VERSION_MISMATCH`, 4 `UNSUPPORTED_CODEC`, 5 `WINDOW_GONE`, 6 `CAPTURE_FAILED`,
-7 `INTERNAL`, 8 `TOO_LARGE`.
+7 `INTERNAL`, 8 `TOO_LARGE`, 9 `SESSION_BUSY`.
+
+A code is advice about what the receiver does next, not just a label for what went wrong: ask
+whether retrying unchanged could ever succeed, and pick accordingly. `SESSION_BUSY` exists
+because `PROTOCOL` cannot honestly answer that question for every rejection — the agent serves
+one authenticated session at a time, and a second client that authenticates while one is already
+active has done nothing wrong. It sent a perfectly well-formed `ClientHello`; `PROTOCOL` would
+tell it "you sent something invalid, do not retry the same way," which is the opposite of the
+truth ("you are fine, the agent is busy, try again later"). Reusing a fatal-sounding code for a
+transient condition is exactly the mistake this entry exists to correct, and to not repeat: a
+future rejection with no dedicated code should get one rather than default to `PROTOCOL` or
+`INTERNAL` on the assumption that any code is close enough.
 
 **`Close`** — `{ reason u16 }`. Reasons: 0 `close_reason::NORMAL`, 1 `GOING_AWAY`,
 2 `IDLE_TIMEOUT`, 3 `ERROR`.

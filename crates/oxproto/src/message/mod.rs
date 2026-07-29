@@ -143,6 +143,12 @@ pub mod error_code {
     pub const INTERNAL: u16 = 7;
     /// A message exceeded the size limit for its type.
     pub const TOO_LARGE: u16 = 8;
+    /// The peer authenticated, but a session was already active. Distinct from `PROTOCOL`
+    /// deliberately: this is not an out-of-sequence or malformed message, it is a well-formed
+    /// request the agent cannot honour *right now* — the advice to the client is "try again
+    /// later, on your own or once the current session ends," not "something you sent was
+    /// wrong, do not retry the same way."
+    pub const SESSION_BUSY: u16 = 9;
 }
 
 /// Reason codes carried by [`Close`] (`OXPROTO.md` §15).

@@ -8,7 +8,7 @@
 //! Run with: `cargo test -p oxproto --test conformance`.
 
 use oxproto::{
-    channel, close_reason, codec, decode, encode_vec,
+    channel, close_reason, codec, decode, encode_vec, error_code,
     message::{
         msg_type,
         window::{frame_flag, window_flag, window_show},
@@ -544,4 +544,18 @@ fn close_reason_matches_spec() {
     assert_eq!(close_reason::GOING_AWAY, 1);
     assert_eq!(close_reason::IDLE_TIMEOUT, 2);
     assert_eq!(close_reason::ERROR, 3);
+}
+
+/// `Error.code` values (`OXPROTO.md` §15), pinned for the same reason as `close_reason` above.
+#[test]
+fn error_code_matches_spec() {
+    assert_eq!(error_code::PROTOCOL, 1);
+    assert_eq!(error_code::AUTH_FAILED, 2);
+    assert_eq!(error_code::VERSION_MISMATCH, 3);
+    assert_eq!(error_code::UNSUPPORTED_CODEC, 4);
+    assert_eq!(error_code::WINDOW_GONE, 5);
+    assert_eq!(error_code::CAPTURE_FAILED, 6);
+    assert_eq!(error_code::INTERNAL, 7);
+    assert_eq!(error_code::TOO_LARGE, 8);
+    assert_eq!(error_code::SESSION_BUSY, 9);
 }
