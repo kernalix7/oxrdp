@@ -100,6 +100,25 @@ It measures **capture to present**, and says so in its own header. The guest's c
 capture and the local display server after present are outside every process involved; a real
 glass-to-glass figure needs a camera pointed at two screens.
 
+**Correction, same day: the tail was attributed too confidently.** The transport hop was
+diagnosed as Nagle — the agent never set `TCP_NODELAY`, unlike the client — and the fix landed.
+The within-run evidence for it is real: measured in a single run, small frames were penalised
+3.9x relative to large ones before the fix and 1.5x after, which is the direction Nagle removal
+predicts and a comparison that controls for run conditions.
+
+But the before-and-after **cannot** be told apart. Four runs of the identical fixed
+configuration produced `encode->arrival` medians of 4.1, 7.1, 8.3 and 12.3 ms and p99s of 53,
+109, 169 and 247 ms — and the pre-fix run sits comfortably inside that spread. Run-to-run
+variance is larger than the effect being measured, so the claim that the fix was observed
+working is withdrawn. The change stays because disabling Nagle on a latency-sensitive stream is
+correct on its own terms, not because a measurement here proved it.
+
+The lesson is about the experiment rather than the instrument: a report that prints one run's
+percentiles invites exactly this mistake, and comparing two builds needs repetition and a stated
+threshold for what counts as a difference. The most stable number across every run was
+`capture->encode` at 5.7-8 ms, which is the agent's CPU colour conversion — the one stage not
+drowning in noise.
+
 ### Security (2026-07-28)
 
 An adversarial review of the agent's network-facing surface, prompted by input injection
