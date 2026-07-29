@@ -203,6 +203,34 @@ pub fn reframe(raw: &[u8], cached: &mut ParamSets) -> (Vec<u8>, bool) {
     (out, is_idr)
 }
 
+/// The `nal_unit_type` and payload length (header byte included) of every NAL unit in `data`, in
+/// stream order — a diagnostic view of an access unit's actual, as-received structure,
+/// independent of whatever [`reframe`] goes on to do with it. Exists so a caller (`crate::win`
+/// encoder wrapper) can log exactly what came out of the encoder before this module's own
+/// reordering, stripping, and backfilling touch it — which is the only way to see something like
+/// a stray parameter set on a non-keyframe, since [`reframe`] itself would already have removed
+/// it from anything logged after the fact.
+pub fn nal_summary(data: &[u8]) -> Vec<(u8, usize)> {
+    split_annexb(data)
+        .iter()
+        .map(|nal| (nal.kind, nal.payload.len()))
+        .collect()
+}
+
+/// A short human-readable name for a `nal_unit_type`, for diagnostics only — never used anywhere
+/// [`reframe`] itself makes a decision, which switches on the numeric `kind` exclusively.
+pub fn nal_type_name(kind: u8) -> &'static str {
+    match kind {
+        nal_type::SLICE => "SLICE",
+        nal_type::SLICE_IDR => "SLICE_IDR",
+        nal_type::SEI => "SEI",
+        nal_type::SPS => "SPS",
+        nal_type::PPS => "PPS",
+        nal_type::AUD => "AUD",
+        _ => "OTHER",
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -400,5 +428,50 @@ mod tests {
         let (out, is_idr) = reframe(&[0xAB, 0xCD, 0xEF], &mut cached);
         assert!(out.is_empty());
         assert!(!is_idr);
+    }
+
+    #[test]
+    fn nal_summary_reports_every_nal_in_order_with_its_length() {
+        // Payload length includes the header byte, same convention as `Nal::payload`; `nal()`
+        // above always builds a 2-byte payload (header + one filler byte).
+        let raw = annexb(&[
+            nal(nal_type::SPS, 1),
+            nal(nal_type::PPS, 2),
+            nal(nal_type::SLICE, 3),
+        ]);
+        assert_eq!(
+            nal_summary(&raw),
+            vec![(nal_type::SPS, 2), (nal_type::PPS, 2), (nal_type::SLICE, 2)]
+        );
+    }
+
+    #[test]
+    fn nal_summary_sees_a_stray_parameter_set_reframe_would_have_stripped() {
+        // The whole reason `nal_summary` exists separately from `reframe`'s own output: this
+        // access unit is not a keyframe, so `reframe` strips its SPS/PPS from what gets emitted
+        // (see `a_non_keyframe_never_carries_parameter_sets_even_if_present_in_the_raw_bytes`),
+        // but a diagnostic reading the raw bytes still needs to see that they were there.
+        let raw = annexb(&[
+            nal(nal_type::SPS, 1),
+            nal(nal_type::PPS, 2),
+            nal(nal_type::SLICE, 3),
+        ]);
+        let summary = nal_summary(&raw);
+        assert!(summary.iter().any(|&(kind, _)| kind == nal_type::SPS));
+    }
+
+    #[test]
+    fn nal_type_name_covers_every_type_reframe_switches_on() {
+        assert_eq!(nal_type_name(nal_type::SLICE), "SLICE");
+        assert_eq!(nal_type_name(nal_type::SLICE_IDR), "SLICE_IDR");
+        assert_eq!(nal_type_name(nal_type::SEI), "SEI");
+        assert_eq!(nal_type_name(nal_type::SPS), "SPS");
+        assert_eq!(nal_type_name(nal_type::PPS), "PPS");
+        assert_eq!(nal_type_name(nal_type::AUD), "AUD");
+    }
+
+    #[test]
+    fn nal_type_name_does_not_panic_on_an_unknown_type() {
+        assert_eq!(nal_type_name(31), "OTHER");
     }
 }

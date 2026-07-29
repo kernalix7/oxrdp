@@ -22,6 +22,11 @@
 //!   than trying to reconfigure a live MFT's media type mid-stream. Simpler, and it naturally
 //!   produces the fresh SPS/PPS + keyframe §9.1 requires on a coded-size change, since a new
 //!   transform always starts a fresh stream.
+//! - **No periodic re-keying: `CODECAPI_AVEncMPVGOPSize` is pinned huge.** §9.1 names exactly
+//!   two events that produce a keyframe and nothing else; left to its own defaults, an encoder
+//!   MFT is free to insert a periodic sync point anyway, and a real guest run found one doing
+//!   exactly that — one access unit in every thirty rejected by the client's decoder, at a fixed
+//!   period and offset matching the session's configured frame rate. See `GOP_SIZE_FRAMES`.
 //!
 //! **What this file's author could not verify without a live Windows guest**, stated plainly
 //! rather than left implicit: whether `MF_TRANSFORM_ASYNC_UNLOCK` actually lets every hardware
@@ -29,10 +34,14 @@
 //! not this crate's invention, but "documented" and "true of the specific driver on the test
 //! guest" are not the same claim); whether the codec API properties set here are actually
 //! honoured by that driver, since a driver is free to silently ignore an unsupported property
-//! rather than fail `SetValue`; and the `MFTEnumEx` output array's ownership handling in
+//! rather than fail `SetValue`; the `MFTEnumEx` output array's ownership handling in
 //! [`first_activate`], which follows the COM ownership rules as documented but has had no COM
-//! debugger anywhere near it. All three are exactly the class of bug the project's own history
-//! says only shows up by running the code — see `crate::win::capture`'s doc comment.
+//! debugger anywhere near it; and whether `GOP_SIZE_FRAMES` actually fixes the periodic decode
+//! failure above rather than only reducing its frequency, since this crate has no way to run the
+//! encoder against a real decoder itself — the `DIAGNOSTIC_FRAME_LIMIT` logging exists precisely
+//! to settle that from the next guest run instead of guessing twice. All of these are exactly the
+//! class of bug the project's own history says only shows up by running the code — see
+//! `crate::win::capture`'s doc comment.
 
 use std::collections::HashMap;
 use std::ffi::c_void;
@@ -42,15 +51,16 @@ use windows::Win32::Foundation::E_FAIL;
 use windows::Win32::Media::MediaFoundation::{
     eAVEncCommonRateControlMode_LowDelayVBR, CODECAPI_AVEncCommonMeanBitRate,
     CODECAPI_AVEncCommonRateControlMode, CODECAPI_AVEncMPVDefaultBPictureCount,
-    CODECAPI_AVEncVideoForceKeyFrame, CODECAPI_AVLowLatencyMode, ICodecAPI, IMFActivate,
-    IMFMediaBuffer, IMFSample, IMFTransform, MFCreateMediaType, MFCreateMemoryBuffer,
-    MFCreateSample, MFMediaType_Video, MFStartup, MFTEnumEx, MFVideoFormat_H264,
-    MFVideoFormat_NV12, MFVideoInterlace_Progressive, MFSTARTUP_FULL, MFT_CATEGORY_VIDEO_ENCODER,
-    MFT_ENUM_FLAG_HARDWARE, MFT_ENUM_FLAG_SORTANDFILTER, MFT_ENUM_FLAG_SYNCMFT,
-    MFT_MESSAGE_NOTIFY_BEGIN_STREAMING, MFT_MESSAGE_NOTIFY_START_OF_STREAM, MFT_OUTPUT_DATA_BUFFER,
-    MFT_OUTPUT_STREAM_PROVIDES_SAMPLES, MFT_REGISTER_TYPE_INFO, MF_E_TRANSFORM_NEED_MORE_INPUT,
-    MF_MT_AVG_BITRATE, MF_MT_FRAME_RATE, MF_MT_FRAME_SIZE, MF_MT_INTERLACE_MODE, MF_MT_MAJOR_TYPE,
-    MF_MT_SUBTYPE, MF_TRANSFORM_ASYNC, MF_TRANSFORM_ASYNC_UNLOCK, MF_VERSION,
+    CODECAPI_AVEncMPVGOPSize, CODECAPI_AVEncVideoForceKeyFrame, CODECAPI_AVLowLatencyMode,
+    ICodecAPI, IMFActivate, IMFMediaBuffer, IMFSample, IMFTransform, MFCreateMediaType,
+    MFCreateMemoryBuffer, MFCreateSample, MFMediaType_Video, MFStartup, MFTEnumEx,
+    MFVideoFormat_H264, MFVideoFormat_NV12, MFVideoInterlace_Progressive, MFSTARTUP_FULL,
+    MFT_CATEGORY_VIDEO_ENCODER, MFT_ENUM_FLAG_HARDWARE, MFT_ENUM_FLAG_SORTANDFILTER,
+    MFT_ENUM_FLAG_SYNCMFT, MFT_MESSAGE_NOTIFY_BEGIN_STREAMING, MFT_MESSAGE_NOTIFY_START_OF_STREAM,
+    MFT_OUTPUT_DATA_BUFFER, MFT_OUTPUT_STREAM_PROVIDES_SAMPLES, MFT_REGISTER_TYPE_INFO,
+    MF_E_TRANSFORM_NEED_MORE_INPUT, MF_MT_AVG_BITRATE, MF_MT_FRAME_RATE, MF_MT_FRAME_SIZE,
+    MF_MT_INTERLACE_MODE, MF_MT_MAJOR_TYPE, MF_MT_SUBTYPE, MF_TRANSFORM_ASYNC,
+    MF_TRANSFORM_ASYNC_UNLOCK, MF_VERSION,
 };
 use windows::Win32::System::Com::CoTaskMemFree;
 
@@ -64,6 +74,27 @@ use crate::serve::SourceFrame;
 /// magnitude below the `RAW_BGRA` bring-up path's ~460 Mbit/s at 800×600×30fps, which is the
 /// whole point of this file existing.
 const TARGET_BITRATE_BPS: u32 = 6_000_000;
+
+/// `CODECAPI_AVEncMPVGOPSize`, in frames. `OXPROTO.md` §9.1 names exactly two events that
+/// produce a keyframe — the first frame of a window's session, and a resolution change — and
+/// nothing else; it does not call for periodic re-keying, and this crate never asks for one
+/// through `CODECAPI_AVEncVideoForceKeyFrame` outside those two cases. Left unset, an encoder
+/// MFT is free to insert its own periodic sync point anyway — commonly once per second's worth
+/// of configured frame rate, which is exactly what a guest run turned up: the client's decoder
+/// rejected one access unit in every thirty, at a fixed period and offset, on a session encoding
+/// at 30 fps. That is a GOP-boundary signature, not a random one. A value this large (at 30 fps,
+/// over nine hours) is chosen over `0` specifically because this crate cannot confirm on real
+/// hardware whether `0` means "no periodic key frame" or is clamped to some encoder-specific
+/// default instead — an unambiguously huge value pushes the interval past anything a real
+/// session reaches before a resolution change rebuilds the encoder anyway, without depending on
+/// a special-cased meaning for one particular number that varies by vendor.
+const GOP_SIZE_FRAMES: u32 = 1_000_000;
+
+/// How many access units, per [`WindowEncoder`], to log the raw (pre-[`h264::reframe`]) NAL
+/// makeup of. Diagnostic only, requested to chase down the GOP-boundary decode failure
+/// [`GOP_SIZE_FRAMES`] targets — kept bounded so a long session does not spam stderr forever once
+/// the question it exists to answer has been answered.
+const DIAGNOSTIC_FRAME_LIMIT: u32 = 100;
 
 /// Which kind of H.264 encoder [`probe_h264_support`] found.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -180,6 +211,12 @@ fn first_activate(activates: *mut Option<IMFActivate>, count: u32) -> Option<IMF
 
 /// One window's live Media Foundation H.264 encoder stream.
 struct WindowEncoder {
+    /// Native handle, kept only for `DIAGNOSTIC_FRAME_LIMIT` logging — nothing in this struct's
+    /// own logic needs it, since it is already keyed by handle in `WinFrameEncoder`.
+    handle: isize,
+    /// How many access units this instance has emitted from `poll` so far, counted only up to
+    /// `DIAGNOSTIC_FRAME_LIMIT` — see there.
+    frames_seen: u32,
     transform: IMFTransform,
     codec_api: Option<ICodecAPI>,
     /// Coded picture size this transform was configured for (after [`pad_even`]). A later
@@ -204,7 +241,13 @@ struct WindowEncoder {
 }
 
 impl WindowEncoder {
-    fn new(kind: EncoderKind, width: u16, height: u16, target_fps: u16) -> WinResult<Self> {
+    fn new(
+        handle: isize,
+        kind: EncoderKind,
+        width: u16,
+        height: u16,
+        target_fps: u16,
+    ) -> WinResult<Self> {
         let width = u32::from(pad_even(width)).max(2);
         let height = u32::from(pad_even(height)).max(2);
         let transform = create_transform(kind)?;
@@ -278,6 +321,9 @@ impl WindowEncoder {
                 // oldest unacknowledged frame) is unsound the moment a later picture can
                 // reference one that was skipped.
                 let _ = api.SetValue(&CODECAPI_AVEncMPVDefaultBPictureCount, &VARIANT::from(0u32));
+                // See `GOP_SIZE_FRAMES`: this crate is the only thing that should ever decide
+                // when a new keyframe starts.
+                let _ = api.SetValue(&CODECAPI_AVEncMPVGOPSize, &VARIANT::from(GOP_SIZE_FRAMES));
             }
         }
 
@@ -295,6 +341,8 @@ impl WindowEncoder {
         let frame_duration_hns = 10_000_000i64 / i64::from(target_fps.max(1));
 
         Ok(Self {
+            handle,
+            frames_seen: 0,
             transform,
             codec_api,
             width,
@@ -417,6 +465,23 @@ impl WindowEncoder {
         let sample = produced?;
         let buffer = unsafe { sample.ConvertToContiguousBuffer() }.ok()?;
         let raw = read_buffer(&buffer)?;
+
+        if self.frames_seen < DIAGNOSTIC_FRAME_LIMIT {
+            self.frames_seen += 1;
+            // Logged from `raw`, before `reframe` below reorders or strips anything — this is
+            // what the transform itself actually produced. See `DIAGNOSTIC_FRAME_LIMIT`.
+            let nals: Vec<String> = h264::nal_summary(&raw)
+                .into_iter()
+                .map(|(kind, len)| format!("{}:{len}", h264::nal_type_name(kind)))
+                .collect();
+            eprintln!(
+                "oxagent: h264: window={:#x} frame={} nals=[{}]",
+                self.handle,
+                self.frames_seen,
+                nals.join(", ")
+            );
+        }
+
         let (data, is_idr) = h264::reframe(&raw, &mut self.params);
         if data.is_empty() {
             return None;
@@ -539,7 +604,13 @@ impl FrameEncoder for WinFrameEncoder {
             None => true,
         };
         if needs_rebuild {
-            match WindowEncoder::new(self.kind, frame.width, frame.height, self.target_fps) {
+            match WindowEncoder::new(
+                handle,
+                self.kind,
+                frame.width,
+                frame.height,
+                self.target_fps,
+            ) {
                 Ok(enc) => {
                     self.encoders.insert(handle, enc);
                 }
