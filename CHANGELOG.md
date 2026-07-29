@@ -79,7 +79,12 @@ END TO END       p50  18,205 us   p95  60,025   p99  66,211
 ```
 
 **18 ms median, capture to present** — through a VM port forward, with a software H.264 encoder
-and a software decoder, and no GPU anywhere in the path. The tail is the finding: p95 and p99 are
+and a software decoder, and no GPU anywhere in the path. **Read that figure as a lower bound:**
+a review of the instrument afterwards found the presenter timestamps its work on a private clock
+rather than the session's, so every stage built on presentation — decode-to-present, the
+client-only span, and the end-to-end total — is biased low by however long elapses between the
+session connecting and the display thread starting. The stage-sum test cannot catch it, because
+the same biased term appears on both sides of the identity and cancels. The tail is the finding: p95 and p99 are
 three times the median, and almost all of it sits in `encode->arrival`, the transport hop, which
 has no business costing 46 ms over loopback. That is where to look next, not at the codec.
 
