@@ -36,6 +36,8 @@ pub struct H264Decoder {
     warned_about_parameter_sets: bool,
     /// Frames discarded since this decoder last held a usable reference picture.
     dropped_while_resyncing: u32,
+    /// Whether the stream's profile has already been reported.
+    reported_profile: bool,
 }
 
 impl H264Decoder {
@@ -54,6 +56,7 @@ impl H264Decoder {
             awaiting_keyframe: true,
             warned_about_parameter_sets: false,
             dropped_while_resyncing: 0,
+            reported_profile: false,
         })
     }
 
@@ -97,7 +100,60 @@ impl H264Decoder {
             );
         }
 
+        // A frame whose slices are all disposable is a coding-structure finding, not a
+        // corruption one — temporal layers, or a profile beyond what this decoder implements.
+        // Naming it is the difference between reading one log line and hexdumping the payload.
+        if annexb::slices_are_non_reference(&frame.data) == Some(true) {
+            log::debug!(
+                "window {} frame {} is a non-reference picture (every slice has nal_ref_idc=0): \
+                 nothing refers to it, so this is a coding-structure question rather than a \
+                 corrupt bitstream",
+                frame.window_id,
+                frame.frame_id
+            );
+        }
+
         dump_rejected(frame);
+    }
+
+    /// Reports the profile the stream is coded in, once, from its first parameter set.
+    ///
+    /// This decoder implements what Cisco's openh264 implements, which is Constrained Baseline.
+    /// A stream above that boundary can decode for a long time and then fail on whichever frame
+    /// first uses a tool the decoder does not have — intermittent-looking, but systematic. One
+    /// line at the start of a stream settles which of those is happening, so it is a warning
+    /// when it is out of range and a debug note when it is not.
+    fn report_profile(&mut self, frame: &FrameData) {
+        if self.reported_profile {
+            return;
+        }
+        let Some(profile) = annexb::stream_profile(&frame.data) else {
+            return;
+        };
+        self.reported_profile = true;
+
+        if profile.is_constrained_baseline() {
+            log::debug!(
+                "window {} stream is {} (profile_idc={}, constraints={:#04x}, level {}), which \
+                 this decoder implements",
+                frame.window_id,
+                profile.name(),
+                profile.profile_idc,
+                profile.constraints,
+                profile.level()
+            );
+        } else {
+            log::warn!(
+                "window {} stream is {} (profile_idc={}, constraints={:#04x}, level {}), but \
+                 openh264 decodes Constrained Baseline only — frames using anything beyond it \
+                 will be rejected however well the rest of the stream decodes",
+                frame.window_id,
+                profile.name(),
+                profile.profile_idc,
+                profile.constraints,
+                profile.level()
+            );
+        }
     }
 }
 
@@ -133,6 +189,7 @@ impl Decoder for H264Decoder {
             }
             self.awaiting_keyframe = false;
         }
+        self.report_profile(&frame);
 
         // Scoped so the borrow of `self.inner` that `decode` hands out ends before the error
         // path below touches `self` again.
