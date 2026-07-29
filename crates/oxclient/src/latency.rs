@@ -156,6 +156,27 @@ impl WindowLatency {
     }
 }
 
+/// One reporting interval's summary, kept so a run's own variation is visible.
+///
+/// A single set of percentiles over a whole run invites treating it as *the* number for that
+/// configuration. It is not: it is one sample of a noisy process. Keeping each interval's figure
+/// turns "here is the latency" into "here is the latency and here is how much it moves", and the
+/// second half is what says whether a difference between two configurations means anything.
+#[derive(Debug, Clone, Copy)]
+pub struct IntervalSummary {
+    /// Frames presented during the interval.
+    pub frames: u64,
+    /// Frames per second over the interval — the workload control. Two intervals with different
+    /// frame rates were not measuring the same thing.
+    pub fps: f64,
+    /// Median encode-to-arrival.
+    pub transit_p50_us: Option<u64>,
+    /// 95th-percentile encode-to-arrival.
+    pub transit_p95_us: Option<u64>,
+    /// Median capture-to-present.
+    pub total_p50_us: Option<u64>,
+}
+
 /// Per-window latency accounting, fed from the three points a frame passes through.
 ///
 /// Disabled unless asked for: [`LatencyMonitor::enabled`] is checked before any work, so a
@@ -164,6 +185,20 @@ impl WindowLatency {
 pub struct LatencyMonitor {
     windows: HashMap<u32, WindowLatency>,
     enabled: bool,
+    /// Samples for the interval being accumulated, cleared after each report. Non-overlapping,
+    /// unlike the rolling per-window windows, so successive reports are independent looks at the
+    /// same configuration rather than the same frames counted repeatedly.
+    interval_transit: Samples,
+    interval_total: Samples,
+    interval_frames: u64,
+    interval_started_us: u64,
+    /// Every interval so far. The spread across these is the noise floor: a difference between
+    /// two configurations smaller than the variation within one of them is not a finding.
+    history: Vec<IntervalSummary>,
+    /// Gaps between successive frame arrivals, per window — how regular the workload actually
+    /// is. A benchmark whose frame rate wanders makes every other number wander with it.
+    arrival_gaps: Samples,
+    last_arrival_us: HashMap<u32, u64>,
     /// How many times this client stopped reading the wire because a decode queue was full, and
     /// for how long in total. While it is stopped, frames sit unread in the socket and their
     /// measured encode-to-arrival grows — so a transport-shaped tail with a large figure here is
@@ -179,6 +214,13 @@ impl LatencyMonitor {
         Self {
             windows: HashMap::new(),
             enabled: false,
+            interval_transit: Samples::new(SAMPLE_WINDOW),
+            interval_total: Samples::new(SAMPLE_WINDOW),
+            interval_frames: 0,
+            interval_started_us: 0,
+            history: Vec::new(),
+            arrival_gaps: Samples::new(SAMPLE_WINDOW),
+            last_arrival_us: HashMap::new(),
             read_stalls: 0,
             read_stalled_us: 0,
         }
@@ -190,6 +232,13 @@ impl LatencyMonitor {
         Self {
             windows: HashMap::new(),
             enabled: true,
+            interval_transit: Samples::new(SAMPLE_WINDOW),
+            interval_total: Samples::new(SAMPLE_WINDOW),
+            interval_frames: 0,
+            interval_started_us: 0,
+            history: Vec::new(),
+            arrival_gaps: Samples::new(SAMPLE_WINDOW),
+            last_arrival_us: HashMap::new(),
             read_stalls: 0,
             read_stalled_us: 0,
         }
@@ -214,6 +263,13 @@ impl LatencyMonitor {
     pub fn on_arrival(&mut self, frame: ArrivedFrame) {
         if !self.enabled {
             return;
+        }
+        if let Some(previous) = self
+            .last_arrival_us
+            .insert(frame.window_id, frame.arrived_us)
+        {
+            self.arrival_gaps
+                .push(frame.arrived_us.saturating_sub(previous));
         }
         let window = self
             .windows
@@ -309,6 +365,9 @@ impl LatencyMonitor {
         window.client.push(stages.client_us);
         window.total.push(stages.total_us);
         window.presented += 1;
+        self.interval_transit.push(stages.encode_to_arrival_us);
+        self.interval_total.push(stages.total_us);
+        self.interval_frames += 1;
         Some(stages)
     }
 
@@ -339,8 +398,18 @@ impl LatencyMonitor {
     ///
     /// `rtt_us` and `offset_us` are printed alongside because they are what the reader needs in
     /// order to know how much of the end-to-end figure to believe.
-    #[must_use]
-    pub fn report(&self, error_bound_us: Option<u64>, offset_us: Option<i64>) -> String {
+    /// Closes the current interval and renders a report.
+    ///
+    /// Takes `now_us` because an interval's frame rate is the control variable: two intervals
+    /// that saw different frame rates were not measuring the same workload, and comparing their
+    /// latencies is the mistake this whole structure exists to prevent.
+    pub fn report(
+        &mut self,
+        now_us: u64,
+        error_bound_us: Option<u64>,
+        offset_us: Option<i64>,
+    ) -> String {
+        self.close_interval(now_us);
         let mut out = String::new();
         out.push_str("oxclient latency: capture-to-present, microseconds\n");
         match (error_bound_us, offset_us) {
@@ -426,7 +495,95 @@ impl LatencyMonitor {
             "  this client stopped reading the wire {} times, {} us in total\n",
             self.read_stalls, self.read_stalled_us
         ));
+
+        if let Some(last) = self.history.last() {
+            out.push_str(&format!(
+                "  this interval: {} frames at {:.1} fps; arrival gap p50 {} p95 {}\n",
+                last.frames,
+                last.fps,
+                show(self.arrival_gaps.percentile(50)),
+                show(self.arrival_gaps.percentile(95)),
+            ));
+        }
+
+        // The anti-mistake line. One run's percentiles look like a measurement of a
+        // configuration; they are one sample of a noisy process, and this is its noise.
+        if self.history.len() >= 2 {
+            out.push_str(&format!(
+                "  across {} intervals of this run:\n",
+                self.history.len()
+            ));
+            for (label, values) in [
+                (
+                    "encode->arrival p50",
+                    self.history
+                        .iter()
+                        .filter_map(|i| i.transit_p50_us)
+                        .collect::<Vec<_>>(),
+                ),
+                (
+                    "END TO END      p50",
+                    self.history
+                        .iter()
+                        .filter_map(|i| i.total_p50_us)
+                        .collect::<Vec<_>>(),
+                ),
+                (
+                    "frames per second  ",
+                    self.history
+                        .iter()
+                        .map(|i| i.fps.round() as u64)
+                        .collect::<Vec<_>>(),
+                ),
+            ] {
+                let (Some(low), Some(high)) =
+                    (values.iter().min().copied(), values.iter().max().copied())
+                else {
+                    continue;
+                };
+                let spread = if low == 0 {
+                    String::new()
+                } else {
+                    format!("  ({:.1}x)", high as f64 / low as f64)
+                };
+                out.push_str(&format!("    {label} ranged {low} .. {high}{spread}\n"));
+            }
+            out.push_str(
+                "    ^ this is the noise floor: a difference between two configurations \
+                 smaller than\n      the variation within one of them is not a finding.\n",
+            );
+        }
         out
+    }
+
+    /// Files the interval just finished and starts a new one.
+    fn close_interval(&mut self, now_us: u64) {
+        let elapsed_us = now_us.saturating_sub(self.interval_started_us);
+        #[allow(clippy::cast_precision_loss)]
+        let fps = if elapsed_us == 0 {
+            0.0
+        } else {
+            self.interval_frames as f64 * 1_000_000.0 / elapsed_us as f64
+        };
+        if self.interval_frames > 0 {
+            self.history.push(IntervalSummary {
+                frames: self.interval_frames,
+                fps,
+                transit_p50_us: self.interval_transit.percentile(50),
+                transit_p95_us: self.interval_transit.percentile(95),
+                total_p50_us: self.interval_total.percentile(50),
+            });
+        }
+        self.interval_transit = Samples::new(SAMPLE_WINDOW);
+        self.interval_total = Samples::new(SAMPLE_WINDOW);
+        self.interval_frames = 0;
+        self.interval_started_us = now_us;
+    }
+
+    /// Every interval recorded so far.
+    #[must_use]
+    pub fn intervals(&self) -> &[IntervalSummary] {
+        &self.history
     }
 }
 
@@ -621,13 +778,13 @@ mod tests {
         monitor.on_decoded(1, 1, 100);
         monitor.on_presented(1, 1, 200, 0);
 
-        let without = monitor.report(None, None);
+        let without = monitor.report(10_000_000, None, None);
         assert!(without.contains("no pong yet"), "{without}");
 
         // The bound is taken from `ClockSync`, which knows which exchange the offset came
         // from — the caller does not compute it, precisely so it cannot be computed from a
         // different, more flattering sample.
-        let with = monitor.report(Some(400), Some(4_000));
+        let with = monitor.report(10_000_000, Some(400), Some(4_000));
         assert!(with.contains("agent offset 4000"), "{with}");
         assert!(with.contains("+/-400"), "{with}");
         assert!(with.contains("window 1"), "{with}");
@@ -663,7 +820,7 @@ mod tests {
         assert_eq!(window.delta_transit.percentile(50), Some(1_000));
         assert_eq!(window.keyframe_bytes.percentile(50), Some(102_400));
 
-        let report = monitor.report(Some(100), Some(0));
+        let report = monitor.report(10_000_000, Some(100), Some(0));
         assert!(report.contains("keyframe n=3"), "{report}");
         assert!(report.contains("delta    n=27"), "{report}");
         assert!(report.contains("102400 bytes"), "{report}");
@@ -704,10 +861,64 @@ mod tests {
         monitor.on_read_stall(12_000);
         monitor.on_read_stall(8_000);
 
-        let report = monitor.report(Some(100), Some(0));
+        let report = monitor.report(10_000_000, Some(100), Some(0));
         assert!(
             report.contains("stopped reading the wire 2 times, 20000 us"),
             "{report}"
+        );
+    }
+
+    /// A run that wanders must say so. Reporting one set of percentiles per run is what invites
+    /// reading a noisy sample as a measurement of a configuration.
+    #[test]
+    fn the_report_shows_how_much_the_run_itself_moved() {
+        let mut monitor = LatencyMonitor::enabled();
+        // Three intervals, each internally consistent, but a 4x drift between them — the shape
+        // of a benchmark whose own workload is not controlled.
+        for (interval, transit) in [(1u64, 4_000u64), (2, 8_000), (3, 16_000)] {
+            for frame_id in 0..20u64 {
+                let id = interval * 100 + frame_id;
+                monitor.on_arrival(arrived(1, id, 0, 0, transit));
+                monitor.on_decoded(1, id, transit);
+                monitor.on_presented(1, id, transit + 1_000, 0);
+            }
+            monitor.report(interval * 10_000_000, Some(100), Some(0));
+        }
+
+        let intervals = monitor.intervals();
+        assert_eq!(intervals.len(), 3);
+        assert_eq!(intervals[0].transit_p50_us, Some(4_000));
+        assert_eq!(intervals[2].transit_p50_us, Some(16_000));
+        assert_eq!(intervals[0].frames, 20);
+
+        let report = monitor.report(40_000_000, Some(100), Some(0));
+        assert!(report.contains("across"), "{report}");
+        assert!(
+            report.contains("ranged 4000 .. 16000") && report.contains("(4.0x)"),
+            "the spread and its ratio must be stated: {report}"
+        );
+        assert!(report.contains("noise floor"), "{report}");
+    }
+
+    #[test]
+    fn an_interval_reports_the_frame_rate_it_saw() {
+        // The workload control: two intervals at different frame rates were not measuring the
+        // same thing, and comparing their latencies is the mistake this exists to prevent.
+        let mut monitor = LatencyMonitor::enabled();
+        for frame_id in 0..30u64 {
+            monitor.on_arrival(arrived(1, frame_id, 0, 0, 1_000));
+            monitor.on_decoded(1, frame_id, 1_000);
+            monitor.on_presented(1, frame_id, 2_000, 0);
+        }
+
+        monitor.report(3_000_000, Some(100), Some(0));
+
+        let interval = monitor.intervals()[0];
+        assert_eq!(interval.frames, 30);
+        assert!(
+            (interval.fps - 10.0).abs() < 0.001,
+            "30 frames in 3 s is 10 fps, got {}",
+            interval.fps
         );
     }
 
@@ -727,7 +938,7 @@ mod tests {
         let window = &monitor.windows[&1];
         assert_eq!(window.total.percentile(50), Some(1_000));
         assert_eq!(window.total.max(), Some(500_000));
-        let report = monitor.report(Some(100), Some(0));
+        let report = monitor.report(10_000_000, Some(100), Some(0));
         assert!(
             report.contains("500000"),
             "the outlier must appear: {report}"

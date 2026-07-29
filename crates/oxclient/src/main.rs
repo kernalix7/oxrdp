@@ -471,9 +471,14 @@ where
     // Printed however the session ended, including on an error, because a session that fell over
     // is exactly the one whose numbers are worth reading.
     if latency.is_enabled() && latency.has_samples() {
+        let now_us = session.clock().now_us();
         eprint!(
             "{}",
-            latency.report(session.offset_error_bound_us(), session.clock_offset_us())
+            latency.report(
+                now_us,
+                session.offset_error_bound_us(),
+                session.clock_offset_us(),
+            )
         );
     }
     result
@@ -642,7 +647,11 @@ where
                     // sample would claim a precision the estimate does not have.
                     eprint!(
                         "{}",
-                        latency.report(session.offset_error_bound_us(), session.clock_offset_us())
+                        latency.report(
+            clock.now_us(),
+            session.offset_error_bound_us(),
+            session.clock_offset_us(),
+        )
                     );
                 }
             }
