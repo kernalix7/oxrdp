@@ -14,7 +14,12 @@
 //!   `CODECAPI_AVEncCommonRateControlMode = LowDelayVBR`, `CODECAPI_AVLowLatencyMode = true`
 //!   where the transform supports it) — required by `OXPROTO.md` §9.1 for the flow control in
 //!   §12 to stay sound: dropping the oldest unacknowledged frame is only safe if no later
-//!   picture can reference one that got skipped.
+//!   picture can reference one that got skipped. **A real guest run proved this `ICodecAPI` call
+//!   alone is not sufficient**: `SetValue` succeeded and the transform still emitted B-pictures
+//!   (Main profile, which permits them). Left in place — it costs nothing and may matter to a
+//!   different encoder — but the actual, effective mechanism against B-frames is the profile
+//!   constraint on the output media type below, which the transform cannot silently ignore the
+//!   way it can an `ICodecAPI` behavioural property.
 //! - **Parameter sets are never trusted to "just be there."** Whatever the transform's raw
 //!   output actually contains, `crate::h264::reframe` normalizes it into what §9.1 requires —
 //!   see that module for why this is not redundant with configuring the transform correctly.
@@ -27,35 +32,40 @@
 //!   MFT is free to insert a periodic sync point anyway. Kept as spec hygiene regardless of the
 //!   next bullet's finding: it was this file's first, and as it turned out incomplete, attempt to
 //!   explain a real guest run rejecting one access unit in every thirty. See `GOP_SIZE_FRAMES`.
-//! - **Constrained Baseline profile, zero temporal layers, both pinned explicitly.** A raw-byte
-//!   capture of the rejected access units above showed the GOP-size theory was not the mechanism:
-//!   every one was an AUD plus a single non-IDR, non-reference (`nal_ref_idc == 0`) slice — no
-//!   SPS, no PPS, nothing `CODECAPI_AVEncMPVGOPSize` has any say over. That shape — a disposable
-//!   picture nothing later depends on, on a strict period — is what temporal-layer or
-//!   hierarchical-P structuring produces, and this file had never explicitly turned it off, nor
-//!   ever pinned a profile, leaving Media Foundation free to choose Main or High while this
-//!   crate's one known client decoder targets Constrained Baseline. Both `CODECAPI_AVEncMPVProfile`
-//!   and `CODECAPI_AVEncVideoTemporalLayerCount` are now set every time a `WindowEncoder` is
-//!   built, and read back immediately afterward (`get_u32_property`) so the guest's own log says
-//!   what was actually configured rather than what was merely requested — see
-//!   `DIAGNOSTIC_FRAME_LIMIT`'s per-frame log for the same check against the SPS a real keyframe
-//!   emits.
+//! - **Constrained Baseline is a media-type constraint, not only an `ICodecAPI` request.** Ground
+//!   truth from a guest run's own SPS (this crate now parses and logs it — `crate::h264::
+//!   sps_profile`) confirmed the root cause the periodic decode rejections traced back to: this
+//!   encoder was emitting Main profile (`profile_idc = 77`) regardless of `CODECAPI_AVEncMPVProfile`
+//!   having been set, and Main permits B-pictures — a B-picture is exactly what `nal_ref_idc == 0`
+//!   on a non-IDR slice means, and openh264's Constrained-Baseline-only decoder rejects every one
+//!   it sees. `MF_MT_MPEG2_PROFILE` (`= eAVEncH264VProfile_ConstrainedBase`) is set on the output
+//!   media type instead — Media Foundation's actual attribute for H.264 profile signalling
+//!   despite the legacy "MPEG2" name, and a `SetOutputType` negotiation the transform must accept
+//!   or reject, not a behavioural hint it can silently disregard the way it disregarded
+//!   `CODECAPI_AVEncMPVGOPSize` and `CODECAPI_AVEncMPVDefaultBPictureCount` — both confirmed
+//!   ignored by the same guest run, which is exactly the caveat this file already carried about
+//!   trusting a `SetValue` succeeding. `CODECAPI_AVEncVideoTemporalLayerCount = 0` and the
+//!   `ICodecAPI` profile request are both still set too, best-effort, alongside it — seatbelt,
+//!   not the actual mechanism.
 //!
 //! **What this file's author could not verify without a live Windows guest**, stated plainly
 //! rather than left implicit: whether `MF_TRANSFORM_ASYNC_UNLOCK` actually lets every hardware
 //! encoder this might run against be driven synchronously (it is documented Microsoft guidance,
 //! not this crate's invention, but "documented" and "true of the specific driver on the test
-//! guest" are not the same claim); whether the codec API properties set here are actually
-//! honoured by that driver, since a driver is free to silently ignore an unsupported property
-//! rather than fail `SetValue` — `get_u32_property`'s readback narrows this but does not close it,
-//! since a driver could in principle echo back a value it does not actually honour in the encoded
-//! bitstream, which is exactly why the per-frame SPS/`nal_ref_idc` logging exists as the more
-//! authoritative check; the `MFTEnumEx` output array's ownership handling in [`first_activate`],
-//! which follows the COM ownership rules as documented but has had no COM debugger anywhere near
-//! it; and whether pinning the profile and temporal-layer count actually stops the periodic
-//! rejection, as opposed to only changing its shape again, since this crate has no way to run the
-//! encoder against a real decoder itself. All of these are exactly the class of bug the project's
-//! own history says only shows up by running the code — see `crate::win::capture`'s doc comment.
+//! guest" are not the same claim); the `MFTEnumEx` output array's ownership handling in
+//! [`first_activate`], which follows the COM ownership rules as documented but has had no COM
+//! debugger anywhere near it; and whether constraining the profile on the media type actually
+//! stops the rejection this time, given two `ICodecAPI` properties on this same encoder have
+//! already turned out to be accepted and ignored — `crate::h264::sps_profile`'s per-frame logging
+//! exists precisely so the next guest run answers that from the SPS itself, not from another
+//! property's return value. Two more items this same guest run surfaced and this crate has not
+//! yet acted on, deliberately, one change at a time rather than batched: `CODECAPI_AVEncMPVGOPSize`
+//! remains demonstrated-ignored (if Constrained Baseline does not also settle the GOP period, this
+//! file will need to force keyframes on its own schedule rather than asking the encoder for one);
+//! and `CODECAPI_AVEncVideoMaxNumRefFrame` is not yet pinned to `1`, which a low-latency,
+//! non-reordering, single-reference screen stream has no use for more of. All of this is exactly
+//! the class of bug the project's own history says only shows up by running the code — see
+//! `crate::win::capture`'s doc comment.
 
 use std::collections::HashMap;
 use std::ffi::c_void;
@@ -74,8 +84,8 @@ use windows::Win32::Media::MediaFoundation::{
     MFT_ENUM_FLAG_SORTANDFILTER, MFT_ENUM_FLAG_SYNCMFT, MFT_MESSAGE_NOTIFY_BEGIN_STREAMING,
     MFT_MESSAGE_NOTIFY_START_OF_STREAM, MFT_OUTPUT_DATA_BUFFER, MFT_OUTPUT_STREAM_PROVIDES_SAMPLES,
     MFT_REGISTER_TYPE_INFO, MF_E_TRANSFORM_NEED_MORE_INPUT, MF_MT_AVG_BITRATE, MF_MT_FRAME_RATE,
-    MF_MT_FRAME_SIZE, MF_MT_INTERLACE_MODE, MF_MT_MAJOR_TYPE, MF_MT_SUBTYPE, MF_TRANSFORM_ASYNC,
-    MF_TRANSFORM_ASYNC_UNLOCK, MF_VERSION,
+    MF_MT_FRAME_SIZE, MF_MT_INTERLACE_MODE, MF_MT_MAJOR_TYPE, MF_MT_MPEG2_PROFILE, MF_MT_SUBTYPE,
+    MF_TRANSFORM_ASYNC, MF_TRANSFORM_ASYNC_UNLOCK, MF_VERSION,
 };
 use windows::Win32::System::Com::CoTaskMemFree;
 
@@ -306,6 +316,21 @@ impl WindowEncoder {
             output_type.SetUINT64(&MF_MT_FRAME_RATE, pack_u64(u32::from(target_fps.max(1)), 1))?;
             output_type.SetUINT32(&MF_MT_INTERLACE_MODE, MFVideoInterlace_Progressive.0 as u32)?;
             output_type.SetUINT32(&MF_MT_AVG_BITRATE, TARGET_BITRATE_BPS)?;
+            // Constrained Baseline, on the *media type* rather than only through `ICodecAPI`
+            // (`CODECAPI_AVEncMPVProfile`, still set best-effort below). A guest run proved two
+            // other `ICodecAPI` properties on this exact encoder are accepted by `SetValue` and
+            // then ignored — including the no-B-frames one, which is how the client ended up
+            // decoding actual B-pictures under a stream this crate believed was violating
+            // nothing. A media-type attribute is not the same kind of promise: `SetOutputType`
+            // negotiates it, so the transform either accepts Constrained Baseline here (this `?`
+            // succeeds) or this function fails loudly instead of silently building an encoder
+            // that emits Main or High anyway. `MF_MT_MPEG2_PROFILE` is Media Foundation's actual
+            // attribute for signalling H.264 profile on the output type — the "MPEG2" in the name
+            // is legacy, not a mistake; there is no separate H.264-named attribute for this.
+            output_type.SetUINT32(
+                &MF_MT_MPEG2_PROFILE,
+                eAVEncH264VProfile_ConstrainedBase.0 as u32,
+            )?;
         }
         // SAFETY: `transform` is a live `IMFTransform`; `output_type` was just fully configured
         // above.
