@@ -292,6 +292,14 @@ impl<S: AsyncRead + AsyncWrite + Unpin> ClientSession<S> {
         self.clock_sync.offset_us()
     }
 
+    /// How far the offset estimate could be out, from `ClockSync` itself.
+    ///
+    /// Half the round trip of the exchange the current offset was computed from — not of the
+    /// best exchange ever seen, which would claim a precision this estimate does not have.
+    pub fn offset_error_bound_us(&self) -> Option<u64> {
+        self.clock_sync.offset_error_bound_us()
+    }
+
     /// Round-trip time statistics from the ping/pong exchange.
     pub fn rtt_us(&self) -> &oxproto::latency::Samples {
         self.clock_sync.rtt()

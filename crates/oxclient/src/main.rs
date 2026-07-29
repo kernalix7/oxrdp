@@ -16,7 +16,7 @@ use oxclient::clock::ClientClock;
 use oxclient::decode::pipeline::{Backpressure, DecodePipeline, FrameReport, FrameSink};
 use oxclient::decode::{self, WindowDecoders};
 use oxclient::geometry::GeometrySync;
-use oxclient::latency::LatencyMonitor;
+use oxclient::latency::{ArrivedFrame, LatencyMonitor};
 use oxclient::session::{ClientSession, SessionConfig};
 use oxclient::{ClientEvent, ModelChange, RemoteWindow, WindowModel};
 use oxdisplay::{CommandSender, CpuPresenter, DisplayCommand, DisplayEvent, WindowSpec};
@@ -163,6 +163,48 @@ impl log::Log for StderrLogger {
     }
 
     fn flush(&self) {}
+}
+
+/// When each frame's decode actually finished, until its acknowledgement is sent.
+///
+/// `FrameAck.decoded_us` is defined by `OXPROTO.md` §12 as the client's decode time, and the
+/// agent's flow control reads it. The display layer cannot supply it: decode now happens on a
+/// worker thread, so by the time a frame reaches the presenter the decode is long over and the
+/// presenter's own clock reading is simply when *it* started. The worker reports the real
+/// instant, and this holds it for the moment between that report and the presentation.
+///
+/// Bounded, because a frame that is decoded but never presented — the agent dropped it, or the
+/// window closed — would otherwise leave its entry behind forever.
+#[derive(Debug, Default)]
+struct DecodeTimes {
+    times: HashMap<(u32, u64), u64>,
+}
+
+impl DecodeTimes {
+    /// Frames decoded but not yet presented. A handful at most in normal operation: the agent
+    /// holds two unacknowledged frames per window by default.
+    const CAPACITY: usize = 64;
+
+    fn record(&mut self, window_id: u32, frame_id: u64, decoded_us: u64) {
+        if self.times.len() >= Self::CAPACITY {
+            // Evict the lowest frame id, which is the one least likely still to be coming.
+            if let Some(oldest) = self.times.keys().min().copied() {
+                self.times.remove(&oldest);
+            }
+        }
+        self.times.insert((window_id, frame_id), decoded_us);
+    }
+
+    /// The real decode time, or the presenter's fallback if the report never arrived.
+    fn take(&mut self, window_id: u32, frame_id: u64, fallback_us: u64) -> u64 {
+        self.times
+            .remove(&(window_id, frame_id))
+            .unwrap_or(fallback_us)
+    }
+
+    fn forget(&mut self, window_id: u32) {
+        self.times.retain(|(window, _), _| *window != window_id);
+    }
 }
 
 /// A latency monitor, on only when `OXCLIENT_LATENCY` is set.
@@ -431,7 +473,7 @@ where
     if latency.is_enabled() && latency.has_samples() {
         eprint!(
             "{}",
-            latency.report(session.rtt_us().last(), session.clock_offset_us())
+            latency.report(session.offset_error_bound_us(), session.clock_offset_us())
         );
     }
     result
@@ -449,6 +491,7 @@ where
 {
     let mut model = WindowModel::new();
     let mut geometry = GeometrySync::new();
+    let mut decode_times = DecodeTimes::default();
     // The session's own clock, not a second one: every timestamp compared below has to share an
     // epoch with the ones the session puts on the wire.
     let clock = session.clock();
@@ -461,13 +504,15 @@ where
     let mut pings = tokio::time::interval(PING_INTERVAL);
     let mut reports = tokio::time::interval(LATENCY_REPORT_INTERVAL);
     // A frame a worker had no room for. While one is held, this task stops reading the wire —
-    // see `oxclient::decode::pipeline` for why the client must not simply drop it.
-    let mut stalled: Option<Backpressure> = None;
+    // see `oxclient::decode::pipeline` for why the client must not simply drop it. The instant
+    // is kept alongside because that pause inflates the *next* frames' measured arrival time,
+    // and a measurement that cannot see its own observer effect is not much of a measurement.
+    let mut stalled: Option<(Backpressure, u64)> = None;
 
     loop {
         // Cloned out before the `select!` so the waiting branch owns its queue handle and the
         // handler is free to take `stalled`.
-        let stalled_queue = stalled.as_ref().map(|held| held.queue.clone());
+        let stalled_queue = stalled.as_ref().map(|(held, _)| held.queue.clone());
         let is_stalled = stalled_queue.is_some();
 
         tokio::select! {
@@ -504,6 +549,7 @@ where
                             decoders.forget(*id);
                             geometry.forget(*id);
                             latency.forget(*id);
+                            decode_times.forget(*id);
                         }
                         _ => {}
                     }
@@ -514,15 +560,17 @@ where
                         ModelChange::Frame(frame) => {
                             // Stamped here, the moment the frame is off the wire, because this
                             // is the boundary between "the network had it" and "we have it".
-                            latency.on_arrival(
-                                frame.window_id,
-                                frame.frame_id,
-                                frame.captured_us,
-                                frame.encoded_us,
-                                clock.now_us(),
-                            );
+                            latency.on_arrival(ArrivedFrame {
+                                window_id: frame.window_id,
+                                frame_id: frame.frame_id,
+                                captured_us: frame.captured_us,
+                                encoded_us: frame.encoded_us,
+                                arrived_us: clock.now_us(),
+                                keyframe: frame.is_keyframe(),
+                                bytes: frame.data.len(),
+                            });
                             if let Err(backpressure) = decoders.submit(frame) {
-                                stalled = Some(backpressure);
+                                stalled = Some((backpressure, clock.now_us()));
                             }
                             None
                         }
@@ -542,7 +590,8 @@ where
             // flowing throughout: refusing to read the wire is what pushes back on the agent,
             // and it costs the input path nothing.
             alive = wait_for_decode_room(stalled_queue), if is_stalled => {
-                if let Some(held) = stalled.take() {
+                if let Some((held, since)) = stalled.take() {
+                    latency.on_read_stall(clock.now_us().saturating_sub(since));
                     if alive {
                         // Sole producer on that queue: the slot reserved above is still free.
                         let _ = held.queue.try_send(held.frame);
@@ -564,6 +613,7 @@ where
                     // sees the frame long after, so it cannot report this itself.
                     FrameReport::Decoded { window_id, frame_id, decoded_us } => {
                         latency.on_decoded(window_id, frame_id, decoded_us);
+                        decode_times.record(window_id, frame_id, decoded_us);
                     }
                     FrameReport::Dropped { window_id, frame_id, finished_us } => {
                         latency.on_dropped(window_id, frame_id);
@@ -587,13 +637,12 @@ where
             }
             _ = reports.tick(), if latency.is_enabled() => {
                 if latency.has_samples() {
-                    // The *last* round trip, not the best one: the offset estimate comes from the
-                    // most recent pong, so the error bound has to come from that same exchange.
-                    // Quoting the minimum RTT beside an offset derived from a different, slower
+                    // The bound comes from `ClockSync` itself, which knows which exchange the
+                    // current offset was computed from. Deriving it here from a different RTT
                     // sample would claim a precision the estimate does not have.
                     eprint!(
                         "{}",
-                        latency.report(session.rtt_us().last(), session.clock_offset_us())
+                        latency.report(session.offset_error_bound_us(), session.clock_offset_us())
                     );
                 }
             }
@@ -602,7 +651,13 @@ where
                     return Ok(());
                 };
                 if let Err(error) = handle_display_event(
-                    session, &clock, &model, &mut geometry, latency, event,
+                    session,
+                    &clock,
+                    &model,
+                    &mut geometry,
+                    latency,
+                    &mut decode_times,
+                    event,
                 )
                 .await
                 {
@@ -661,6 +716,7 @@ async fn handle_display_event<S: AsyncRead + AsyncWrite + Unpin>(
     model: &WindowModel,
     geometry: &mut GeometrySync,
     latency: &mut LatencyMonitor,
+    decode_times: &mut DecodeTimes,
     event: DisplayEvent,
 ) -> io::Result<()> {
     match event {
@@ -827,6 +883,9 @@ async fn handle_display_event<S: AsyncRead + AsyncWrite + Unpin>(
             if let Some(offset) = session.clock_offset_us() {
                 latency.on_presented(window_id, frame_id, presented_us, offset);
             }
+            // The worker's instant, not the presenter's: §12 says this field is when the client
+            // decoded the frame, and the presenter only knows when it began presenting it.
+            let decoded_us = decode_times.take(window_id, frame_id, decoded_us);
             send_frame_ack(session, window_id, frame_id, decoded_us, presented_us).await?;
         }
         DisplayEvent::BackendError { message } => {
@@ -1117,6 +1176,7 @@ mod tests {
             model,
             geometry,
             &mut LatencyMonitor::disabled(),
+            &mut DecodeTimes::default(),
             DisplayEvent::CloseRequested { window_id },
         )
         .await
@@ -1167,6 +1227,7 @@ mod tests {
                 &model,
                 &mut geometry,
                 &mut LatencyMonitor::disabled(),
+                &mut DecodeTimes::default(),
                 event,
             )
             .await
@@ -1195,6 +1256,7 @@ mod tests {
             &model,
             &mut geometry,
             &mut LatencyMonitor::disabled(),
+            &mut DecodeTimes::default(),
             DisplayEvent::ResizeRequested {
                 window_id: 1,
                 width: 1,
@@ -1226,6 +1288,7 @@ mod tests {
             &model,
             &mut geometry,
             &mut LatencyMonitor::disabled(),
+            &mut DecodeTimes::default(),
             DisplayEvent::MoveRequested {
                 window_id: 1,
                 x: 3297,
@@ -1259,6 +1322,7 @@ mod tests {
             &model,
             &mut geometry,
             &mut LatencyMonitor::disabled(),
+            &mut DecodeTimes::default(),
             event,
         )
         .await
@@ -1269,6 +1333,7 @@ mod tests {
             &model,
             &mut geometry,
             &mut LatencyMonitor::disabled(),
+            &mut DecodeTimes::default(),
             DisplayEvent::CloseRequested { window_id: 7 },
         )
         .await
@@ -1704,6 +1769,7 @@ mod tests {
             &model,
             &mut geometry,
             &mut LatencyMonitor::disabled(),
+            &mut DecodeTimes::default(),
             DisplayEvent::ResizeRequested {
                 window_id: 1,
                 width: 1024,
