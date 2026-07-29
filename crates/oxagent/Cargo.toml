@@ -43,6 +43,10 @@ windows = { version = "0.58", features = [
     "Win32_Graphics_Gdi",
     # Window -> owning process resolution (app identity / WM_CLASS)
     "Win32_System_Threading",
+    # Session diagnostics: is this process even attached to the interactive desktop input
+    # injection would need to reach (Win32_System_Threading above gives the process id;
+    # ProcessIdToSessionId/WTSGetActiveConsoleSessionId live here)
+    "Win32_System_RemoteDesktop",
     # Input injection (P3)
     "Win32_UI_Input_KeyboardAndMouse",
     # Encoding (P5)

@@ -485,13 +485,30 @@ fn mouse_input(dx: i32, dy: i32, mouse_data: u32, flags: MOUSE_EVENT_FLAGS) -> I
 }
 
 /// Send a batch of already-built inputs, if there are any.
+///
+/// `SendInput`'s return is not a success boolean — it is the count of events it actually queued,
+/// which can be less than `inputs.len()` (including zero) without the call itself failing. That
+/// is the sharpest available signal for "the guest is silently swallowing input": a click or
+/// keystroke that never arrives looks, from the client's side, identical whether the agent never
+/// called `SendInput` at all or called it and had the queue reject every event, and only this
+/// return value tells the two apart. A common real cause for a nonzero shortfall is UIPI
+/// (`GetLastError` = `ERROR_ACCESS_DENIED`) blocking synthetic input into a window running at a
+/// higher integrity level than this process.
 fn send_inputs(inputs: &[INPUT]) {
     if inputs.is_empty() {
         return;
     }
     // SAFETY: `inputs` is a slice of fully-initialized `INPUT` values; `size_of::<INPUT>()`
     // matches the type `SendInput` is being called with, as the API requires.
-    unsafe {
-        SendInput(inputs, std::mem::size_of::<INPUT>() as i32);
+    let queued = unsafe { SendInput(inputs, std::mem::size_of::<INPUT>() as i32) };
+    if (queued as usize) < inputs.len() {
+        // SAFETY: queried immediately after the call whose shortfall this explains; nothing
+        // between the two calls can have overwritten the calling thread's last-error value.
+        let err = unsafe { GetLastError() };
+        eprintln!(
+            "oxagent: input: SendInput queued {queued}/{} events, GetLastError={}",
+            inputs.len(),
+            err.0
+        );
     }
 }

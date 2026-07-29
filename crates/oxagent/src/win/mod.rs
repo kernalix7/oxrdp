@@ -16,6 +16,8 @@ use tokio::net::TcpListener;
 use tokio::sync::Semaphore;
 use tokio_rustls::TlsAcceptor;
 use windows::Win32::Foundation::HWND;
+use windows::Win32::System::RemoteDesktop::{ProcessIdToSessionId, WTSGetActiveConsoleSessionId};
+use windows::Win32::System::Threading::GetCurrentProcessId;
 use windows::Win32::UI::HiDpi::{
     SetProcessDpiAwarenessContext, DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2,
 };
@@ -56,6 +58,37 @@ fn set_dpi_awareness() {
     }
 }
 
+/// Log which Windows session this process is running in, and whether it is the one with the
+/// interactive desktop.
+///
+/// `SendInput` only ever reaches windows in the calling process's own session — there is no
+/// cross-session variant. If this process's session does not match the active console session,
+/// every keyboard/mouse injection this agent will ever attempt is doomed before it even calls
+/// `SendInput`, and this is exactly the shape of setup that produces that: a guest agent
+/// installed as a Windows service runs in Session 0 by default (Session 0 Isolation, since
+/// Vista), completely separate from the interactive user's session, with no visible desktop of
+/// its own to inject into. Purely informational — a mismatch does not stop the agent from
+/// starting, since it affects only input, not capture or anything else this process does.
+fn log_session_context() {
+    // SAFETY: takes no arguments and cannot fail.
+    let pid = unsafe { GetCurrentProcessId() };
+    let mut own_session = 0u32;
+    // SAFETY: `pid` is this process's own id, valid for the lifetime of this call;
+    // `own_session` is a local out-parameter.
+    let resolved = unsafe { ProcessIdToSessionId(pid, &mut own_session) }.is_ok();
+    // SAFETY: takes no arguments and cannot fail.
+    let active_session = unsafe { WTSGetActiveConsoleSessionId() };
+    if !resolved {
+        eprintln!("oxagent: session: could not resolve this process's session id");
+    } else if own_session == active_session {
+        eprintln!("oxagent: session: running in session {own_session}, the active console session");
+    } else {
+        eprintln!(
+            "oxagent: session: running in session {own_session}, but the active console session is {active_session} — synthetic keyboard/mouse input cannot reach a different session's desktop"
+        );
+    }
+}
+
 /// Agent entry point: set up TLS, bind the listener, and serve clients until shutdown.
 ///
 /// Each connection is authenticated before the capture source is touched (see
@@ -67,6 +100,7 @@ fn set_dpi_awareness() {
 /// and everyone after it, forever.
 pub fn run_agent(config: &AgentConfig, print_pin: bool) -> ExitCode {
     set_dpi_awareness();
+    log_session_context();
 
     let identity =
         match AgentIdentity::load_or_generate(&config.cert_path, &config.key_path, "oxagent") {
