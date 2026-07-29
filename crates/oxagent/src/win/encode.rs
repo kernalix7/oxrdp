@@ -49,13 +49,44 @@
 //!   of the same request, it is a structurally different, unignorable one, which is why
 //!   `MAX_REF_FRAMES` below is verified from the bitstream rather than trusted from
 //!   `ICodecAPI::GetValue` either.
-//! - **Reference frame count pinned to 1, verified from the SPS, not from the property.** A
-//!   third `ICodecAPI` property on this encoder has now been demonstrated accepted-and-ignored
-//!   (the profile one, above) and a fourth was never checked against the bitstream at all until
-//!   `MAX_REF_FRAMES`. `crate::h264::sps_ref_frame_info` — an Exp-Golomb bitstream reader, not
-//!   just the fixed-byte read `sps_profile` does — reads `max_num_ref_frames` straight out of a
-//!   real keyframe's SPS, logged per frame alongside the `ICodecAPI` readback so the two can be
-//!   compared directly rather than one being assumed to imply the other.
+//! - **Reference frame count pinned to 1 — and confirmed as the fourth ignored property, the
+//!   first that lies about it.** `crate::h264::sps_ref_frame_info` (an Exp-Golomb bitstream
+//!   reader, not just the fixed-byte read `sps_profile` does) caught what `ICodecAPI::GetValue`
+//!   did not: `GetValue` echoed back exactly the requested value, `Some(1)`, while the SPS itself
+//!   said `2`. The previous three ignored properties were silent or unreported; this one reports
+//!   success it did not deliver, which is why the bitstream reading, not the property readback,
+//!   is what this file trusts. Not chased further past logging the discrepancy once per
+//!   instance: a second reference frame is legal H.264, costs one extra decoded picture's worth
+//!   of memory, and is an efficiency detail, not a correctness one — unlike the profile issue
+//!   above, which was.
+//! - **Keyframe schedule: `OXPROTO.md` §9.1's two events, an attempt at a third media-type-level
+//!   lever against the encoder's own autonomous ones, and — because that attempt might fail the
+//!   same way four `ICodecAPI` properties already have — an unconditional log of every keyframe
+//!   this crate did not ask for.** This file only ever calls `CODECAPI_AVEncVideoForceKeyFrame`
+//!   for a window's first frame in a session and a resolution change, which is what §9.1 requires
+//!   and all it requires. `CODECAPI_AVEncMPVGOPSize` was already shown unable to stop this
+//!   encoder inserting its own keyframes anyway, roughly once a second; `MF_MT_MAX_KEYFRAME_SPACING`
+//!   (`MAX_KEYFRAME_SPACING_FRAMES`) is the media-type-level version of the same request — the
+//!   same structural upgrade that fixed the profile — tried because it might succeed where the
+//!   `ICodecAPI` property did not, not because success is assumed. Whichever way that goes,
+//!   `WindowEncoder::poll` correlates every produced keyframe back to whether *that* frame was
+//!   actually requested (`pending_force_keyframe`) and logs the ones that were not, unconditionally,
+//!   for the whole session — the bandwidth §9.1's two-event policy exists to avoid stays visible
+//!   rather than assumed absent.
+//!
+//!   **Deliberately not built: a protocol-level keyframe-request message.** Today's transport is
+//!   TCP, which guarantees that everything this crate actually transmits, the client actually
+//!   receives, in order — and this file's own capture/submit/send coupling (see `crate::serve::
+//!   pump_frames`) means a frame is only ever encoded once this crate has also committed to
+//!   sending it, so today's encoder-side reference chain and what actually reaches the client can
+//!   never drift apart. That stops being true the moment a transport can lose an already-sent
+//!   frame in flight — `OXPROTO.md` has no client-initiated "I am desynchronised, send a
+//!   keyframe" message today, and a client that loses one over such a transport would have no
+//!   recovery until the next resize. This crate's read, stated rather than acted on: that gap is
+//!   real but not urgent while TCP is the only transport, and becomes worth closing specifically
+//!   when QUIC (or any transport that can silently drop a frame) lands — which is a protocol
+//!   change for `OXPROTO.md`'s owner to decide and route, not something to invent unilaterally
+//!   here.
 //!
 //! **What this file's author could not verify without a live Windows guest**, stated plainly
 //! rather than left implicit: whether `MF_TRANSFORM_ASYNC_UNLOCK` actually lets every hardware
@@ -63,19 +94,11 @@
 //! not this crate's invention, but "documented" and "true of the specific driver on the test
 //! guest" are not the same claim); the `MFTEnumEx` output array's ownership handling in
 //! [`first_activate`], which follows the COM ownership rules as documented but has had no COM
-//! debugger anywhere near it; and whether `CODECAPI_AVEncVideoMaxNumRefFrame` fares any better
-//! than the three properties already shown ignored on this same encoder — `MAX_REF_FRAMES`'s doc
-//! says why the SPS reading is what actually settles it, but that reading has not yet come back
-//! from a guest run. Two items a guest run has already surfaced and this crate has not yet acted
-//! on, deliberately, one change at a time rather than batched: `CODECAPI_AVEncMPVGOPSize` remains
-//! demonstrated-ignored, so the IDRs a guest run saw at 1/31/61/91 are still this encoder's own
-//! choice, not `OXPROTO.md` §9.1's two named events — forcing keyframes on a schedule this crate
-//! controls, rather than asking the encoder for one, is the planned fix; and whether the protocol
-//! needs a keyframe-request message at all, for a transport (unlike today's TCP) that can lose a
-//! frame with no resize in sight to recover at, is a question for `docs/design/OXPROTO.md`'s
-//! owner, not something to decide unilaterally here. All of this is exactly the class of bug the
-//! project's own history says only shows up by running the code — see `crate::win::capture`'s
-//! doc comment.
+//! debugger anywhere near it; and whether `MF_MT_MAX_KEYFRAME_SPACING` actually stops this
+//! encoder's autonomous re-keying or turns out to be a fifth ignored request — the unconditional
+//! unrequested-keyframe log exists precisely so the next guest run answers that directly instead
+//! of this file guessing a fifth time. All of this is exactly the class of bug the project's own
+//! history says only shows up by running the code — see `crate::win::capture`'s doc comment.
 
 use std::collections::HashMap;
 use std::ffi::c_void;
@@ -95,7 +118,8 @@ use windows::Win32::Media::MediaFoundation::{
     MFT_MESSAGE_NOTIFY_BEGIN_STREAMING, MFT_MESSAGE_NOTIFY_START_OF_STREAM, MFT_OUTPUT_DATA_BUFFER,
     MFT_OUTPUT_STREAM_PROVIDES_SAMPLES, MFT_REGISTER_TYPE_INFO, MF_E_TRANSFORM_NEED_MORE_INPUT,
     MF_MT_AVG_BITRATE, MF_MT_FRAME_RATE, MF_MT_FRAME_SIZE, MF_MT_INTERLACE_MODE, MF_MT_MAJOR_TYPE,
-    MF_MT_MPEG2_PROFILE, MF_MT_SUBTYPE, MF_TRANSFORM_ASYNC, MF_TRANSFORM_ASYNC_UNLOCK, MF_VERSION,
+    MF_MT_MAX_KEYFRAME_SPACING, MF_MT_MPEG2_PROFILE, MF_MT_SUBTYPE, MF_TRANSFORM_ASYNC,
+    MF_TRANSFORM_ASYNC_UNLOCK, MF_VERSION,
 };
 use windows::Win32::System::Com::CoTaskMemFree;
 
@@ -125,13 +149,32 @@ const TARGET_BITRATE_BPS: u32 = 6_000_000;
 /// a special-cased meaning for one particular number that varies by vendor.
 const GOP_SIZE_FRAMES: u32 = 1_000_000;
 
+/// `MF_MT_MAX_KEYFRAME_SPACING`, on the output media type — the same class of fix as
+/// `MF_MT_MPEG2_PROFILE`, tried for the same reason `GOP_SIZE_FRAMES` alone was not enough: a
+/// guest run confirmed `CODECAPI_AVEncMPVGOPSize` accepted and silently ignored, with autonomous
+/// IDRs still landing on the encoder's own roughly-one-second schedule. Unlike an `ICodecAPI`
+/// property, a media-type attribute is part of what `SetOutputType` negotiates — the transform
+/// either accepts it or the call fails, not a behavioural request it can quietly disregard. What
+/// this crate could **not** verify without a live guest: whether this specific attribute name is
+/// actually the lever this encoder honours for suppressing its own periodic re-keying, or whether
+/// it, too, turns out accepted-and-ignored like three properties before it. `WindowEncoder::poll`
+/// logs every keyframe this crate did not explicitly request, unconditionally, for exactly this
+/// reason — that log answers the question this comment cannot.
+const MAX_KEYFRAME_SPACING_FRAMES: u32 = GOP_SIZE_FRAMES;
+
 /// `CODECAPI_AVEncVideoMaxNumRefFrame`. A low-latency screen stream has no B-frames (no
 /// reordering) and rarely enough motion complexity for a second reference frame to earn back the
 /// decoder memory and prediction-search cost it adds; one is exactly what a P-frame needs and
-/// nothing more. Verified from the bitstream, not trusted from the property — three `ICodecAPI`
-/// properties on this same encoder have already been demonstrated accepted and silently ignored,
-/// so `crate::h264::sps_ref_frame_info`'s `max_num_ref_frames` reading is the number that
-/// actually matters; see `DIAGNOSTIC_FRAME_LIMIT`'s per-frame log.
+/// nothing more.
+///
+/// **Confirmed accepted and ignored** by a guest run: `ICodecAPI::GetValue` echoed back
+/// `Some(1)` — this property is the first of four on this encoder to report success while lying
+/// about it, rather than simply doing nothing silently or declining to report at all. The
+/// bitstream's own SPS said `max_num_ref_frames = 2`. Left pinned anyway (harmless, and may
+/// matter to a different encoder), but not chased further: a second reference frame is legal,
+/// costs one extra decoded picture's worth of memory, and buys nothing worth more engineering
+/// effort on a mostly-static desktop. `WindowEncoder::poll` logs the discrepancy once per
+/// instance so it stays visible rather than needing rediscovery.
 const MAX_REF_FRAMES: u32 = 1;
 
 /// How many access units, per [`WindowEncoder`], to log the raw (pre-[`h264::reframe`]) NAL
@@ -294,6 +337,20 @@ struct WindowEncoder {
     /// to match, the session's own `captured_us` clock.
     next_sample_time_hns: i64,
     frame_duration_hns: i64,
+    /// Whether each frame handed to `ProcessInput` and not yet drained by `poll` was submitted
+    /// with `force_keyframe = true`, oldest first. `submit` and `poll` are not 1:1 in real time —
+    /// a hardware encoder in particular can lag `submit` by more than one tick — so this is what
+    /// lets a later `poll` result be matched back to whether *that specific* frame is one this
+    /// crate actually asked to be a keyframe, rather than one this encoder decided to make a
+    /// keyframe on its own initiative. Only pushed to when `ProcessInput` actually accepts the
+    /// frame (see `submit`), so it never grows an entry for a submission the encoder never
+    /// produces a corresponding output for.
+    pending_force_keyframe: std::collections::VecDeque<bool>,
+    /// Whether the `MAX_REF_FRAMES` vs. the bitstream's own `max_num_ref_frames` discrepancy has
+    /// already been logged for this instance — the SPS does not change frame to frame within one
+    /// encoder instance, so logging the same mismatch again on every subsequent keyframe would
+    /// be repeating known information rather than reporting anything new.
+    ref_frame_discrepancy_logged: bool,
 }
 
 impl WindowEncoder {
@@ -350,6 +407,13 @@ impl WindowEncoder {
                 &MF_MT_MPEG2_PROFILE,
                 eAVEncH264VProfile_ConstrainedBase.0 as u32,
             )?;
+            // See `MAX_KEYFRAME_SPACING_FRAMES`: the same media-type-level attempt at the same
+            // problem `CODECAPI_AVEncMPVGOPSize` already failed to solve. Bundled into the same
+            // `SetOutputType` call, and the same hard `?`, as the profile constraint above —
+            // `WinFrameEncoder`'s per-window `RAW_BGRA` fallback exists precisely so a transform
+            // that rejects this attribute degrades one window gracefully rather than taking the
+            // whole session down.
+            output_type.SetUINT32(&MF_MT_MAX_KEYFRAME_SPACING, MAX_KEYFRAME_SPACING_FRAMES)?;
         }
         // SAFETY: `transform` is a live `IMFTransform`; `output_type` was just fully configured
         // above.
@@ -456,6 +520,8 @@ impl WindowEncoder {
             params: h264::ParamSets::default(),
             next_sample_time_hns: 0,
             frame_duration_hns,
+            pending_force_keyframe: std::collections::VecDeque::new(),
+            ref_frame_discrepancy_logged: false,
         })
     }
 
@@ -486,7 +552,12 @@ impl WindowEncoder {
         // simply does not get this one — the same "newest content wins over queueing"
         // philosophy `crate::pacing::FrameBudget` already applies one stage later, applied here
         // to the encoder's own internal pipeline instead of the network.
-        let _ = result;
+        if result.is_ok() {
+            // Only recorded on acceptance: a frame `ProcessInput` refused never gets a
+            // corresponding `poll` output, so pushing here regardless would leave this queue
+            // permanently one entry ahead of reality.
+            self.pending_force_keyframe.push_back(force_keyframe);
+        }
     }
 
     fn build_input_sample(&mut self, frame: &SourceFrame) -> WinResult<IMFSample> {
@@ -611,6 +682,45 @@ impl WindowEncoder {
         if data.is_empty() {
             return None;
         }
+
+        // Correlate this output back to whether *this* frame was one this crate actually asked
+        // to be a keyframe — see `pending_force_keyframe`'s doc. `unwrap_or(false)` treats an
+        // unknown correlation (the queue underflowing, which should not happen for a standard,
+        // non-reordering encoder) as "not requested": the conservative direction, since the
+        // point of this check is to never miss reporting bandwidth this crate did not ask for.
+        // Unconditional, not gated by `DIAGNOSTIC_FRAME_LIMIT`: an encoder still inserting
+        // autonomous keyframes is exactly the ongoing cost `OXPROTO.md` §9.1's two-event policy
+        // exists to avoid, for the whole session, not just its first hundred frames — and a
+        // keyframe-rate event is rare enough on its own not to flood stderr the way a per-frame
+        // log would.
+        let was_requested = self.pending_force_keyframe.pop_front().unwrap_or(false);
+        if is_idr && !was_requested {
+            eprintln!(
+                "oxagent: h264: window={:#x} produced an unrequested keyframe ({} bytes) — \
+                 OXPROTO.md §9.1 names only two events that should ever force one; this encoder \
+                 inserted this one on its own schedule despite MAX_KEYFRAME_SPACING_FRAMES",
+                self.handle,
+                data.len()
+            );
+        }
+
+        // See `MAX_REF_FRAMES`: logged once, the first time this instance's SPS is actually
+        // seen, not on every subsequent keyframe repeating the same already-known fact.
+        if !self.ref_frame_discrepancy_logged {
+            if let Some(info) = h264::first_sps_ref_frame_info(&raw) {
+                self.ref_frame_discrepancy_logged = true;
+                if info.max_num_ref_frames != MAX_REF_FRAMES {
+                    eprintln!(
+                        "oxagent: h264: window={:#x} WARNING: requested max_ref_frames={MAX_REF_FRAMES} \
+                         but the SPS says {} — CODECAPI_AVEncVideoMaxNumRefFrame was accepted and \
+                         ignored; harmless, not chased further, see MAX_REF_FRAMES",
+                        self.handle,
+                        info.max_num_ref_frames
+                    );
+                }
+            }
+        }
+
         Some(EncodedFrame {
             data,
             keyframe: is_idr,
