@@ -60,4 +60,18 @@ pub trait FrameEncoder {
     /// Drop encoder state for a window — called when it closes, so its stream context (and any
     /// GPU/hardware resources it holds) does not outlive the window.
     fn forget(&mut self, handle: isize);
+
+    /// Whether `handle` has given up on this codec permanently at its current resolution — not
+    /// "nothing ready this tick" (`poll` returning `None` already covers that), but "this window
+    /// will not produce output from this encoder no matter what is submitted to it next". A
+    /// resolution change gets a fresh attempt; the exact size that already failed does not retry
+    /// forever.
+    ///
+    /// `crate::serve::pump_frames` falls back to sending this window uncoded (`RAW_BGRA`) once
+    /// this is true, rather than silently sending nothing for it for the rest of the session — a
+    /// real guest run showed encoder construction can fail for reasons out of this crate's
+    /// control (the driver refusing a required media-type constraint, say), and codec selection
+    /// today is negotiated once per *session*, not per window, so there is no other way for one
+    /// misbehaving window not to take its whole session down with it.
+    fn failed(&self, handle: isize) -> bool;
 }

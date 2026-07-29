@@ -671,6 +671,12 @@ pub struct WinFrameEncoder {
     kind: EncoderKind,
     target_fps: u16,
     encoders: HashMap<isize, WindowEncoder>,
+    /// Handles whose `WindowEncoder` construction failed, and the size (as reported by
+    /// `SourceFrame`, before `pad_even`) it failed at. Consulted by `failed` and by `submit`
+    /// itself, so a size that has already failed once is not retried every single tick forever —
+    /// only a *different* size (a resolution change) gets a fresh attempt, since a different
+    /// size might not hit whatever the original failure was.
+    failed: HashMap<isize, (u16, u16)>,
 }
 
 impl WinFrameEncoder {
@@ -680,12 +686,18 @@ impl WinFrameEncoder {
             kind,
             target_fps,
             encoders: HashMap::new(),
+            failed: HashMap::new(),
         }
     }
 }
 
 impl FrameEncoder for WinFrameEncoder {
     fn submit(&mut self, handle: isize, frame: &SourceFrame, force_keyframe: bool) {
+        if self.failed.get(&handle) == Some(&(frame.width, frame.height)) {
+            // Already known broken at exactly this size — see `failed`'s doc. The caller checks
+            // `Self::failed` after this returns and falls back accordingly; nothing to do here.
+            return;
+        }
         let needs_rebuild = match self.encoders.get(&handle) {
             Some(enc) => !enc.matches(frame),
             None => true,
@@ -700,10 +712,16 @@ impl FrameEncoder for WinFrameEncoder {
             ) {
                 Ok(enc) => {
                     self.encoders.insert(handle, enc);
+                    self.failed.remove(&handle);
                 }
                 Err(err) => {
-                    eprintln!("oxagent: H.264 encoder setup failed for {handle:#x}: {err}");
+                    eprintln!(
+                        "oxagent: h264: encoder setup failed for {handle:#x} at {}x{}: {err} — \
+                         falling back to RAW_BGRA for this window until its resolution changes",
+                        frame.width, frame.height
+                    );
                     self.encoders.remove(&handle);
+                    self.failed.insert(handle, (frame.width, frame.height));
                     return;
                 }
             }
@@ -722,5 +740,10 @@ impl FrameEncoder for WinFrameEncoder {
 
     fn forget(&mut self, handle: isize) {
         self.encoders.remove(&handle);
+        self.failed.remove(&handle);
+    }
+
+    fn failed(&self, handle: isize) -> bool {
+        self.failed.contains_key(&handle)
     }
 }

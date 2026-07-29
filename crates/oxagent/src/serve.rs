@@ -698,12 +698,20 @@ where
 
 /// Capture and send one frame per window, subject to each window's budget.
 ///
-/// `codec` picks the path per session (chosen once, at negotiation — a session never switches
-/// codecs mid-flight): `RAW_BGRA` sends the captured pixels as-is, exactly as before this file
-/// had an encoder at all. Anything else (`H264`, today) submits the capture to `encoder` and
-/// sends whatever it has ready, which may be nothing this tick — a real encoder's output can
-/// lag its input by a frame or more, so "captured a frame" and "have something to send" are not
-/// the same event once a codec is doing real work.
+/// `codec` is the session's negotiated preference — chosen once, at negotiation, and `RAW_BGRA`
+/// never involves `encoder` at all, exactly as before this file had one. A session that
+/// negotiated `H264`, though, is a per-*session* preference, not a per-window guarantee:
+/// `encoder.submit`/`poll` do the real work for each window individually, and if a window's
+/// encoder ever reports [`FrameEncoder::failed`] — a real guest run showed construction can fail
+/// for reasons outside this crate's control — that one window falls back to sending its captured
+/// pixels as `RAW_BGRA` instead, without taking the rest of the session's windows down with it.
+/// Every window is judged independently, every tick. `FrameData.codec` always says which path a
+/// given message actually took, which is why the per-message codec is computed locally here
+/// rather than trusted to equal the outer `codec` parameter.
+///
+/// Even on the `H264` path, a submitted frame may have nothing ready to send this tick — a real
+/// encoder's output can lag its input by a frame or more, so "captured a frame" and "have
+/// something to send" are not the same event once a codec is doing real work.
 #[allow(clippy::too_many_arguments)]
 async fn pump_frames<W, WR, E>(
     writer: &mut WR,
@@ -749,50 +757,61 @@ where
         };
         let captured_us = elapsed_us(started);
 
-        let (flags, width, height, data, encoded_us) = if codec == oxproto::codec::H264 {
+        // Submitted before the `failed` check below so a construction failure discovered on
+        // *this* call already routes this very frame through the fallback, rather than losing
+        // one frame while `failed` catches up on the next tick.
+        if codec == oxproto::codec::H264 {
             encoder.submit(stream.handle, &frame, stream.needs_keyframe);
-            let Some(encoded) = encoder.poll(stream.handle) else {
-                // Nothing ready yet this tick: no `frame_id` is spent, no `FrameData` is sent.
-                // The next tick tries again — `submit` above already handed the encoder this
-                // frame's content, so nothing is lost by waiting.
-                continue;
-            };
-            if encoded.keyframe {
-                stream.needs_keyframe = false;
-            }
-            let flags = if encoded.keyframe {
-                frame_flag::KEYFRAME
+        }
+
+        let (msg_codec, flags, width, height, data, encoded_us) =
+            if codec == oxproto::codec::H264 && !encoder.failed(stream.handle) {
+                let Some(encoded) = encoder.poll(stream.handle) else {
+                    // Nothing ready yet this tick: no `frame_id` is spent, no `FrameData` is
+                    // sent. The next tick tries again — `submit` above already handed the
+                    // encoder this frame's content, so nothing is lost by waiting.
+                    continue;
+                };
+                if encoded.keyframe {
+                    stream.needs_keyframe = false;
+                }
+                let flags = if encoded.keyframe {
+                    frame_flag::KEYFRAME
+                } else {
+                    0
+                };
+                // The *coded* size, not the captured size: an encoder that padded an odd
+                // capture dimension to the even size NV12 requires reports that padded size
+                // here, so `FrameData` never disagrees with what its own bitstream's SPS says.
+                (
+                    oxproto::codec::H264,
+                    flags,
+                    encoded.width,
+                    encoded.height,
+                    encoded.data,
+                    elapsed_us(started),
+                )
             } else {
-                0
+                // `RAW_BGRA`, either because the session negotiated it outright or because this
+                // one window's encoder just reported `failed` (see this function's doc) —
+                // either way this window's own pixels, sent uncoded. Every frame is trivially a
+                // "keyframe" (there is nothing to reference), and capture and "encode" complete
+                // at the same instant since there is no separate encode step.
+                (
+                    oxproto::codec::RAW_BGRA,
+                    frame_flag::KEYFRAME,
+                    frame.width,
+                    frame.height,
+                    frame.data,
+                    captured_us,
+                )
             };
-            // The *coded* size, not the captured size: an encoder that padded an odd capture
-            // dimension to the even size NV12 requires reports that padded size here, so
-            // `FrameData` never disagrees with what its own bitstream's SPS says.
-            (
-                flags,
-                encoded.width,
-                encoded.height,
-                encoded.data,
-                elapsed_us(started),
-            )
-        } else {
-            // `RAW_BGRA`: unchanged from before this file had a real codec. Every frame is
-            // trivially a "keyframe" (there is nothing to reference), and capture and "encode"
-            // complete at the same instant since there is no separate encode step.
-            (
-                frame_flag::KEYFRAME,
-                frame.width,
-                frame.height,
-                frame.data,
-                captured_us,
-            )
-        };
 
         let frame_id = stream.budget.on_captured();
         let body = Message::FrameData(FrameData {
             window_id: id,
             frame_id,
-            codec,
+            codec: msg_codec,
             flags,
             width,
             height,
@@ -970,6 +989,9 @@ mod tests {
             None
         }
         fn forget(&mut self, _: isize) {}
+        fn failed(&self, _: isize) -> bool {
+            false
+        }
     }
 
     /// One recorded call to a [`FrameEncoder`], for asserting exactly what `pump_frames` asked
@@ -984,11 +1006,16 @@ mod tests {
     /// immediately available from the very next `poll` for that window — and reports every call
     /// over a channel. `coded_size`, when set, overrides the width/height the encoder reports
     /// for its output, independent of the input frame's own size — the same way a real encoder
-    /// padding an odd capture dimension to the even size NV12 requires would.
+    /// padding an odd capture dimension to the even size NV12 requires would. `failing`, when a
+    /// handle is inserted into it, makes `failed()` report `true` for exactly that handle — for
+    /// tests of the per-window `RAW_BGRA` fallback (`crate::serve::pump_frames`'s doc); `submit`/
+    /// `poll` still record and behave normally for a failing handle, since the fake does not
+    /// know *why* a real encoder would have failed, only that this test wants it to have.
     struct RecordingEncoder {
         calls: mpsc::UnboundedSender<EncoderCall>,
         pending: HashMap<isize, EncodedFrame>,
         coded_size: Option<(u16, u16)>,
+        failing: std::collections::HashSet<isize>,
     }
 
     impl RecordingEncoder {
@@ -997,6 +1024,7 @@ mod tests {
                 calls,
                 pending: HashMap::new(),
                 coded_size: None,
+                failing: std::collections::HashSet::new(),
             }
         }
     }
@@ -1025,6 +1053,10 @@ mod tests {
 
         fn forget(&mut self, handle: isize) {
             let _ = self.calls.send(EncoderCall::Forget { handle });
+        }
+
+        fn failed(&self, handle: isize) -> bool {
+            self.failing.contains(&handle)
         }
     }
 
@@ -2457,6 +2489,81 @@ mod tests {
             rx.try_recv().is_err(),
             "a RAW_BGRA session must never call the encoder"
         );
+
+        drop(client);
+        let _ = agent_task.await;
+    }
+
+    #[tokio::test]
+    async fn a_window_whose_encoder_failed_falls_back_to_raw_bgra_within_an_h264_session() {
+        // `FakeSource::one_window` always uses handle 0x1000 — see there.
+        let (mut client, agent) = tokio::io::duplex(64 * 1024);
+        let (tx, _rx) = mpsc::unbounded_channel();
+
+        let agent_task = tokio::spawn(async move {
+            let mut source = FakeSource::one_window(8);
+            let mut sink = NoopSink;
+            let mut encoder = RecordingEncoder::new(tx);
+            encoder.failing.insert(0x1000);
+            let session_slot = Semaphore::new(1);
+            run_session(
+                agent,
+                &mut source,
+                &mut sink,
+                &mut encoder,
+                SessionParams {
+                    target_fps: 240,
+                    max_frames_in_flight: 2,
+                },
+                32,
+                "secret",
+                &[oxproto::codec::RAW_BGRA, oxproto::codec::H264],
+                far_deadline(),
+                &session_slot,
+            )
+            .await
+        });
+
+        let mut r = Reassembler::new();
+        write_message(
+            &mut client,
+            &hello_with("secret", feature::FRAME_ACK, vec![oxproto::codec::H264]),
+            channel::CONTROL,
+        )
+        .await
+        .unwrap();
+        let sh = read_message(&mut client, &mut r).await.unwrap().unwrap();
+        let Message::ServerHello(sh) = sh else {
+            panic!("expected ServerHello, got {sh:?}")
+        };
+        assert_eq!(
+            sh.codec,
+            oxproto::codec::H264,
+            "the session negotiates H264 as usual — the fallback is per window, not per session"
+        );
+
+        let mut saw_raw = false;
+        for _ in 0..32 {
+            match read_message(&mut client, &mut r).await.unwrap().unwrap() {
+                Message::FrameData(f) => {
+                    assert_eq!(
+                        f.codec,
+                        oxproto::codec::RAW_BGRA,
+                        "a window whose encoder failed must send RAW_BGRA even though the \
+                         session negotiated H264"
+                    );
+                    assert_ne!(
+                        f.flags & frame_flag::KEYFRAME,
+                        0,
+                        "every RAW_BGRA frame is trivially a keyframe"
+                    );
+                    saw_raw = true;
+                    break;
+                }
+                _ => continue,
+            }
+        }
+        assert!(saw_raw, "expected at least one FrameData");
 
         drop(client);
         let _ = agent_task.await;
