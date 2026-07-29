@@ -260,18 +260,19 @@ comments for the current story.
       confirmed against the guest yet.
 ▶  P4  Multi-window polish: z-order sync, icons, further HAS_FRAME edge cases, the
       cross-channel-ordering geometry gap noted in §4 (crates/oxclient — routed, not yet fixed).
-▶  P5  Media Foundation H.264 encoder — IN FLIGHT NOW (uncommitted: crates/oxagent/src/
-      {encode,h264,nv12}.rs). Client-side H.264 decode already landed (2026-07-28), behind the
-      default-on `h264` feature, validated only via unit tests against openh264's own encoder
-      output — not yet against a real agent-encoded stream, since the agent doesn't encode H.264
-      yet. Once the encoder lands: negotiate H.264 end-to-end against the real guest and record
-      the result here with the same rigor as P1c/P2b/P3 got.
+▶  P5  Media Foundation H.264 encoder — LANDED (`dfd715a`) and negotiating H.264 end-to-end
+      against the real guest, but not clean: three ICodecAPI settings have been accepted and
+      silently disregarded by this guest's encoder (one of them reporting success on read-back
+      while the bitstream said otherwise), and an unrequested keyframe every ~30 frames is still
+      not confirmed suppressed. See §9 for the specifics — kept ▶ rather than ✅ until the
+      keyframe behavior is actually confirmed stopped, not just detected.
    P5b SIMD for the YUV→BGRA conversion — flagged as the next perf target: measured at 75-87% of
       client-side decode cost at the sizes where the measurement is clean (6f005ba). Not started.
-   P6  Latency harness: the protocol now carries every timestamp needed (captured_us/encoded_us/
-      decoded_us/presented_us, Ping/Pong for clock offset) but nothing has assembled them into a
-      measured number yet, and there is still no recorded FreeRDP baseline on the same guest.
-      This is the claim the whole pivot rests on; it remains unmeasured.
+▶  P6  Latency harness — LANDED (`3ff545d`, `f5d161c`) and has produced a first real number
+      against the live guest (§9), but an adversarial review of the instrument itself
+      (2026-07-29) found a real defect affecting three of its six reported figures — see §9
+      before trusting the exact numbers for an architectural decision. There is still no recorded
+      FreeRDP baseline on the same guest to compare against.
       QUIC transport, clipboard/audio also land around here.
 ```
 
@@ -362,6 +363,89 @@ it never retried.
 Verified against the guest in the scenario that previously failed — a Notepad window with two
 Terminal windows stacked over it. Typing after a click now lands in Notepad: its title went from
 `*abcabc - Notepad` to `*abcabczz - Notepad`.
+
+### Media Foundation encoder: three settings disregarded, keyframe cadence still unresolved (2026-07-29)
+
+Validated on the live guest in the sense that H.264 now negotiates and streams end-to-end
+(`dfd715a` onward) — RAW_BGRA is no longer the only path a real session runs. Not validated in
+the sense of "does what was asked": this guest's hardware encoder has ignored requested settings
+three separate times, discovered only by reading the actual bitstream rather than trusting the
+API's own report of what it set:
+
+- **`CODECAPI_AVEncMPVDefaultBPictureCount = 0`** — set, but ignored: the client's SPS parser
+  showed Main profile, which permits B-frames, and every one of a batch of rejected access units
+  turned out to be exactly that. Fixed structurally, not by asking harder: pinning the profile to
+  Constrained Baseline through `SetOutputType` (a negotiation the transform must honor) rather
+  than through `ICodecAPI` (a request it can silently drop) — confirmed fixed by reading
+  `profile_idc` back out of real SPS bytes.
+- **Reference frame count** — this is the "false success" case. `GetValue` echoed back the
+  requested value (1); the actual encoded SPS said 2. Confirmed by writing a real Exp-Golomb /
+  emulation-prevention-byte bitstream reader (H.264 §9.1, §7.4.1.1) rather than trusting the API
+  — reading a spec-compliant SPS field by field is the only way this discrepancy was even
+  visible.
+- **`CODECAPI_AVEncMPVGOPSize`** — this one failed outright rather than silently succeeding.
+  Replaced with `MF_MT_MAX_KEYFRAME_SPACING` on the output media type (same structural fix as the
+  profile). **Not yet confirmed to work**: an unrequested ~100–137 KB keyframe (versus a
+  ~236-byte delta — roughly a 3 Mbit/s floor per window for a static desktop) is still appearing
+  every ~30 frames as of the latest commit (`4816e96`). What landed instead of a confirmed fix is
+  detection: every keyframe is now correlated against whether this session actually asked for
+  it, and an unrequested one is logged with its byte cost for the whole session, not just the
+  first hundred frames. If the `MAX_KEYFRAME_SPACING` lever works, the log goes silent after
+  frame 1; as of this writing, whether it has gone silent has not been recorded here.
+
+Net: H.264 is real and negotiates, but nobody should assume an `ICodecAPI` setting on this
+encoder took effect without reading it back from the bitstream — that pattern has held three
+times in a row now, not once.
+
+### Latency: first measurement taken, and a real defect found reviewing the instrument (2026-07-29)
+
+**The measurement.** `crates/oxclient/src/latency.rs` (`3ff545d`, `f5d161c`) measured a live
+session end to end: release builds both sides, software codec, 628 frames against the real
+guest, `Ping`/`Pong` wired up for the first time (before this, the client sent no pings and
+discarded every pong, so agent and client timestamps could never be compared at all).
+
+```
+capture->encode  p50   8,142 us
+encode->arrival  p50   5,433 us   p95  45,184   p99  53,490
+arrival->decode  p50   4,899 us
+decode->present  p50   1,172 us
+END TO END       p50  20,107 us   p95  60,613   p99  70,356
+```
+
+~20 ms median capture-to-present through a VM port forward, software codec throughout — the
+pivot's premise holds at the median. The tail is roughly three times the median and sits almost
+entirely in `encode→arrival`, which a follow-up (`f5d161c`) partly attributed to the instrument's
+own backpressure (this client deliberately stops reading the wire under decode pressure, and
+that pause was, before that commit, being silently charged to "the network") rather than pure
+transmission time.
+
+**Before trusting the exact numbers for an architectural decision, read this.** An adversarial
+review of `crates/oxclient/src/latency.rs` (2026-07-29, same day) found that **two of the module's
+"exact, client-clock-only" stages are not exact**: `decode_to_present_us` and `client_us` (and
+therefore `total_us`/END TO END, which contains `decode_to_present_us`) are computed using
+`presented_us` from `oxdisplay::CpuPresenter`'s own private `Instant`, while the other side of
+each subtraction (`decoded_us`, `arrived_us`, the offset-converted `captured_us`) comes from the
+session's shared `ClientClock`. These are two different, independently-zeroed clocks —
+`CpuPresenter::new()` takes no clock parameter and has never been given one. `PresentTimes`'s own
+doc comment promises "client monotonic microseconds"; what it actually returns is *a* client
+monotonic clock, just not the one every other timestamp in the system shares. The bug is a
+one-time constant bias (however long after `ClientClock::new()` the display thread's
+`CpuPresenter::new()` happens to run — TLS handshake plus window-system startup, not measured),
+and because `CpuPresenter` is always constructed *after* the session's clock, that bias makes
+`decode_to_present_us`, `client_us`, and `total_us` read **systematically low**, potentially by
+more than the true value of the stage it corrupts most (`decode->present`, p50 1,172 us in the
+run above, is exactly the kind of small number a multi-millisecond startup skew could swamp).
+`arrival_to_decode_us` and `capture_to_encode_us` are unaffected — they're fed from the decode
+worker's own `ClientClock`-based report and pure agent-clock timestamps respectively, neither of
+which touches the presenter's clock. Not something the existing "do the four stages sum to the
+total" test can catch: the same biased `presented_us` term appears in both `decode_to_present_us`
+and `total_us`, so the identity holds even though both are wrong by the same amount. Full
+findings — including a real sampling-bias risk in how dropped/never-presented frames are excluded
+from the percentiles, and why p95/p99 on the 11–32-frame windows in some of today's runs are not
+statistically distinguishable from `max` — reported to the team lead directly; not fixed here,
+since `crates/oxclient/**` was out of scope for this review. **Treat the numbers above as
+directionally right and methodologically sound, but the precise client-side and end-to-end
+figures as a probable underestimate until the clock-source bug is fixed.**
 
 ## 10. Key technical learnings (don't relearn these)
 
