@@ -8,6 +8,33 @@ All notable changes to oxrdp are documented here. The format is based on
 
 ## [Unreleased]
 
+### H.264 encoding, measured on the guest (2026-07-29)
+
+The agent now encodes with Media Foundation, and `codec=2` negotiates end to end against the
+real guest. The number this work existed to change:
+
+| | RAW_BGRA | H.264 |
+|---|---|---|
+| keyframe, 596x623 window | 1,485,232 B | 27,262 B |
+| delta frame, same window | 1,485,232 B | **236 B** |
+
+Every frame was a full uncompressed buffer before, because there was no encoder — a single
+window cost roughly 470 Mbit/s. A delta frame is now about 6,300 times smaller than the buffer
+it replaces, and even a keyframe is 54 times smaller.
+
+Written to §9.1 rather than to Media Foundation's defaults, which disagree with it: parameter
+sets are re-emitted on every keyframe whether or not the transform included them, the KEYFRAME
+flag is set from the NAL type that actually came out rather than from what was requested, and
+B-frames are disabled through ICodecAPI rather than assumed — §12's flow control drops the
+oldest unacknowledged frame, which is unsound the moment a later frame can reference a skipped
+one. If no encoder is available the agent never offers H.264 and sessions run on RAW_BGRA
+exactly as before.
+
+Three things are documented as unverified in the encoder's own module doc rather than only in a
+report: whether `MF_TRANSFORM_ASYNC_UNLOCK` really drives this guest's hardware encoder
+synchronously, whether the driver honours the `ICodecAPI` properties rather than silently
+ignoring them, and the COM ownership handling around `MFTEnumEx`.
+
 ### Security (2026-07-28)
 
 An adversarial review of the agent's network-facing surface, prompted by input injection
