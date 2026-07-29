@@ -59,20 +59,24 @@
 //!   instance: a second reference frame is legal H.264, costs one extra decoded picture's worth
 //!   of memory, and is an efficiency detail, not a correctness one — unlike the profile issue
 //!   above, which was.
-//! - **Keyframe schedule: `OXPROTO.md` §9.1's two events, an attempt at a third media-type-level
-//!   lever against the encoder's own autonomous ones, and — because that attempt might fail the
-//!   same way four `ICodecAPI` properties already have — an unconditional log of every keyframe
-//!   this crate did not ask for.** This file only ever calls `CODECAPI_AVEncVideoForceKeyFrame`
-//!   for a window's first frame in a session and a resolution change, which is what §9.1 requires
-//!   and all it requires. `CODECAPI_AVEncMPVGOPSize` was already shown unable to stop this
-//!   encoder inserting its own keyframes anyway, roughly once a second; `MF_MT_MAX_KEYFRAME_SPACING`
-//!   (`MAX_KEYFRAME_SPACING_FRAMES`) is the media-type-level version of the same request — the
-//!   same structural upgrade that fixed the profile — tried because it might succeed where the
-//!   `ICodecAPI` property did not, not because success is assumed. Whichever way that goes,
-//!   `WindowEncoder::poll` correlates every produced keyframe back to whether *that* frame was
-//!   actually requested (`pending_force_keyframe`) and logs the ones that were not, unconditionally,
-//!   for the whole session — the bandwidth §9.1's two-event policy exists to avoid stays visible
-//!   rather than assumed absent.
+//! - **Keyframe schedule: `OXPROTO.md` §9.1's two events, and nothing else this file ever asks
+//!   for — the encoder's own autonomous ones are now a confirmed, permanent bandwidth line item,
+//!   not a bug this file is still chasing.** This file only ever calls
+//!   `CODECAPI_AVEncVideoForceKeyFrame` for a window's first frame in a session and a resolution
+//!   change, which is what §9.1 requires and all it requires. `MF_MT_MAX_KEYFRAME_SPACING`
+//!   (`MAX_KEYFRAME_SPACING_FRAMES`) was tried as a media-type-level lever against the encoder's
+//!   own periodic re-keying — the same structural upgrade that fixed the profile — and a guest
+//!   run confirmed it, too, accepted and ignored: 23 unrequested keyframes in one run, still
+//!   landing on the same roughly-one-second schedule as before the attempt, `WindowEncoder::poll`
+//!   detecting and logging every one. That makes five settings on this encoder now demonstrated
+//!   disregarded (`CODECAPI_AVEncMPVGOPSize`, `CODECAPI_AVEncMPVDefaultBPictureCount`,
+//!   `CODECAPI_AVEncMPVProfile`, `CODECAPI_AVEncVideoMaxNumRefFrame`, and this one), and a sixth
+//!   lever was explicitly ruled out rather than attempted: the honest options left are encoding
+//!   with something else, or accounting for the cost, and neither is worth doing blind. The
+//!   correlation and detection this required (`WindowEncoder::pending`, matching each produced
+//!   keyframe back to whether *that specific* frame was actually requested) stays regardless —
+//!   it is what turned "still happening" from a guess into a guest-run-confirmed count and a
+//!   byte cost, unconditionally, for the whole session, not just its first hundred frames.
 //!
 //!   **Deliberately not built: a protocol-level keyframe-request message.** Today's transport is
 //!   TCP, which guarantees that everything this crate actually transmits, the client actually
@@ -82,11 +86,24 @@
 //!   never drift apart. That stops being true the moment a transport can lose an already-sent
 //!   frame in flight — `OXPROTO.md` has no client-initiated "I am desynchronised, send a
 //!   keyframe" message today, and a client that loses one over such a transport would have no
-//!   recovery until the next resize. This crate's read, stated rather than acted on: that gap is
-//!   real but not urgent while TCP is the only transport, and becomes worth closing specifically
-//!   when QUIC (or any transport that can silently drop a frame) lands — which is a protocol
-//!   change for `OXPROTO.md`'s owner to decide and route, not something to invent unilaterally
-//!   here.
+//!   recovery until the next resize. This crate's read, accepted and recorded rather than
+//!   routed as a spec change now: that gap is real but not urgent while TCP is the only
+//!   transport, and becomes worth closing specifically when QUIC (or any transport that can
+//!   silently drop a frame) lands.
+//! - **`capture->encode` latency, split by what actually costs it, not assumed.** A guest
+//!   measurement found that stage running 5.7-8ms p50 and reaching for the obvious explanation —
+//!   the CPU-side `bgra_to_nv12` conversion — turned out to be exactly the kind of unverified
+//!   assumption the keyframe-size hypothesis had just been punished for making, from the
+//!   opposite direction: a standalone benchmark of the shipped conversion algorithm, at the
+//!   window sizes this project actually tests against, measured well under 1ms. Conversion and
+//!   the transform's own `ProcessInput`/`ProcessOutput` compute have entirely different fixes
+//!   (SIMD versus "this encoder might not have one"), so guessing which one to chase was worth
+//!   ruling out rather than risking. `WindowEncoder::poll` and `submit` now time each
+//!   independently per frame (`PendingSubmission::convert_us`/`process_input_us`,
+//!   `accumulated_process_output_us`) and log the split for the first
+//!   `DIAGNOSTIC_FRAME_LIMIT` frames of every window — permanent, the same as the NAL summary and
+//!   the unrequested-keyframe detector, so a future regression in either half is visible by
+//!   which number moved, not rediscovered from a latency percentile.
 //!
 //! **What this file's author could not verify without a live Windows guest**, stated plainly
 //! rather than left implicit: whether `MF_TRANSFORM_ASYNC_UNLOCK` actually lets every hardware
@@ -94,11 +111,14 @@
 //! not this crate's invention, but "documented" and "true of the specific driver on the test
 //! guest" are not the same claim); the `MFTEnumEx` output array's ownership handling in
 //! [`first_activate`], which follows the COM ownership rules as documented but has had no COM
-//! debugger anywhere near it; and whether `MF_MT_MAX_KEYFRAME_SPACING` actually stops this
-//! encoder's autonomous re-keying or turns out to be a fifth ignored request — the unconditional
-//! unrequested-keyframe log exists precisely so the next guest run answers that directly instead
-//! of this file guessing a fifth time. All of this is exactly the class of bug the project's own
-//! history says only shows up by running the code — see `crate::win::capture`'s doc comment.
+//! debugger anywhere near it; and whether the `capture->encode` timing split
+//! (`PendingSubmission::convert_us` vs. `process_input_us`/`accumulated_process_output_us`)
+//! actually lands on the side a standalone benchmark predicted, or turns out to disagree with it
+//! the way the keyframe-size hypothesis disagreed with the data that killed it — the log exists
+//! precisely so the next guest run says which, instead of this file assuming its own benchmark
+//! transfers unchanged to guest hardware it has never run on. All of this is exactly the class of
+//! bug the project's own history says only shows up by running the code — see
+//! `crate::win::capture`'s doc comment.
 
 use std::collections::HashMap;
 use std::ffi::c_void;
@@ -149,17 +169,22 @@ const TARGET_BITRATE_BPS: u32 = 6_000_000;
 /// a special-cased meaning for one particular number that varies by vendor.
 const GOP_SIZE_FRAMES: u32 = 1_000_000;
 
-/// `MF_MT_MAX_KEYFRAME_SPACING`, on the output media type — the same class of fix as
-/// `MF_MT_MPEG2_PROFILE`, tried for the same reason `GOP_SIZE_FRAMES` alone was not enough: a
-/// guest run confirmed `CODECAPI_AVEncMPVGOPSize` accepted and silently ignored, with autonomous
-/// IDRs still landing on the encoder's own roughly-one-second schedule. Unlike an `ICodecAPI`
-/// property, a media-type attribute is part of what `SetOutputType` negotiates — the transform
-/// either accepts it or the call fails, not a behavioural request it can quietly disregard. What
-/// this crate could **not** verify without a live guest: whether this specific attribute name is
-/// actually the lever this encoder honours for suppressing its own periodic re-keying, or whether
-/// it, too, turns out accepted-and-ignored like three properties before it. `WindowEncoder::poll`
-/// logs every keyframe this crate did not explicitly request, unconditionally, for exactly this
-/// reason — that log answers the question this comment cannot.
+/// `MF_MT_MAX_KEYFRAME_SPACING`, on the output media type — tried as the same class of fix as
+/// `MF_MT_MPEG2_PROFILE` (a `SetOutputType`-negotiated media-type attribute, not a behavioural
+/// `ICodecAPI` hint the transform can quietly disregard), for the same reason `GOP_SIZE_FRAMES`
+/// alone was not enough: a guest run had confirmed `CODECAPI_AVEncMPVGOPSize` accepted and
+/// silently ignored.
+///
+/// **Confirmed, by a later guest run, not to be the lever this encoder honours either**: 23
+/// unrequested keyframes in one run, on the same roughly-one-second schedule as before this was
+/// set. Unlike the profile fix, the "media type is negotiated" argument did not hold here — that
+/// framing turned out to be true of the *coded format* (which the bitstream fundamentally is,
+/// so `SetOutputType` had no choice but to honour or reject it), not of a rate-control hint that
+/// merely happens to be expressible as a media-type attribute, which is what keyframe spacing
+/// is. Left set anyway (harmless, may matter elsewhere) but not chased with a sixth lever: five
+/// settings on this encoder have now been demonstrated disregarded, and `WindowEncoder::poll`'s
+/// unconditional unrequested-keyframe log is what makes the residual cost visible and countable
+/// instead of assumed away.
 const MAX_KEYFRAME_SPACING_FRAMES: u32 = GOP_SIZE_FRAMES;
 
 /// `CODECAPI_AVEncVideoMaxNumRefFrame`. A low-latency screen stream has no B-frames (no
@@ -308,6 +333,18 @@ fn get_u32_property(api: &ICodecAPI, property: &GUID) -> Option<u32> {
     u32::try_from(&value).ok()
 }
 
+/// One `submit`ted frame's bookkeeping, kept until the matching `poll` drains it — see
+/// `WindowEncoder::pending`'s doc for why a queue rather than a single slot.
+struct PendingSubmission {
+    force_keyframe: bool,
+    /// Wall-clock microseconds spent in `bgra_to_nv12` for this specific frame — the
+    /// colour-conversion half of `capture->encode`, isolated from everything else on either
+    /// side of it, so a guest run can say which half of that stage actually costs the time.
+    convert_us: u64,
+    /// Wall-clock microseconds spent in the `ProcessInput` call that accepted this frame.
+    process_input_us: u64,
+}
+
 /// One window's live Media Foundation H.264 encoder stream.
 struct WindowEncoder {
     /// Native handle, kept only for `DIAGNOSTIC_FRAME_LIMIT` logging — nothing in this struct's
@@ -337,15 +374,20 @@ struct WindowEncoder {
     /// to match, the session's own `captured_us` clock.
     next_sample_time_hns: i64,
     frame_duration_hns: i64,
-    /// Whether each frame handed to `ProcessInput` and not yet drained by `poll` was submitted
-    /// with `force_keyframe = true`, oldest first. `submit` and `poll` are not 1:1 in real time —
-    /// a hardware encoder in particular can lag `submit` by more than one tick — so this is what
-    /// lets a later `poll` result be matched back to whether *that specific* frame is one this
-    /// crate actually asked to be a keyframe, rather than one this encoder decided to make a
-    /// keyframe on its own initiative. Only pushed to when `ProcessInput` actually accepts the
+    /// One entry per frame handed to `ProcessInput` and not yet drained by `poll`, oldest first.
+    /// `submit` and `poll` are not 1:1 in real time — a hardware encoder in particular can lag
+    /// `submit` by more than one tick — so this is what lets a later `poll` result be matched
+    /// back to *that specific* frame: whether this crate actually asked for it to be a keyframe,
+    /// and how long its pieces took. Only pushed to when `ProcessInput` actually accepts the
     /// frame (see `submit`), so it never grows an entry for a submission the encoder never
     /// produces a corresponding output for.
-    pending_force_keyframe: std::collections::VecDeque<bool>,
+    pending: std::collections::VecDeque<PendingSubmission>,
+    /// Wall-clock microseconds accumulated across `ProcessOutput` calls since a sample was last
+    /// actually produced. An encoder can need more than one `poll` before it has anything ready
+    /// — every one of those calls is real compute time toward whatever frame eventually comes
+    /// out, so this accumulates across them rather than only counting the one call that finally
+    /// succeeds.
+    accumulated_process_output_us: u64,
     /// Whether the `MAX_REF_FRAMES` vs. the bitstream's own `max_num_ref_frames` discrepancy has
     /// already been logged for this instance — the SPS does not change frame to frame within one
     /// encoder instance, so logging the same mismatch again on every subsequent keyframe would
@@ -520,7 +562,8 @@ impl WindowEncoder {
             params: h264::ParamSets::default(),
             next_sample_time_hns: 0,
             frame_duration_hns,
-            pending_force_keyframe: std::collections::VecDeque::new(),
+            pending: std::collections::VecDeque::new(),
+            accumulated_process_output_us: 0,
             ref_frame_discrepancy_logged: false,
         })
     }
@@ -542,12 +585,14 @@ impl WindowEncoder {
             }
         }
 
-        let Ok(sample) = self.build_input_sample(frame) else {
+        let Ok((sample, convert_us)) = self.build_input_sample(frame) else {
             return;
         };
+        let input_start = std::time::Instant::now();
         // SAFETY: `sample` is a fully populated `IMFSample` built for this transform's negotiated
         // NV12 input type.
         let result = unsafe { self.transform.ProcessInput(0, &sample, 0) };
+        let process_input_us = input_start.elapsed().as_micros() as u64;
         // An encoder that cannot take more input right now (still working on a previous frame)
         // simply does not get this one — the same "newest content wins over queueing"
         // philosophy `crate::pacing::FrameBudget` already applies one stage later, applied here
@@ -556,11 +601,19 @@ impl WindowEncoder {
             // Only recorded on acceptance: a frame `ProcessInput` refused never gets a
             // corresponding `poll` output, so pushing here regardless would leave this queue
             // permanently one entry ahead of reality.
-            self.pending_force_keyframe.push_back(force_keyframe);
+            self.pending.push_back(PendingSubmission {
+                force_keyframe,
+                convert_us,
+                process_input_us,
+            });
         }
     }
 
-    fn build_input_sample(&mut self, frame: &SourceFrame) -> WinResult<IMFSample> {
+    /// Returns the built sample and how long `bgra_to_nv12` itself took, in microseconds — not
+    /// `pad_bgra` (a no-op for the common case of an already-even capture size) and not the
+    /// `IMFMediaBuffer` lock/copy below (Media-Foundation plumbing overhead, a different cost
+    /// than colour conversion) — see `PendingSubmission::convert_us`.
+    fn build_input_sample(&mut self, frame: &SourceFrame) -> WinResult<(IMFSample, u64)> {
         // The captured frame may be smaller than `self.width`/`self.height` by exactly the
         // padding `pad_even` added; `bgra_to_nv12` needs an even-sized buffer, so pad here by
         // reusing the last valid row/column — edge-replication, not resampling.
@@ -571,7 +624,9 @@ impl WindowEncoder {
             self.width,
             self.height,
         );
+        let convert_start = std::time::Instant::now();
         let nv12 = bgra_to_nv12(&padded, self.width as usize, self.height as usize);
+        let convert_us = convert_start.elapsed().as_micros() as u64;
 
         let buffer = unsafe { MFCreateMemoryBuffer(nv12.len() as u32)? };
         {
@@ -596,7 +651,7 @@ impl WindowEncoder {
             sample.SetSampleDuration(self.frame_duration_hns)?;
         }
         self.next_sample_time_hns += self.frame_duration_hns;
-        Ok(sample)
+        Ok((sample, convert_us))
     }
 
     fn poll(&mut self) -> Option<EncodedFrame> {
@@ -621,12 +676,16 @@ impl WindowEncoder {
             pEvents: std::mem::ManuallyDrop::new(None),
         };
         let mut status: u32 = 0;
+        let output_start = std::time::Instant::now();
         // SAFETY: `output` is a single, fully-initialized `MFT_OUTPUT_DATA_BUFFER`; its sample
         // (if any) was just allocated above with the size `GetOutputStreamInfo` reported.
         let result = unsafe {
             self.transform
                 .ProcessOutput(0, std::slice::from_mut(&mut output), &mut status)
         };
+        // Accumulated, not overwritten: see `accumulated_process_output_us`'s doc — this call
+        // may be one of several before a sample actually comes out.
+        self.accumulated_process_output_us += output_start.elapsed().as_micros() as u64;
 
         let produced = match result {
             Ok(()) => std::mem::ManuallyDrop::into_inner(output.pSample),
@@ -640,6 +699,14 @@ impl WindowEncoder {
         let sample = produced?;
         let buffer = unsafe { sample.ConvertToContiguousBuffer() }.ok()?;
         let raw = read_buffer(&buffer)?;
+
+        // Popped unconditionally, not inside the `DIAGNOSTIC_FRAME_LIMIT` gate below: a
+        // submission left uncorrelated here would misalign every later one. `process_output_us`
+        // is reset immediately after reading it — see `accumulated_process_output_us`'s doc.
+        let timing = self.pending.pop_front();
+        let process_output_us = self.accumulated_process_output_us;
+        self.accumulated_process_output_us = 0;
+        let was_requested = timing.as_ref().is_some_and(|t| t.force_keyframe);
 
         if self.frames_seen < DIAGNOSTIC_FRAME_LIMIT {
             self.frames_seen += 1;
@@ -670,8 +737,23 @@ impl WindowEncoder {
                     )
                 })
                 .unwrap_or_default();
+            // The `capture->encode` split: does the colour conversion or the transform's own
+            // compute actually own that stage's latency? See `PendingSubmission::convert_us`.
+            // `timing` can be `None` if `self.pending` ever underflows (should not happen for a
+            // standard, non-reordering encoder) — reported as missing rather than guessed at.
+            let timings = match &timing {
+                Some(t) => format!(
+                    " convert_us={} process_input_us={process_input_us} \
+                     process_output_us={process_output_us} total_encode_us={total}",
+                    t.convert_us,
+                    process_input_us = t.process_input_us,
+                    total = t.convert_us + t.process_input_us + process_output_us
+                ),
+                None => " convert_us=? process_input_us=? process_output_us=? total_encode_us=?"
+                    .to_string(),
+            };
             eprintln!(
-                "oxagent: h264: window={:#x} frame={} nals=[{}]{profile}{ref_frames}",
+                "oxagent: h264: window={:#x} frame={} nals=[{}]{profile}{ref_frames}{timings}",
                 self.handle,
                 self.frames_seen,
                 nals.join(", ")
@@ -683,17 +765,15 @@ impl WindowEncoder {
             return None;
         }
 
-        // Correlate this output back to whether *this* frame was one this crate actually asked
-        // to be a keyframe — see `pending_force_keyframe`'s doc. `unwrap_or(false)` treats an
-        // unknown correlation (the queue underflowing, which should not happen for a standard,
-        // non-reordering encoder) as "not requested": the conservative direction, since the
-        // point of this check is to never miss reporting bandwidth this crate did not ask for.
-        // Unconditional, not gated by `DIAGNOSTIC_FRAME_LIMIT`: an encoder still inserting
-        // autonomous keyframes is exactly the ongoing cost `OXPROTO.md` §9.1's two-event policy
-        // exists to avoid, for the whole session, not just its first hundred frames — and a
-        // keyframe-rate event is rare enough on its own not to flood stderr the way a per-frame
-        // log would.
-        let was_requested = self.pending_force_keyframe.pop_front().unwrap_or(false);
+        // `was_requested` (popped from `self.pending` above, alongside the timing data) is
+        // whether *this* frame is one this crate actually asked to be a keyframe — the
+        // conservative direction on an unknown correlation (`is_some_and` false on `None`) is
+        // "not requested", since the point of this check is to never miss reporting bandwidth
+        // this crate did not ask for. Unconditional, not gated by `DIAGNOSTIC_FRAME_LIMIT`: an
+        // encoder still inserting autonomous keyframes is exactly the ongoing cost `OXPROTO.md`
+        // §9.1's two-event policy exists to avoid, for the whole session, not just its first
+        // hundred frames — and a keyframe-rate event is rare enough on its own not to flood
+        // stderr the way a per-frame log would.
         if is_idr && !was_requested {
             eprintln!(
                 "oxagent: h264: window={:#x} produced an unrequested keyframe ({} bytes) — \
