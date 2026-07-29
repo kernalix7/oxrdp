@@ -203,17 +203,26 @@ pub fn reframe(raw: &[u8], cached: &mut ParamSets) -> (Vec<u8>, bool) {
     (out, is_idr)
 }
 
-/// The `nal_unit_type` and payload length (header byte included) of every NAL unit in `data`, in
-/// stream order — a diagnostic view of an access unit's actual, as-received structure,
-/// independent of whatever [`reframe`] goes on to do with it. Exists so a caller (`crate::win`
-/// encoder wrapper) can log exactly what came out of the encoder before this module's own
-/// reordering, stripping, and backfilling touch it — which is the only way to see something like
-/// a stray parameter set on a non-keyframe, since [`reframe`] itself would already have removed
-/// it from anything logged after the fact.
-pub fn nal_summary(data: &[u8]) -> Vec<(u8, usize)> {
+/// `(nal_unit_type, nal_ref_idc, payload length)` — header byte included in the length — for
+/// every NAL unit in `data`, in stream order: a diagnostic view of an access unit's actual,
+/// as-received structure, independent of whatever [`reframe`] goes on to do with it. Exists so a
+/// caller (`crate::win` encoder wrapper) can log exactly what came out of the encoder before this
+/// module's own reordering, stripping, and backfilling touch it — which is the only way to see
+/// something like a stray parameter set on a non-keyframe, since [`reframe`] itself would already
+/// have removed it from anything logged after the fact.
+///
+/// `nal_ref_idc` (the header byte's bits 6-5, a 2-bit value 0-3) is included specifically because
+/// it is what distinguishes a disposable, non-reference picture (`nal_ref_idc == 0`, legal for
+/// any slice type including a plain P-slice, not just B-slices) from one later pictures may
+/// depend on — the field a temporal-layer or hierarchical-P encoder configuration marks
+/// differently on the frames it treats as expendable.
+pub fn nal_summary(data: &[u8]) -> Vec<(u8, u8, usize)> {
     split_annexb(data)
         .iter()
-        .map(|nal| (nal.kind, nal.payload.len()))
+        .map(|nal| {
+            let nal_ref_idc = (nal.payload[0] >> 5) & 0x3;
+            (nal.kind, nal_ref_idc, nal.payload.len())
+        })
         .collect()
 }
 
@@ -229,6 +238,35 @@ pub fn nal_type_name(kind: u8) -> &'static str {
         nal_type::AUD => "AUD",
         _ => "OTHER",
     }
+}
+
+/// `(profile_idc, constraint_flags, level_idc)` from an SPS NAL's payload — ITU-T H.264
+/// §7.3.2.1.1: three fixed, byte-aligned fields immediately after the one-byte NAL header, before
+/// anything exp-golomb-coded starts, so no bitstream parser is needed to read them. `None` if
+/// `payload` is too short to hold all three (a truncated or otherwise malformed SPS, treated as
+/// "nothing to report" rather than panicking on it, same as the rest of this module).
+///
+/// `constraint_flags` packs `constraint_set0_flag` through `constraint_set5_flag` in bits 7
+/// down to 2, with the low 2 bits reserved; bit 6 (`0x40`, `constraint_set1_flag`) is what turns
+/// `profile_idc == 66` specifically into Constrained Baseline rather than plain Baseline. Exists
+/// so a caller can log what an encoder's SPS actually says instead of what a `CODECAPI_*`
+/// property was merely asked to produce — a driver accepting `ICodecAPI::SetValue` is not proof
+/// it took effect.
+pub fn sps_profile(payload: &[u8]) -> Option<(u8, u8, u8)> {
+    let profile_idc = *payload.get(1)?;
+    let constraint_flags = *payload.get(2)?;
+    let level_idc = *payload.get(3)?;
+    Some((profile_idc, constraint_flags, level_idc))
+}
+
+/// [`sps_profile`] for the first SPS NAL found in a raw Annex-B access unit, if any. Convenience
+/// for a caller that has the whole access unit's bytes (an encoder's raw `ProcessOutput` sample,
+/// say) and wants "what profile does this AU's SPS claim" without splitting it into NALs itself.
+pub fn first_sps_profile(raw: &[u8]) -> Option<(u8, u8, u8)> {
+    split_annexb(raw)
+        .into_iter()
+        .find(|nal| nal.kind == nal_type::SPS)
+        .and_then(|nal| sps_profile(nal.payload))
 }
 
 #[cfg(test)]
@@ -433,7 +471,8 @@ mod tests {
     #[test]
     fn nal_summary_reports_every_nal_in_order_with_its_length() {
         // Payload length includes the header byte, same convention as `Nal::payload`; `nal()`
-        // above always builds a 2-byte payload (header + one filler byte).
+        // above always builds a 2-byte payload (header + one filler byte) with `nal_ref_idc`
+        // implicitly 0, since it masks `kind` to 5 bits and sets nothing above that.
         let raw = annexb(&[
             nal(nal_type::SPS, 1),
             nal(nal_type::PPS, 2),
@@ -441,7 +480,11 @@ mod tests {
         ]);
         assert_eq!(
             nal_summary(&raw),
-            vec![(nal_type::SPS, 2), (nal_type::PPS, 2), (nal_type::SLICE, 2)]
+            vec![
+                (nal_type::SPS, 0, 2),
+                (nal_type::PPS, 0, 2),
+                (nal_type::SLICE, 0, 2),
+            ]
         );
     }
 
@@ -457,7 +500,23 @@ mod tests {
             nal(nal_type::SLICE, 3),
         ]);
         let summary = nal_summary(&raw);
-        assert!(summary.iter().any(|&(kind, _)| kind == nal_type::SPS));
+        assert!(summary.iter().any(|&(kind, _, _)| kind == nal_type::SPS));
+    }
+
+    #[test]
+    fn nal_summary_extracts_a_nonzero_nal_ref_idc() {
+        // `nal()` above always encodes `nal_ref_idc = 0`; build the header byte directly here to
+        // prove extraction actually reads bits 6-5, not just returning a hardcoded 0. `ref_idc =
+        // 3` (a reference picture) on a plain SLICE, and `ref_idc = 0` (disposable) on another —
+        // exactly the field that tells the two apart in a real capture.
+        let ref_slice = vec![(3 << 5) | nal_type::SLICE, 0xAA];
+        let disposable_slice = vec![nal_type::SLICE, 0xBB]; // ref_idc = 0
+        let raw = annexb(&[ref_slice, disposable_slice]);
+
+        assert_eq!(
+            nal_summary(&raw),
+            vec![(nal_type::SLICE, 3, 2), (nal_type::SLICE, 0, 2)]
+        );
     }
 
     #[test]
@@ -473,5 +532,36 @@ mod tests {
     #[test]
     fn nal_type_name_does_not_panic_on_an_unknown_type() {
         assert_eq!(nal_type_name(31), "OTHER");
+    }
+
+    #[test]
+    fn sps_profile_reads_the_three_fixed_bytes_after_the_nal_header() {
+        // header, profile_idc=66 (Baseline), constraint_flags=0x40 (constraint_set1_flag,
+        // i.e. Constrained Baseline), level_idc=31 (level 3.1).
+        let payload = [nal_type::SPS, 66, 0x40, 31, 0xAB, 0xCD];
+        assert_eq!(sps_profile(&payload), Some((66, 0x40, 31)));
+    }
+
+    #[test]
+    fn sps_profile_is_none_for_a_payload_too_short_to_hold_all_three_fields() {
+        assert_eq!(sps_profile(&[nal_type::SPS]), None);
+        assert_eq!(sps_profile(&[nal_type::SPS, 66]), None);
+        assert_eq!(sps_profile(&[nal_type::SPS, 66, 0x40]), None);
+    }
+
+    #[test]
+    fn first_sps_profile_finds_the_sps_among_other_nals_in_an_access_unit() {
+        let raw = annexb(&[
+            nal(nal_type::AUD, 0),
+            vec![nal_type::SPS, 100, 0x00, 41], // High profile, no constraint flags, level 4.1
+            nal(nal_type::SLICE_IDR, 9),
+        ]);
+        assert_eq!(first_sps_profile(&raw), Some((100, 0x00, 41)));
+    }
+
+    #[test]
+    fn first_sps_profile_is_none_when_the_access_unit_has_no_sps() {
+        let raw = annexb(&[nal(nal_type::SLICE, 1)]);
+        assert_eq!(first_sps_profile(&raw), None);
     }
 }

@@ -24,9 +24,22 @@
 //!   transform always starts a fresh stream.
 //! - **No periodic re-keying: `CODECAPI_AVEncMPVGOPSize` is pinned huge.** §9.1 names exactly
 //!   two events that produce a keyframe and nothing else; left to its own defaults, an encoder
-//!   MFT is free to insert a periodic sync point anyway, and a real guest run found one doing
-//!   exactly that — one access unit in every thirty rejected by the client's decoder, at a fixed
-//!   period and offset matching the session's configured frame rate. See `GOP_SIZE_FRAMES`.
+//!   MFT is free to insert a periodic sync point anyway. Kept as spec hygiene regardless of the
+//!   next bullet's finding: it was this file's first, and as it turned out incomplete, attempt to
+//!   explain a real guest run rejecting one access unit in every thirty. See `GOP_SIZE_FRAMES`.
+//! - **Constrained Baseline profile, zero temporal layers, both pinned explicitly.** A raw-byte
+//!   capture of the rejected access units above showed the GOP-size theory was not the mechanism:
+//!   every one was an AUD plus a single non-IDR, non-reference (`nal_ref_idc == 0`) slice — no
+//!   SPS, no PPS, nothing `CODECAPI_AVEncMPVGOPSize` has any say over. That shape — a disposable
+//!   picture nothing later depends on, on a strict period — is what temporal-layer or
+//!   hierarchical-P structuring produces, and this file had never explicitly turned it off, nor
+//!   ever pinned a profile, leaving Media Foundation free to choose Main or High while this
+//!   crate's one known client decoder targets Constrained Baseline. Both `CODECAPI_AVEncMPVProfile`
+//!   and `CODECAPI_AVEncVideoTemporalLayerCount` are now set every time a `WindowEncoder` is
+//!   built, and read back immediately afterward (`get_u32_property`) so the guest's own log says
+//!   what was actually configured rather than what was merely requested — see
+//!   `DIAGNOSTIC_FRAME_LIMIT`'s per-frame log for the same check against the SPS a real keyframe
+//!   emits.
 //!
 //! **What this file's author could not verify without a live Windows guest**, stated plainly
 //! rather than left implicit: whether `MF_TRANSFORM_ASYNC_UNLOCK` actually lets every hardware
@@ -34,32 +47,34 @@
 //! not this crate's invention, but "documented" and "true of the specific driver on the test
 //! guest" are not the same claim); whether the codec API properties set here are actually
 //! honoured by that driver, since a driver is free to silently ignore an unsupported property
-//! rather than fail `SetValue`; the `MFTEnumEx` output array's ownership handling in
-//! [`first_activate`], which follows the COM ownership rules as documented but has had no COM
-//! debugger anywhere near it; and whether `GOP_SIZE_FRAMES` actually fixes the periodic decode
-//! failure above rather than only reducing its frequency, since this crate has no way to run the
-//! encoder against a real decoder itself — the `DIAGNOSTIC_FRAME_LIMIT` logging exists precisely
-//! to settle that from the next guest run instead of guessing twice. All of these are exactly the
-//! class of bug the project's own history says only shows up by running the code — see
-//! `crate::win::capture`'s doc comment.
+//! rather than fail `SetValue` — `get_u32_property`'s readback narrows this but does not close it,
+//! since a driver could in principle echo back a value it does not actually honour in the encoded
+//! bitstream, which is exactly why the per-frame SPS/`nal_ref_idc` logging exists as the more
+//! authoritative check; the `MFTEnumEx` output array's ownership handling in [`first_activate`],
+//! which follows the COM ownership rules as documented but has had no COM debugger anywhere near
+//! it; and whether pinning the profile and temporal-layer count actually stops the periodic
+//! rejection, as opposed to only changing its shape again, since this crate has no way to run the
+//! encoder against a real decoder itself. All of these are exactly the class of bug the project's
+//! own history says only shows up by running the code — see `crate::win::capture`'s doc comment.
 
 use std::collections::HashMap;
 use std::ffi::c_void;
 
-use windows::core::{Interface, Result as WinResult, VARIANT};
+use windows::core::{Interface, Result as WinResult, GUID, VARIANT};
 use windows::Win32::Foundation::E_FAIL;
 use windows::Win32::Media::MediaFoundation::{
-    eAVEncCommonRateControlMode_LowDelayVBR, CODECAPI_AVEncCommonMeanBitRate,
-    CODECAPI_AVEncCommonRateControlMode, CODECAPI_AVEncMPVDefaultBPictureCount,
-    CODECAPI_AVEncMPVGOPSize, CODECAPI_AVEncVideoForceKeyFrame, CODECAPI_AVLowLatencyMode,
-    ICodecAPI, IMFActivate, IMFMediaBuffer, IMFSample, IMFTransform, MFCreateMediaType,
-    MFCreateMemoryBuffer, MFCreateSample, MFMediaType_Video, MFStartup, MFTEnumEx,
-    MFVideoFormat_H264, MFVideoFormat_NV12, MFVideoInterlace_Progressive, MFSTARTUP_FULL,
-    MFT_CATEGORY_VIDEO_ENCODER, MFT_ENUM_FLAG_HARDWARE, MFT_ENUM_FLAG_SORTANDFILTER,
-    MFT_ENUM_FLAG_SYNCMFT, MFT_MESSAGE_NOTIFY_BEGIN_STREAMING, MFT_MESSAGE_NOTIFY_START_OF_STREAM,
-    MFT_OUTPUT_DATA_BUFFER, MFT_OUTPUT_STREAM_PROVIDES_SAMPLES, MFT_REGISTER_TYPE_INFO,
-    MF_E_TRANSFORM_NEED_MORE_INPUT, MF_MT_AVG_BITRATE, MF_MT_FRAME_RATE, MF_MT_FRAME_SIZE,
-    MF_MT_INTERLACE_MODE, MF_MT_MAJOR_TYPE, MF_MT_SUBTYPE, MF_TRANSFORM_ASYNC,
+    eAVEncCommonRateControlMode_LowDelayVBR, eAVEncH264VProfile_ConstrainedBase,
+    CODECAPI_AVEncCommonMeanBitRate, CODECAPI_AVEncCommonRateControlMode,
+    CODECAPI_AVEncMPVDefaultBPictureCount, CODECAPI_AVEncMPVGOPSize, CODECAPI_AVEncMPVProfile,
+    CODECAPI_AVEncVideoForceKeyFrame, CODECAPI_AVEncVideoTemporalLayerCount,
+    CODECAPI_AVLowLatencyMode, ICodecAPI, IMFActivate, IMFMediaBuffer, IMFSample, IMFTransform,
+    MFCreateMediaType, MFCreateMemoryBuffer, MFCreateSample, MFMediaType_Video, MFStartup,
+    MFTEnumEx, MFVideoFormat_H264, MFVideoFormat_NV12, MFVideoInterlace_Progressive,
+    MFSTARTUP_FULL, MFT_CATEGORY_VIDEO_ENCODER, MFT_ENUM_FLAG_HARDWARE,
+    MFT_ENUM_FLAG_SORTANDFILTER, MFT_ENUM_FLAG_SYNCMFT, MFT_MESSAGE_NOTIFY_BEGIN_STREAMING,
+    MFT_MESSAGE_NOTIFY_START_OF_STREAM, MFT_OUTPUT_DATA_BUFFER, MFT_OUTPUT_STREAM_PROVIDES_SAMPLES,
+    MFT_REGISTER_TYPE_INFO, MF_E_TRANSFORM_NEED_MORE_INPUT, MF_MT_AVG_BITRATE, MF_MT_FRAME_RATE,
+    MF_MT_FRAME_SIZE, MF_MT_INTERLACE_MODE, MF_MT_MAJOR_TYPE, MF_MT_SUBTYPE, MF_TRANSFORM_ASYNC,
     MF_TRANSFORM_ASYNC_UNLOCK, MF_VERSION,
 };
 use windows::Win32::System::Com::CoTaskMemFree;
@@ -209,6 +224,18 @@ fn first_activate(activates: *mut Option<IMFActivate>, count: u32) -> Option<IMF
     owned.into_iter().flatten().next()
 }
 
+/// Read back a `u32`-valued `ICodecAPI` property, or `None` if the driver does not support
+/// `GetValue` for it, or the value it returns cannot be coerced to `u32`. Used only for
+/// diagnostics: "check what you are actually getting" — a driver accepting `SetValue` is not
+/// proof the property took effect, since `SetValue` itself is already best-effort throughout this
+/// file (see the module doc).
+fn get_u32_property(api: &ICodecAPI, property: &GUID) -> Option<u32> {
+    // SAFETY: `api` is a live `ICodecAPI`; `property` is always one of this file's own
+    // `CODECAPI_*` constants.
+    let value = unsafe { api.GetValue(property) }.ok()?;
+    u32::try_from(&value).ok()
+}
+
 /// One window's live Media Foundation H.264 encoder stream.
 struct WindowEncoder {
     /// Native handle, kept only for `DIAGNOSTIC_FRAME_LIMIT` logging — nothing in this struct's
@@ -324,7 +351,32 @@ impl WindowEncoder {
                 // See `GOP_SIZE_FRAMES`: this crate is the only thing that should ever decide
                 // when a new keyframe starts.
                 let _ = api.SetValue(&CODECAPI_AVEncMPVGOPSize, &VARIANT::from(GOP_SIZE_FRAMES));
+                // Constrained Baseline, explicitly: left unset, Media Foundation is free to
+                // pick its own profile (commonly Main or High), and a real guest capture found
+                // every rejected access unit was a disposable (`nal_ref_idc = 0`) non-IDR slice
+                // on a strict period, matching temporal-layer/hierarchical-P structuring this
+                // crate never asked for and had never explicitly turned off. Setting the profile
+                // does not by itself guarantee that structuring stops — Constrained Baseline
+                // still permits non-reference P-slices — so `CODECAPI_AVEncVideoTemporalLayerCount`
+                // is pinned to 0 right below it for the same reason, not as a fallback.
+                let _ = api.SetValue(
+                    &CODECAPI_AVEncMPVProfile,
+                    &VARIANT::from(eAVEncH264VProfile_ConstrainedBase.0 as u32),
+                );
+                let _ = api.SetValue(&CODECAPI_AVEncVideoTemporalLayerCount, &VARIANT::from(0u32));
             }
+
+            // "Check what you are actually getting rather than what you set": read the two
+            // properties above straight back, immediately, rather than trusting that `SetValue`
+            // succeeding means the driver actually adopted them. Best-effort like everything
+            // else here — `None` just means this driver does not support reading a property back,
+            // not that the `SetValue` above failed.
+            eprintln!(
+                "oxagent: h264: window={handle:#x} encoder configured: profile requested={} reported={:?}, temporal_layers requested=0 reported={:?}",
+                eAVEncH264VProfile_ConstrainedBase.0,
+                get_u32_property(api, &CODECAPI_AVEncMPVProfile),
+                get_u32_property(api, &CODECAPI_AVEncVideoTemporalLayerCount),
+            );
         }
 
         let output_info = unsafe { transform.GetOutputStreamInfo(0)? };
@@ -470,12 +522,22 @@ impl WindowEncoder {
             self.frames_seen += 1;
             // Logged from `raw`, before `reframe` below reorders or strips anything — this is
             // what the transform itself actually produced. See `DIAGNOSTIC_FRAME_LIMIT`.
+            // `nal_ref_idc` is included per-NAL specifically to catch disposable, non-reference
+            // pictures (`ref_idc == 0`) — a real guest capture found every periodically-rejected
+            // access unit was exactly that.
             let nals: Vec<String> = h264::nal_summary(&raw)
                 .into_iter()
-                .map(|(kind, len)| format!("{}:{len}", h264::nal_type_name(kind)))
+                .map(|(kind, ref_idc, len)| {
+                    format!("{}:ref_idc={ref_idc}:{len}", h264::nal_type_name(kind))
+                })
                 .collect();
+            let profile = h264::first_sps_profile(&raw)
+                .map(|(p, c, l)| {
+                    format!(" sps_profile_idc={p} sps_constraint_flags={c:#010b} sps_level_idc={l}")
+                })
+                .unwrap_or_default();
             eprintln!(
-                "oxagent: h264: window={:#x} frame={} nals=[{}]",
+                "oxagent: h264: window={:#x} frame={} nals=[{}]{profile}",
                 self.handle,
                 self.frames_seen,
                 nals.join(", ")
