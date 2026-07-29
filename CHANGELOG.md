@@ -57,10 +57,11 @@ decode it.
 
 Fixed by constraining the profile through the **output media type** rather than a property. A
 media type is negotiated — `SetOutputType` either accepts Constrained Baseline or fails — while
-a property is advisory and this encoder had disregarded three of them. Verified on the guest:
-`profile_idc=66, constraints=0xc0`, and zero rejections where the same setup previously produced
-twelve to twenty-eight. Not yet re-measured under sustained delta frames; the runs after the fix
-carried keyframes only.
+a property is advisory and this encoder had disregarded three of them. Verified on the guest, both sides
+agreeing: `profile_idc=66, constraints=0xc0`, and zero rejections and zero resynchronisations
+where the same setup previously produced twelve to twenty-eight rejections. The agent's own NAL
+log carries the direct proof that B-frames are gone — every delta slice now reports
+`ref_idc=3`, where the rejected frames had been `ref_idc=0` non-reference pictures.
 
 ### Security (2026-07-28)
 
