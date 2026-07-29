@@ -21,7 +21,7 @@ use std::time::{Duration, Instant};
 
 use oxproto::envelope::{channel, Reassembler};
 use oxproto::message::input::key_flag;
-use oxproto::message::window::{window_flag, window_show};
+use oxproto::message::window::{frame_flag, window_flag, window_show};
 use oxproto::message::{
     Close, Error as ProtoError, FrameData, Message, WindowClosed, WindowGeometry, WindowOpened,
     WindowState, WindowTitle,
@@ -31,6 +31,7 @@ use oxtransport::{read_message, write_message, write_raw};
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
 use tokio::sync::{mpsc, Semaphore};
 
+use crate::encode::FrameEncoder;
 use crate::handshake::{negotiate, HandshakeError, Negotiated};
 use crate::input::InputSink;
 use crate::pacing::FrameBudget;
@@ -126,6 +127,32 @@ struct WindowStream {
     /// Doubles as the reason `pump_frames` stops capturing this window: while it reads
     /// `MINIMIZED`, `next_frame` is never called for this window's handle at all.
     show_state: u8,
+    /// Last `window_flag` bitmask announced — the same set `WindowOpened.flags` carried at
+    /// open, now tracked separately so a later change to any bit can be diffed and reported via
+    /// `WindowState.flags` (`OXPROTO.md` §11).
+    flags: u32,
+    /// Whether the next frame sent for this window, once a codec that has a concept of one is
+    /// in use, must be a keyframe. Starts `true` (a window's first frame in a session must
+    /// always be one — `OXPROTO.md` §9.1 — including for a window that was already open when
+    /// this client attached) and is set again whenever the coded size changes; cleared once a
+    /// keyframe is actually sent. Meaningless, and untouched, for `RAW_BGRA`, which has no such
+    /// concept.
+    needs_keyframe: bool,
+}
+
+/// Tracks which kinds of input this session has already logged the first occurrence of.
+///
+/// A pointer stream alone can run at 30+ Hz, so per-event logging would flood stderr and hide
+/// the one thing this exists to answer: did input of this kind reach the sink at all, this
+/// session. One line per kind, the first time it is actually dispatched, is enough to answer
+/// that from the guest's own captured stderr without instrumenting anything else.
+#[derive(Debug, Default)]
+struct InputFirstSeen {
+    pointer: bool,
+    key: bool,
+    text: bool,
+    modifier_sync: bool,
+    window_control: bool,
 }
 
 /// Run one authenticated session to completion.
@@ -140,15 +167,18 @@ struct WindowStream {
 /// authenticated session drives windows at a time: connections are now handled concurrently
 /// (each on its own task, so one stalled peer cannot block every connection after it — see
 /// `crate::win::run_agent`), and without this gate that would let a second, fully authenticated
-/// client also start streaming and injecting input alongside the first.
+/// client also start streaming and injecting input alongside the first. `supported_codecs` is
+/// forwarded to `negotiate` as-is — see there for why it is a parameter rather than a constant.
 #[allow(clippy::too_many_arguments)]
-pub async fn run_session<S, W, I>(
+pub async fn run_session<S, W, I, E>(
     stream: S,
     source: &mut W,
     sink: &mut I,
+    encoder: &mut E,
     params: SessionParams,
     session_id: u64,
     expected_token: &str,
+    supported_codecs: &[u8],
     pre_auth_deadline: Instant,
     session_slot: &Semaphore,
 ) -> Result<Negotiated, HandshakeError>
@@ -156,6 +186,7 @@ where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
     W: WindowSource,
     I: InputSink,
+    E: FrameEncoder,
 {
     let (mut reader, mut writer) = tokio::io::split(stream);
 
@@ -169,9 +200,13 @@ where
         };
         match tokio::time::timeout_at(
             tokio::time::Instant::from(pre_auth_deadline),
-            negotiate(&mut duplex, &mut reassembler, session_id, |presented| {
-                oxsec::verify_token(expected_token, presented)
-            }),
+            negotiate(
+                &mut duplex,
+                &mut reassembler,
+                session_id,
+                supported_codecs,
+                |presented| oxsec::verify_token(expected_token, presented),
+            ),
         )
         .await
         {
@@ -193,13 +228,10 @@ where
     // rather than `acquire`: a client that cannot get the slot right now must be told so, not
     // queued to start streaming later once the first session happens to end.
     let Ok(_session_permit) = session_slot.try_acquire() else {
-        // error_code has no dedicated "another session is active" code; PROTOCOL is the closest
-        // existing fit (an out-of-sequence attempt to start a second session). Flagged to the
-        // crates/oxproto owner as worth a dedicated code rather than picked silently.
         let _ = write_message(
             &mut writer,
             &Message::Error(ProtoError {
-                code: error_code::PROTOCOL,
+                code: error_code::SESSION_BUSY,
                 message: "a session is already active".into(),
             }),
             channel::CONTROL,
@@ -254,6 +286,7 @@ where
         &mut writer,
         source,
         sink,
+        encoder,
         &mut rx,
         &mut ticker,
         &mut registry,
@@ -263,6 +296,7 @@ where
         acks_enabled,
         text_input_enabled,
         window_control_enabled,
+        negotiated.codec,
     )
     .await;
 
@@ -274,10 +308,11 @@ where
 
 /// The steady-state loop: announce window changes, send frames, apply acks and input.
 #[allow(clippy::too_many_arguments)]
-async fn drive<W, WR, I>(
+async fn drive<W, WR, I, E>(
     writer: &mut WR,
     source: &mut W,
     sink: &mut I,
+    encoder: &mut E,
     rx: &mut mpsc::Receiver<Message>,
     ticker: &mut tokio::time::Interval,
     registry: &mut WindowRegistry,
@@ -287,12 +322,18 @@ async fn drive<W, WR, I>(
     acks_enabled: bool,
     text_input_enabled: bool,
     window_control_enabled: bool,
+    codec: u8,
 ) -> io::Result<()>
 where
     W: WindowSource,
     WR: AsyncWrite + Unpin,
     I: InputSink,
+    E: FrameEncoder,
 {
+    // See `InputFirstSeen`: logs the first dispatched event of each kind, and nothing else about
+    // steady-state input traffic.
+    let mut input_seen = InputFirstSeen::default();
+
     loop {
         tokio::select! {
             // Incoming messages take priority over the next capture: an ack that frees budget
@@ -337,6 +378,13 @@ where
                         // have. Do not add re-resolution machinery for this — see the security
                         // review.
                         if let Some(stream) = streams.get(&p.window_id) {
+                            if !input_seen.pointer {
+                                input_seen.pointer = true;
+                                eprintln!(
+                                    "oxagent: input: first PointerEvent this session: window_id={} handle={:#x} buttons={:#04x}",
+                                    p.window_id, stream.handle, p.buttons
+                                );
+                            }
                             sink.pointer_event(
                                 stream.handle,
                                 p.x,
@@ -345,28 +393,72 @@ where
                                 p.wheel_x,
                                 p.wheel_y,
                             );
+                        } else {
+                            eprintln!(
+                                "oxagent: input: dropping PointerEvent for unknown or closed window_id={}",
+                                p.window_id
+                            );
                         }
                     }
                     Message::KeyEvent(k) => {
                         // No `window_id`: keyboard input always targets whatever window is
                         // currently focused, which the sink establishes via `PointerEvent` /
                         // `WindowControl::ACTIVATE` (OXPROTO.md §13).
-                        sink.key_event(k.scancode, k.flags & key_flag::EXTENDED != 0, k.is_pressed());
+                        let extended = k.flags & key_flag::EXTENDED != 0;
+                        let pressed = k.is_pressed();
+                        if !input_seen.key {
+                            input_seen.key = true;
+                            eprintln!(
+                                "oxagent: input: first KeyEvent this session: scancode={:#04x} extended={extended} pressed={pressed}",
+                                k.scancode
+                            );
+                        }
+                        sink.key_event(k.scancode, extended, pressed);
                     }
                     Message::TextInput(t) => {
                         if text_input_enabled {
+                            if !input_seen.text {
+                                input_seen.text = true;
+                                // The text itself is not logged — it can be anything the user
+                                // typed, including a password.
+                                eprintln!(
+                                    "oxagent: input: first TextInput this session: {} char(s)",
+                                    t.text.chars().count()
+                                );
+                            }
                             sink.text_input(&t.text);
+                        } else {
+                            eprintln!("oxagent: input: dropping TextInput: TEXT_INPUT not negotiated");
                         }
                     }
                     Message::ModifierSync(m) => {
+                        if !input_seen.modifier_sync {
+                            input_seen.modifier_sync = true;
+                            eprintln!(
+                                "oxagent: input: first ModifierSync this session: modifiers={:#06x} locks={:#04x}",
+                                m.modifiers, m.locks
+                            );
+                        }
                         sink.modifier_sync(m.modifiers, m.locks);
                     }
-                    // Gated on WINDOW_CONTROL by the match guard: a client that never
-                    // negotiated it falls through to the catch-all below and is dropped.
+                    // No longer gated by a match guard: `window_control_enabled` is now checked
+                    // inside, alongside window resolution, so a rejection either way is logged
+                    // instead of silently falling through to the catch-all below.
                     //
                     // Same accepted stale-handle window as `PointerEvent` above — see there.
-                    Message::WindowControl(w) if window_control_enabled => {
-                        if let Some(stream) = streams.get(&w.window_id) {
+                    Message::WindowControl(w) => {
+                        if !window_control_enabled {
+                            eprintln!(
+                                "oxagent: input: dropping WindowControl: WINDOW_CONTROL not negotiated"
+                            );
+                        } else if let Some(stream) = streams.get(&w.window_id) {
+                            if !input_seen.window_control {
+                                input_seen.window_control = true;
+                                eprintln!(
+                                    "oxagent: input: first WindowControl this session: window_id={} handle={:#x} action={}",
+                                    w.window_id, stream.handle, w.action
+                                );
+                            }
                             sink.window_control(
                                 stream.handle,
                                 w.action,
@@ -374,6 +466,11 @@ where
                                 w.y,
                                 w.width,
                                 w.height,
+                            );
+                        } else {
+                            eprintln!(
+                                "oxagent: input: dropping WindowControl for unknown or closed window_id={}",
+                                w.window_id
                             );
                         }
                     }
@@ -385,8 +482,8 @@ where
             }
 
             _ = ticker.tick() => {
-                sync_windows(writer, source, registry, streams, params).await?;
-                pump_frames(writer, source, streams, started, acks_enabled).await?;
+                sync_windows(writer, source, encoder, registry, streams, params).await?;
+                pump_frames(writer, source, encoder, streams, started, acks_enabled, codec).await?;
             }
         }
     }
@@ -428,9 +525,11 @@ fn show_state(w: &SourceWindow) -> u8 {
 }
 
 /// Diff the platform's window list against what the client has been told.
-async fn sync_windows<W, WR>(
+#[allow(clippy::too_many_arguments)]
+async fn sync_windows<W, WR, E>(
     writer: &mut WR,
     source: &mut W,
+    encoder: &mut E,
     registry: &mut WindowRegistry,
     streams: &mut HashMap<u32, WindowStream>,
     params: &SessionParams,
@@ -438,6 +537,7 @@ async fn sync_windows<W, WR>(
 where
     W: WindowSource,
     WR: AsyncWrite + Unpin,
+    E: FrameEncoder,
 {
     let live = source.live_windows();
 
@@ -472,6 +572,12 @@ where
                     geometry: (w.x, w.y, w.width, w.height),
                     title: w.title.clone(),
                     show_state: show_state(w),
+                    flags: window_flags(w),
+                    // Every window's first frame in a session must be a keyframe (OXPROTO.md
+                    // §9.1), including — this is that case — a window reported for the first
+                    // time to a client that only just attached, whether or not the window
+                    // itself is new. `RAW_BGRA` ignores this field entirely.
+                    needs_keyframe: true,
                 },
             );
             continue;
@@ -482,6 +588,54 @@ where
         let Some(stream) = streams.get_mut(&tracked.window_id) else {
             continue;
         };
+
+        if stream.title != w.title {
+            stream.title.clone_from(&w.title);
+            send(
+                writer,
+                &Message::WindowTitle(WindowTitle {
+                    window_id: tracked.window_id,
+                    title: w.title.clone(),
+                }),
+                channel::WINDOW,
+            )
+            .await?;
+        }
+
+        // `WindowState.flags` carries the *same* bitmask `WindowOpened.flags` does, always the
+        // complete current value (OXPROTO.md §11) — computed up front so both the "does
+        // WindowState need sending" check here and the "does this specific change force a
+        // fresh WindowGeometry" check below can see whether HAS_FRAME in particular flipped,
+        // without duplicating `window_flags(w)`.
+        let new_flags = window_flags(w);
+        let has_frame_changed = (new_flags ^ stream.flags) & window_flag::HAS_FRAME != 0;
+
+        // Sent whenever *either* half changes, always repeating both at their current value —
+        // a receiver replaces what it has stored rather than applying a delta (OXPROTO.md
+        // §11). A `flags`-only change (RESIZABLE/HAS_FRAME/TOPMOST, with `state` unchanged) is
+        // a normal message here, not an edge case: entering full screen is the common case for
+        // HAS_FRAME, toggling always-on-top the common case for TOPMOST.
+        //
+        // Sent *before* `WindowGeometry` below, deliberately: OXPROTO.md §11 says a `HAS_FRAME`
+        // change "must" be followed by a fresh `WindowGeometry`, which only makes sense if
+        // `WindowState` goes out first — the client would otherwise see a `WindowGeometry` in a
+        // coordinate space it has not yet been told changed.
+        let new_show_state = show_state(w);
+        if stream.show_state != new_show_state || stream.flags != new_flags {
+            stream.show_state = new_show_state;
+            stream.flags = new_flags;
+            send(
+                writer,
+                &Message::WindowState(WindowState {
+                    window_id: tracked.window_id,
+                    state: new_show_state,
+                    flags: new_flags,
+                }),
+                channel::WINDOW,
+            )
+            .await?;
+        }
+
         // Geometry is skipped entirely while minimized: a minimized window's frame bounds are
         // not real geometry (typically 0×0, sometimes an off-screen icon-sized rect), and
         // sending that would make the client resize its native window to nothing. `stream.
@@ -492,10 +646,23 @@ where
         // catches that once `w.minimized` goes false again.
         if !w.minimized {
             let geometry = (w.x, w.y, w.width, w.height);
-            if stream.geometry != geometry {
+            // `has_frame_changed` forces a resend even when the numbers are unchanged: that bit
+            // decides whether geometry is client-area or whole-window space
+            // (`docs/design/window-decorations.md`), so a flip moves the coordinate space
+            // itself and the client must not assume geometry it already has is still correct in
+            // the new space until a fresh `WindowGeometry` says so (OXPROTO.md §11).
+            if stream.geometry != geometry || has_frame_changed {
+                let resolution_changed =
+                    (stream.geometry.2, stream.geometry.3) != (w.width, w.height);
                 stream.geometry = geometry;
                 // A resize invalidates frames already in flight for the old size.
                 stream.budget.restart();
+                if resolution_changed {
+                    // OXPROTO.md §9.1: a coded-size change is a fresh stream start for H.264 —
+                    // new SPS/PPS and a keyframe. Harmless to set unconditionally even under
+                    // RAW_BGRA, which never reads it.
+                    stream.needs_keyframe = true;
+                }
                 send(
                     writer,
                     &Message::WindowGeometry(WindowGeometry {
@@ -510,43 +677,13 @@ where
                 .await?;
             }
         }
-        if stream.title != w.title {
-            stream.title.clone_from(&w.title);
-            send(
-                writer,
-                &Message::WindowTitle(WindowTitle {
-                    window_id: tracked.window_id,
-                    title: w.title.clone(),
-                }),
-                channel::WINDOW,
-            )
-            .await?;
-        }
-        // `flags` is reserved on the wire (`oxproto::message::window::WindowState`) — RESIZABLE/
-        // HAS_FRAME/TOPMOST have no field to carry a post-`WindowOpened` change through, only
-        // the show state does. Those three essentially never change for a live window in
-        // practice (unlike minimize/maximize/restore, which are routine), so that gap is left
-        // unaddressed here rather than inventing meaning for a reserved field — see the P3
-        // report to the team lead.
-        let new_show_state = show_state(w);
-        if stream.show_state != new_show_state {
-            stream.show_state = new_show_state;
-            send(
-                writer,
-                &Message::WindowState(WindowState {
-                    window_id: tracked.window_id,
-                    state: new_show_state,
-                    flags: 0,
-                }),
-                channel::WINDOW,
-            )
-            .await?;
-        }
     }
 
     let handles: Vec<isize> = live.iter().map(|w| w.handle).collect();
     for gone in registry.retain_live(&handles) {
-        streams.remove(&gone.window_id);
+        if let Some(stream) = streams.remove(&gone.window_id) {
+            encoder.forget(stream.handle);
+        }
         send(
             writer,
             &Message::WindowClosed(WindowClosed {
@@ -560,16 +697,27 @@ where
 }
 
 /// Capture and send one frame per window, subject to each window's budget.
-async fn pump_frames<W, WR>(
+///
+/// `codec` picks the path per session (chosen once, at negotiation — a session never switches
+/// codecs mid-flight): `RAW_BGRA` sends the captured pixels as-is, exactly as before this file
+/// had an encoder at all. Anything else (`H264`, today) submits the capture to `encoder` and
+/// sends whatever it has ready, which may be nothing this tick — a real encoder's output can
+/// lag its input by a frame or more, so "captured a frame" and "have something to send" are not
+/// the same event once a codec is doing real work.
+#[allow(clippy::too_many_arguments)]
+async fn pump_frames<W, WR, E>(
     writer: &mut WR,
     source: &mut W,
+    encoder: &mut E,
     streams: &mut HashMap<u32, WindowStream>,
     started: Instant,
     acks_enabled: bool,
+    codec: u8,
 ) -> io::Result<()>
 where
     W: WindowSource,
     WR: AsyncWrite + Unpin,
+    E: FrameEncoder,
 {
     // Deterministic order so a window is never starved by map iteration order.
     let mut ids: Vec<u32> = streams.keys().copied().collect();
@@ -599,20 +747,58 @@ where
         let Some(frame) = source.next_frame(stream.handle) else {
             continue;
         };
-
         let captured_us = elapsed_us(started);
+
+        let (flags, width, height, data, encoded_us) = if codec == oxproto::codec::H264 {
+            encoder.submit(stream.handle, &frame, stream.needs_keyframe);
+            let Some(encoded) = encoder.poll(stream.handle) else {
+                // Nothing ready yet this tick: no `frame_id` is spent, no `FrameData` is sent.
+                // The next tick tries again — `submit` above already handed the encoder this
+                // frame's content, so nothing is lost by waiting.
+                continue;
+            };
+            if encoded.keyframe {
+                stream.needs_keyframe = false;
+            }
+            let flags = if encoded.keyframe {
+                frame_flag::KEYFRAME
+            } else {
+                0
+            };
+            // The *coded* size, not the captured size: an encoder that padded an odd capture
+            // dimension to the even size NV12 requires reports that padded size here, so
+            // `FrameData` never disagrees with what its own bitstream's SPS says.
+            (
+                flags,
+                encoded.width,
+                encoded.height,
+                encoded.data,
+                elapsed_us(started),
+            )
+        } else {
+            // `RAW_BGRA`: unchanged from before this file had a real codec. Every frame is
+            // trivially a "keyframe" (there is nothing to reference), and capture and "encode"
+            // complete at the same instant since there is no separate encode step.
+            (
+                frame_flag::KEYFRAME,
+                frame.width,
+                frame.height,
+                frame.data,
+                captured_us,
+            )
+        };
+
         let frame_id = stream.budget.on_captured();
         let body = Message::FrameData(FrameData {
             window_id: id,
             frame_id,
-            codec: oxproto::codec::RAW_BGRA,
-            flags: oxproto::message::window::frame_flag::KEYFRAME,
-            width: frame.width,
-            height: frame.height,
+            codec,
+            flags,
+            width,
+            height,
             captured_us,
-            // No encoder yet: capture and "encode" complete at the same instant.
-            encoded_us: captured_us,
-            data: frame.data,
+            encoded_us,
+            data,
         })
         .encode_body()
         .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
@@ -677,6 +863,8 @@ impl<R: Unpin, W: AsyncWrite + Unpin> AsyncWrite for ReadWrite<'_, R, W> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::encode::EncodedFrame;
+    use crate::handshake::RAW_BGRA_ONLY;
     use oxproto::message::{ClientHello, DisplayLayout, Output};
     use oxtransport::write_message;
 
@@ -771,6 +959,96 @@ mod tests {
         fn text_input(&mut self, _: &str) {}
         fn modifier_sync(&mut self, _: u16, _: u8) {}
         fn window_control(&mut self, _: isize, _: u8, _: i32, _: i32, _: u16, _: u16) {}
+    }
+
+    /// A [`FrameEncoder`] that never has anything ready — for tests exercising `RAW_BGRA` (which
+    /// never calls it) or anything else where encoding is not the point.
+    struct NoopEncoder;
+    impl FrameEncoder for NoopEncoder {
+        fn submit(&mut self, _: isize, _: &SourceFrame, _: bool) {}
+        fn poll(&mut self, _: isize) -> Option<EncodedFrame> {
+            None
+        }
+        fn forget(&mut self, _: isize) {}
+    }
+
+    /// One recorded call to a [`FrameEncoder`], for asserting exactly what `pump_frames` asked
+    /// it to do.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    enum EncoderCall {
+        Submit { handle: isize, force_keyframe: bool },
+        Forget { handle: isize },
+    }
+
+    /// A [`FrameEncoder`] that "encodes" synchronously — whatever is submitted for a window is
+    /// immediately available from the very next `poll` for that window — and reports every call
+    /// over a channel. `coded_size`, when set, overrides the width/height the encoder reports
+    /// for its output, independent of the input frame's own size — the same way a real encoder
+    /// padding an odd capture dimension to the even size NV12 requires would.
+    struct RecordingEncoder {
+        calls: mpsc::UnboundedSender<EncoderCall>,
+        pending: HashMap<isize, EncodedFrame>,
+        coded_size: Option<(u16, u16)>,
+    }
+
+    impl RecordingEncoder {
+        fn new(calls: mpsc::UnboundedSender<EncoderCall>) -> Self {
+            Self {
+                calls,
+                pending: HashMap::new(),
+                coded_size: None,
+            }
+        }
+    }
+
+    impl FrameEncoder for RecordingEncoder {
+        fn submit(&mut self, handle: isize, frame: &SourceFrame, force_keyframe: bool) {
+            let _ = self.calls.send(EncoderCall::Submit {
+                handle,
+                force_keyframe,
+            });
+            let (width, height) = self.coded_size.unwrap_or((frame.width, frame.height));
+            self.pending.insert(
+                handle,
+                EncodedFrame {
+                    data: vec![0xAB], // placeholder bitstream bytes; content is not the point
+                    keyframe: force_keyframe,
+                    width,
+                    height,
+                },
+            );
+        }
+
+        fn poll(&mut self, handle: isize) -> Option<EncodedFrame> {
+            self.pending.remove(&handle)
+        }
+
+        fn forget(&mut self, handle: isize) {
+            let _ = self.calls.send(EncoderCall::Forget { handle });
+        }
+    }
+
+    /// Like [`MutableSource`], but also produces a frame matching the window's current size on
+    /// every poll while it is not minimized — for tests that need to drive the encoder, not
+    /// just window lifecycle messages.
+    struct MutableFrameSource(std::sync::Arc<std::sync::Mutex<SourceWindow>>);
+
+    impl WindowSource for MutableFrameSource {
+        fn live_windows(&mut self) -> Vec<SourceWindow> {
+            vec![self.0.lock().unwrap().clone()]
+        }
+
+        fn next_frame(&mut self, _handle: isize) -> Option<SourceFrame> {
+            let w = self.0.lock().unwrap();
+            if w.minimized {
+                return None;
+            }
+            Some(SourceFrame {
+                width: w.width,
+                height: w.height,
+                data: vec![0xAB; 4],
+            })
+        }
     }
 
     /// One recorded call to an [`InputSink`] method, for asserting exactly what the driver
@@ -992,13 +1270,19 @@ mod tests {
     /// Like [`hello`], but with a caller-chosen feature set — for tests where negotiating (or
     /// not negotiating) `TEXT_INPUT`/`WINDOW_CONTROL` is the point.
     fn hello_with_features(token: &str, features: u64) -> Message {
+        hello_with(token, features, vec![oxproto::codec::RAW_BGRA])
+    }
+
+    /// Like [`hello`], with a caller-chosen feature set *and* codec offer — for tests where
+    /// which codec the client asks for is the point.
+    fn hello_with(token: &str, features: u64, codecs: Vec<u8>) -> Message {
         Message::ClientHello(ClientHello {
             version_min: 1,
             version_max: 1,
             features,
             auth_token: token.into(),
             client_name: "test".into(),
-            codecs: vec![oxproto::codec::RAW_BGRA],
+            codecs,
             display: DisplayLayout {
                 outputs: vec![Output {
                     id: 0,
@@ -1024,17 +1308,20 @@ mod tests {
         let agent_task = tokio::spawn(async move {
             let mut source = FakeSource::one_window(3);
             let mut sink = NoopSink;
+            let mut encoder = NoopEncoder;
             let session_slot = Semaphore::new(1);
             run_session(
                 agent,
                 &mut source,
                 &mut sink,
+                &mut encoder,
                 SessionParams {
                     target_fps: 240,
                     max_frames_in_flight: 2,
                 },
                 77,
                 "secret",
+                RAW_BGRA_ONLY,
                 far_deadline(),
                 &session_slot,
             )
@@ -1098,14 +1385,17 @@ mod tests {
         let agent_task = tokio::spawn(async move {
             let mut source = Forbidden;
             let mut sink = NoopSink;
+            let mut encoder = NoopEncoder;
             let session_slot = Semaphore::new(1);
             run_session(
                 agent,
                 &mut source,
                 &mut sink,
+                &mut encoder,
                 SessionParams::default(),
                 1,
                 "secret",
+                RAW_BGRA_ONLY,
                 far_deadline(),
                 &session_slot,
             )
@@ -1150,17 +1440,20 @@ mod tests {
         let agent_task = tokio::spawn(async move {
             let mut source = Vanishing { polls: 0 };
             let mut sink = NoopSink;
+            let mut encoder = NoopEncoder;
             let session_slot = Semaphore::new(1);
             run_session(
                 agent,
                 &mut source,
                 &mut sink,
+                &mut encoder,
                 SessionParams {
                     target_fps: 240,
                     max_frames_in_flight: 2,
                 },
                 5,
                 "secret",
+                RAW_BGRA_ONLY,
                 far_deadline(),
                 &session_slot,
             )
@@ -1221,14 +1514,17 @@ mod tests {
         let agent_task = tokio::spawn(async move {
             let mut source = FakeSource::one_window(0);
             let mut sink = RecordingSink(tx);
+            let mut encoder = NoopEncoder;
             let session_slot = Semaphore::new(1);
             run_session(
                 agent,
                 &mut source,
                 &mut sink,
+                &mut encoder,
                 SessionParams::default(),
                 3,
                 "secret",
+                RAW_BGRA_ONLY,
                 far_deadline(),
                 &session_slot,
             )
@@ -1322,14 +1618,17 @@ mod tests {
         let agent_task = tokio::spawn(async move {
             let mut source = FakeSource::one_window(0);
             let mut sink = RecordingSink(tx);
+            let mut encoder = NoopEncoder;
             let session_slot = Semaphore::new(1);
             run_session(
                 agent,
                 &mut source,
                 &mut sink,
+                &mut encoder,
                 SessionParams::default(),
                 4,
                 "secret",
+                RAW_BGRA_ONLY,
                 far_deadline(),
                 &session_slot,
             )
@@ -1391,14 +1690,17 @@ mod tests {
             let agent_task = tokio::spawn(async move {
                 let mut source = FakeSource::one_window(0);
                 let mut sink = RecordingSink(tx);
+                let mut encoder = NoopEncoder;
                 let session_slot = Semaphore::new(1);
                 run_session(
                     agent,
                     &mut source,
                     &mut sink,
+                    &mut encoder,
                     SessionParams::default(),
                     1,
                     "secret",
+                    RAW_BGRA_ONLY,
                     far_deadline(),
                     &session_slot,
                 )
@@ -1465,14 +1767,17 @@ mod tests {
         let agent_task = tokio::spawn(async move {
             let mut source = FakeSource::one_window(0);
             let mut sink = RecordingSink(tx);
+            let mut encoder = NoopEncoder;
             let session_slot = Semaphore::new(1);
             run_session(
                 agent,
                 &mut source,
                 &mut sink,
+                &mut encoder,
                 SessionParams::default(),
                 9,
                 "secret",
+                RAW_BGRA_ONLY,
                 far_deadline(),
                 &session_slot,
             )
@@ -1557,17 +1862,20 @@ mod tests {
             async move {
                 let mut source = MutableSource(state);
                 let mut sink = NoopSink;
+                let mut encoder = NoopEncoder;
                 let session_slot = Semaphore::new(1);
                 run_session(
                     agent,
                     &mut source,
                     &mut sink,
+                    &mut encoder,
                     SessionParams {
                         target_fps: 240,
                         max_frames_in_flight: 2,
                     },
                     11,
                     "secret",
+                    RAW_BGRA_ONLY,
                     far_deadline(),
                     &session_slot,
                 )
@@ -1619,17 +1927,20 @@ mod tests {
             async move {
                 let mut source = MutableSource(state);
                 let mut sink = NoopSink;
+                let mut encoder = NoopEncoder;
                 let session_slot = Semaphore::new(1);
                 run_session(
                     agent,
                     &mut source,
                     &mut sink,
+                    &mut encoder,
                     SessionParams {
                         target_fps: 240,
                         max_frames_in_flight: 2,
                     },
                     12,
                     "secret",
+                    RAW_BGRA_ONLY,
                     far_deadline(),
                     &session_slot,
                 )
@@ -1728,17 +2039,20 @@ mod tests {
             async move {
                 let mut source = PanicsIfPolledWhileMinimized(state);
                 let mut sink = NoopSink;
+                let mut encoder = NoopEncoder;
                 let session_slot = Semaphore::new(1);
                 run_session(
                     agent,
                     &mut source,
                     &mut sink,
+                    &mut encoder,
                     SessionParams {
                         target_fps: 240,
                         max_frames_in_flight: 2,
                     },
                     13,
                     "secret",
+                    RAW_BGRA_ONLY,
                     far_deadline(),
                     &session_slot,
                 )
@@ -1791,15 +2105,18 @@ mod tests {
         let session_slot = Semaphore::new(1);
         let mut source = FakeSource::one_window(0);
         let mut sink = NoopSink;
+        let mut encoder = NoopEncoder;
 
         let started = Instant::now();
         let result = run_session(
             agent,
             &mut source,
             &mut sink,
+            &mut encoder,
             SessionParams::default(),
             1,
             "secret",
+            RAW_BGRA_ONLY,
             deadline,
             &session_slot,
         )
@@ -1839,13 +2156,16 @@ mod tests {
             async move {
                 let mut source = FakeSource::one_window(0);
                 let mut sink = NoopSink;
+                let mut encoder = NoopEncoder;
                 run_session(
                     agent_a,
                     &mut source,
                     &mut sink,
+                    &mut encoder,
                     SessionParams::default(),
                     1,
                     "secret",
+                    RAW_BGRA_ONLY,
                     deadline_a,
                     &session_slot,
                 )
@@ -1858,13 +2178,16 @@ mod tests {
             async move {
                 let mut source = FakeSource::one_window(0);
                 let mut sink = NoopSink;
+                let mut encoder = NoopEncoder;
                 run_session(
                     agent_b,
                     &mut source,
                     &mut sink,
+                    &mut encoder,
                     SessionParams::default(),
                     2,
                     "secret",
+                    RAW_BGRA_ONLY,
                     deadline_b,
                     &session_slot,
                 )
@@ -1908,16 +2231,19 @@ mod tests {
             async move {
                 let mut source = FakeSource::one_window(0);
                 let mut sink = NoopSink;
+                let mut encoder = NoopEncoder;
                 run_session(
                     agent_a,
                     &mut source,
                     &mut sink,
+                    &mut encoder,
                     SessionParams {
                         target_fps: 240,
                         max_frames_in_flight: 2,
                     },
                     1,
                     "secret",
+                    RAW_BGRA_ONLY,
                     deadline,
                     &session_slot,
                 )
@@ -1942,13 +2268,16 @@ mod tests {
             .unwrap();
         let mut source_b = FakeSource::one_window(0);
         let mut sink_b = NoopSink;
+        let mut encoder_b = NoopEncoder;
         let result_b = run_session(
             agent_b,
             &mut source_b,
             &mut sink_b,
+            &mut encoder_b,
             SessionParams::default(),
             2,
             "secret",
+            RAW_BGRA_ONLY,
             deadline,
             &session_slot,
         )
@@ -1965,12 +2294,331 @@ mod tests {
             "B does authenticate — it just cannot run a session"
         );
         let err_b = read_message(&mut client_b, &mut rb).await.unwrap().unwrap();
-        assert!(matches!(err_b, Message::Error(_)), "got {err_b:?}");
+        assert!(
+            matches!(
+                err_b,
+                Message::Error(ProtoError {
+                    code: error_code::SESSION_BUSY,
+                    ..
+                })
+            ),
+            "got {err_b:?}"
+        );
         let close_b = read_message(&mut client_b, &mut rb).await.unwrap().unwrap();
         assert!(matches!(close_b, Message::Close(_)), "got {close_b:?}");
 
         drop(client_a);
         drop(client_b);
         let _ = task_a.await;
+    }
+
+    #[tokio::test]
+    async fn h264_forces_a_keyframe_for_the_first_frame_and_after_a_resize() {
+        let state = std::sync::Arc::new(std::sync::Mutex::new(minimizable_window()));
+        let (mut client, agent) = tokio::io::duplex(64 * 1024);
+        let (tx, mut rx) = mpsc::unbounded_channel();
+
+        let agent_task = tokio::spawn({
+            let state = std::sync::Arc::clone(&state);
+            async move {
+                let mut source = MutableFrameSource(state);
+                let mut sink = NoopSink;
+                let mut encoder = RecordingEncoder::new(tx);
+                let session_slot = Semaphore::new(1);
+                run_session(
+                    agent,
+                    &mut source,
+                    &mut sink,
+                    &mut encoder,
+                    SessionParams {
+                        target_fps: 240,
+                        max_frames_in_flight: 2,
+                    },
+                    30,
+                    "secret",
+                    &[oxproto::codec::RAW_BGRA, oxproto::codec::H264],
+                    far_deadline(),
+                    &session_slot,
+                )
+                .await
+            }
+        });
+
+        let mut r = Reassembler::new();
+        write_message(
+            &mut client,
+            &hello_with("secret", feature::FRAME_ACK, vec![oxproto::codec::H264]),
+            channel::CONTROL,
+        )
+        .await
+        .unwrap();
+        let sh = read_message(&mut client, &mut r).await.unwrap().unwrap();
+        let Message::ServerHello(sh) = sh else {
+            panic!("expected ServerHello, got {sh:?}")
+        };
+        assert_eq!(sh.codec, oxproto::codec::H264);
+        let _opened = wait_for_window_opened(&mut client, &mut r).await;
+
+        let first = rx.recv().await.expect("the encoder should be submitted to");
+        assert_eq!(
+            first,
+            EncoderCall::Submit {
+                handle: 0x2000,
+                force_keyframe: true,
+            },
+            "a window's first frame in a session must be forced as a keyframe"
+        );
+
+        // The resulting FrameData must actually carry the KEYFRAME flag and the H264 codec id.
+        let mut saw_keyframe = false;
+        for _ in 0..32 {
+            match read_message(&mut client, &mut r).await.unwrap().unwrap() {
+                Message::FrameData(f) => {
+                    assert_eq!(f.codec, oxproto::codec::H264);
+                    assert_ne!(f.flags & frame_flag::KEYFRAME, 0);
+                    saw_keyframe = true;
+                    break;
+                }
+                _ => continue,
+            }
+        }
+        assert!(saw_keyframe, "the first FrameData must be a keyframe");
+
+        // A coded-size change (OXPROTO.md §9.1) must force a fresh keyframe too.
+        state.lock().unwrap().width = 200;
+
+        let mut saw_forced_keyframe_again = false;
+        for _ in 0..64 {
+            match rx.recv().await.unwrap() {
+                EncoderCall::Submit {
+                    force_keyframe: true,
+                    ..
+                } => {
+                    saw_forced_keyframe_again = true;
+                    break;
+                }
+                _ => continue,
+            }
+        }
+        assert!(
+            saw_forced_keyframe_again,
+            "a coded-size change must force a fresh keyframe"
+        );
+
+        drop(client);
+        let _ = agent_task.await;
+    }
+
+    #[tokio::test]
+    async fn raw_bgra_sessions_never_touch_the_encoder() {
+        let (mut client, agent) = tokio::io::duplex(64 * 1024);
+        let (tx, mut rx) = mpsc::unbounded_channel();
+
+        let agent_task = tokio::spawn(async move {
+            let mut source = FakeSource::one_window(4);
+            let mut sink = NoopSink;
+            let mut encoder = RecordingEncoder::new(tx);
+            let session_slot = Semaphore::new(1);
+            run_session(
+                agent,
+                &mut source,
+                &mut sink,
+                &mut encoder,
+                SessionParams {
+                    target_fps: 240,
+                    max_frames_in_flight: 2,
+                },
+                31,
+                "secret",
+                RAW_BGRA_ONLY,
+                far_deadline(),
+                &session_slot,
+            )
+            .await
+        });
+
+        let mut r = Reassembler::new();
+        write_message(&mut client, &hello("secret"), channel::CONTROL)
+            .await
+            .unwrap();
+        let mut frames = 0;
+        while frames < 2 {
+            match read_message(&mut client, &mut r).await.unwrap() {
+                Some(Message::FrameData(f)) => {
+                    assert_eq!(f.codec, oxproto::codec::RAW_BGRA);
+                    frames += 1;
+                }
+                Some(_) => continue,
+                None => continue,
+            }
+        }
+
+        assert!(
+            rx.try_recv().is_err(),
+            "a RAW_BGRA session must never call the encoder"
+        );
+
+        drop(client);
+        let _ = agent_task.await;
+    }
+
+    #[tokio::test]
+    async fn h264_frame_data_reports_the_encoders_coded_size_not_the_captured_size() {
+        let state = std::sync::Arc::new(std::sync::Mutex::new(minimizable_window())); // 100x50
+        let (mut client, agent) = tokio::io::duplex(64 * 1024);
+        let (tx, _rx) = mpsc::unbounded_channel();
+
+        let agent_task = tokio::spawn({
+            let state = std::sync::Arc::clone(&state);
+            async move {
+                let mut source = MutableFrameSource(state);
+                let mut sink = NoopSink;
+                let mut encoder = RecordingEncoder::new(tx);
+                // Simulates an encoder that padded an odd capture dimension to the even size
+                // NV12 requires — deliberately different from the captured 100x50.
+                encoder.coded_size = Some((102, 50));
+                let session_slot = Semaphore::new(1);
+                run_session(
+                    agent,
+                    &mut source,
+                    &mut sink,
+                    &mut encoder,
+                    SessionParams {
+                        target_fps: 240,
+                        max_frames_in_flight: 2,
+                    },
+                    32,
+                    "secret",
+                    &[oxproto::codec::RAW_BGRA, oxproto::codec::H264],
+                    far_deadline(),
+                    &session_slot,
+                )
+                .await
+            }
+        });
+
+        let mut r = Reassembler::new();
+        write_message(
+            &mut client,
+            &hello_with("secret", feature::FRAME_ACK, vec![oxproto::codec::H264]),
+            channel::CONTROL,
+        )
+        .await
+        .unwrap();
+        let sh = read_message(&mut client, &mut r).await.unwrap().unwrap();
+        assert!(matches!(sh, Message::ServerHello(_)));
+        let _opened = wait_for_window_opened(&mut client, &mut r).await;
+
+        let mut saw = false;
+        for _ in 0..32 {
+            match read_message(&mut client, &mut r).await.unwrap().unwrap() {
+                Message::FrameData(f) => {
+                    assert_eq!(
+                        (f.width, f.height),
+                        (102, 50),
+                        "must report the encoder's coded size, not the captured 100x50"
+                    );
+                    saw = true;
+                    break;
+                }
+                _ => continue,
+            }
+        }
+        assert!(saw, "expected at least one FrameData");
+
+        drop(client);
+        let _ = agent_task.await;
+    }
+
+    #[tokio::test]
+    async fn a_has_frame_change_forces_a_fresh_window_geometry_even_without_a_resize() {
+        use oxproto::message::window::window_flag;
+
+        // `minimizable_window()` starts `has_frame: true` at (5,5) 100x50.
+        let state = std::sync::Arc::new(std::sync::Mutex::new(minimizable_window()));
+        let (mut client, agent) = tokio::io::duplex(64 * 1024);
+
+        let agent_task = tokio::spawn({
+            let state = std::sync::Arc::clone(&state);
+            async move {
+                let mut source = MutableSource(state);
+                let mut sink = NoopSink;
+                let mut encoder = NoopEncoder;
+                let session_slot = Semaphore::new(1);
+                run_session(
+                    agent,
+                    &mut source,
+                    &mut sink,
+                    &mut encoder,
+                    SessionParams {
+                        target_fps: 240,
+                        max_frames_in_flight: 2,
+                    },
+                    33,
+                    "secret",
+                    RAW_BGRA_ONLY,
+                    far_deadline(),
+                    &session_slot,
+                )
+                .await
+            }
+        });
+
+        let mut r = Reassembler::new();
+        write_message(&mut client, &hello("secret"), channel::CONTROL)
+            .await
+            .unwrap();
+        let opened = wait_for_window_opened(&mut client, &mut r).await;
+        assert_ne!(opened.flags & window_flag::HAS_FRAME, 0);
+
+        // Flip HAS_FRAME without touching x/y/width/height at all.
+        state.lock().unwrap().has_frame = false;
+
+        let mut saw_state = false;
+        for _ in 0..32 {
+            match read_message(&mut client, &mut r).await.unwrap().unwrap() {
+                Message::WindowState(s) => {
+                    assert_eq!(s.window_id, opened.window_id);
+                    assert_eq!(
+                        s.flags & window_flag::HAS_FRAME,
+                        0,
+                        "HAS_FRAME must be reported clear now"
+                    );
+                    saw_state = true;
+                    break;
+                }
+                _ => continue,
+            }
+        }
+        assert!(
+            saw_state,
+            "the flags change must be reported via WindowState"
+        );
+
+        // Must be followed by a fresh WindowGeometry, even though x/y/width/height are
+        // unchanged — HAS_FRAME moves the coordinate space itself (OXPROTO.md §11), and a
+        // client must not assume geometry it already has is still correct in the new space.
+        let mut saw_geometry = false;
+        for _ in 0..32 {
+            match read_message(&mut client, &mut r).await.unwrap().unwrap() {
+                Message::WindowGeometry(g) => {
+                    assert_eq!(g.window_id, opened.window_id);
+                    assert_eq!(
+                        (g.x, g.y, g.width, g.height),
+                        (opened.x, opened.y, opened.width, opened.height)
+                    );
+                    saw_geometry = true;
+                    break;
+                }
+                _ => continue,
+            }
+        }
+        assert!(
+            saw_geometry,
+            "HAS_FRAME changing must force a fresh WindowGeometry"
+        );
+
+        drop(client);
+        let _ = agent_task.await;
     }
 }

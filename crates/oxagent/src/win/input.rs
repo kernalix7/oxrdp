@@ -28,7 +28,7 @@ use core::ffi::c_void;
 
 use oxproto::message::input::{lock_state, modifier, pointer_button, window_action};
 use oxproto::scancode::Key;
-use windows::Win32::Foundation::{HWND, LPARAM, WPARAM};
+use windows::Win32::Foundation::{GetLastError, HWND, LPARAM, WPARAM};
 use windows::Win32::UI::Input::KeyboardAndMouse::{
     GetAsyncKeyState, GetKeyState, SendInput, INPUT, INPUT_0, INPUT_KEYBOARD, INPUT_MOUSE,
     KEYBDINPUT, KEYEVENTF_EXTENDEDKEY, KEYEVENTF_KEYUP, KEYEVENTF_SCANCODE, KEYEVENTF_UNICODE,
@@ -83,14 +83,33 @@ impl WinInputSink {
     /// Bring `handle` (as `hwnd`) to the foreground if it is not already the tracked focus.
     fn focus_on_change(&mut self, hwnd: HWND, handle: isize) {
         if self.last_focused != Some(handle) {
-            // SAFETY: `hwnd` is derived from a handle the driver resolved through its own
-            // window table for this exact event; a handle that has since gone stale simply
-            // makes the call fail, which is `BOOL(0)`, not unsound.
-            unsafe {
-                let _ = SetForegroundWindow(hwnd);
-            }
+            set_foreground(hwnd, handle);
             self.last_focused = Some(handle);
         }
+    }
+}
+
+/// Bring `hwnd` to the foreground and log whether it worked.
+///
+/// `SetForegroundWindow`'s `BOOL` return used to be discarded outright with `let _ =`. That
+/// matters more than most discarded booleans here: Windows imposes documented conditions on
+/// when a background process may steal the foreground at all, and a caller that fails silently
+/// has every subsequent injected keyboard/mouse-button event go wherever focus already was
+/// instead of `hwnd` — which looks, from the wire, exactly like a click or keystroke that was
+/// dropped, not one that landed on the wrong window.
+fn set_foreground(hwnd: HWND, handle: isize) {
+    // SAFETY: `hwnd` is derived from a handle the driver resolved through its own window table
+    // for this exact event; a handle that has since gone stale simply makes the call fail, which
+    // is `BOOL(0)`, not unsound.
+    let ok = unsafe { SetForegroundWindow(hwnd) };
+    if !ok.as_bool() {
+        // SAFETY: queried immediately after the call whose failure this explains; nothing
+        // between the two calls can have overwritten the calling thread's last-error value.
+        let err = unsafe { GetLastError() };
+        eprintln!(
+            "oxagent: input: SetForegroundWindow({handle:#x}) failed, GetLastError={}",
+            err.0
+        );
     }
 }
 
@@ -263,10 +282,7 @@ impl InputSink for WinInputSink {
             window_action::ACTIVATE => {
                 // See the type-level doc: this always forces focus, never throttled on
                 // `last_focused`.
-                // SAFETY: same as above.
-                unsafe {
-                    let _ = SetForegroundWindow(hwnd);
-                }
+                set_foreground(hwnd, handle);
                 self.last_focused = Some(handle);
             }
             window_action::MINIMIZE => {

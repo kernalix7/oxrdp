@@ -3,6 +3,7 @@
 
 mod appid;
 pub mod capture;
+mod encode;
 pub mod enumerate;
 mod input;
 
@@ -20,8 +21,10 @@ use windows::Win32::UI::HiDpi::{
 };
 
 use crate::config::AgentConfig;
+use crate::handshake::RAW_BGRA_ONLY;
 use crate::serve::{run_session, SessionParams};
 use capture::WindowCapture;
+use encode::{probe_h264_support, EncoderKind, WinFrameEncoder};
 use enumerate::enumerate_windows;
 use input::WinInputSink;
 
@@ -105,6 +108,23 @@ pub fn run_agent(config: &AgentConfig, print_pin: bool) -> ExitCode {
         return ExitCode::from(1);
     }
 
+    // Probed once, here, rather than per-session: hardware H.264 support is a fact about this
+    // guest for the lifetime of this process, not something that changes per connection. Report
+    // which kind (or none) was found now — "report it once, at session start" (P5a) is most
+    // useful the moment anyone can see it, and for a freshly-started agent that is before the
+    // first session can even connect.
+    let h264_kind = probe_h264_support();
+    let supported_codecs: std::sync::Arc<[u8]> = match h264_kind {
+        Some(kind) => {
+            eprintln!("oxagent: H.264 encode: {kind}");
+            std::sync::Arc::from([oxproto::codec::RAW_BGRA, oxproto::codec::H264])
+        }
+        None => {
+            eprintln!("oxagent: H.264 encode: unavailable, RAW_BGRA only");
+            std::sync::Arc::from(RAW_BGRA_ONLY)
+        }
+    };
+
     eprintln!("oxagent: listening on {} (pin {pin})", config.bind);
 
     let runtime = match tokio::runtime::Runtime::new() {
@@ -173,6 +193,7 @@ pub fn run_agent(config: &AgentConfig, print_pin: bool) -> ExitCode {
                     let acceptor = acceptor.clone();
                     let token = Arc::clone(&token);
                     let session_slot = Arc::clone(&session_slot);
+                    let supported_codecs = Arc::clone(&supported_codecs);
                     let params = SessionParams {
                         target_fps: config.target_fps,
                         max_frames_in_flight: config.max_frames_in_flight,
@@ -216,13 +237,25 @@ pub fn run_agent(config: &AgentConfig, print_pin: bool) -> ExitCode {
                         eprintln!("oxagent: session {id} from {peer}");
                         let mut source = WinWindowSource::new();
                         let mut sink = WinInputSink::new();
+                        // Constructed unconditionally, even when H.264 is unavailable this run
+                        // (`h264_kind` is `None`): building one costs nothing (no Media
+                        // Foundation call happens until `submit`, which only ever runs when the
+                        // negotiated codec is `H264` — impossible unless `supported_codecs`
+                        // offered it), and it keeps `run_session`'s generic `E: FrameEncoder`
+                        // satisfied without a second code path for "no encoder at all".
+                        let mut encoder = WinFrameEncoder::new(
+                            h264_kind.unwrap_or(EncoderKind::Software),
+                            params.target_fps,
+                        );
                         match run_session(
                             tls,
                             &mut source,
                             &mut sink,
+                            &mut encoder,
                             params,
                             id,
                             &token,
+                            &supported_codecs,
                             deadline,
                             &session_slot,
                         )

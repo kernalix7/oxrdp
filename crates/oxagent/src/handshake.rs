@@ -81,21 +81,28 @@ impl From<io::Error> for HandshakeError {
     }
 }
 
-/// Codecs this agent can actually produce, in descending preference.
-///
-/// `RAW_BGRA` only, until the Media Foundation encoder lands.
-pub const SUPPORTED_CODECS: &[u8] = &[codec::RAW_BGRA];
+/// `RAW_BGRA` is always producible — it is a memory copy, not a real codec. Every other entry
+/// in `supported_codecs` (below) is a runtime fact, not a build-time one: whether the agent can
+/// actually stand up an H.264 encoder depends on what Media Foundation finds on this particular
+/// guest (hardware encoder, software fallback, or neither), which is why it is not a constant
+/// here — see `crate::win::probe_supported_codecs`.
+pub const RAW_BGRA_ONLY: &[u8] = &[codec::RAW_BGRA];
 
 /// Run the agent side of the handshake.
 ///
 /// `verify_token` receives the token the client presented and must compare it against the
 /// agent's expected value in constant time. `session_id` is assigned by the caller.
+/// `supported_codecs` is the codec set the agent can actually produce *for this run* — not a
+/// constant, since H.264 availability is a runtime fact about the guest (see
+/// `crate::win::probe_supported_codecs`) — in descending preference is not required of this
+/// list: the client's own preference order is what `negotiate` honours (below).
 ///
 /// On rejection the peer is told why (`Error` + `Close`) and the connection should be dropped.
 pub async fn negotiate<S, F>(
     stream: &mut S,
     reassembler: &mut Reassembler,
     session_id: u64,
+    supported_codecs: &[u8],
     verify_token: F,
 ) -> Result<Negotiated, HandshakeError>
 where
@@ -142,7 +149,7 @@ where
 
     // First codec the client offered that the agent can produce; the client's list is in
     // descending preference, so this honours its preference rather than ours.
-    let Some(&chosen) = hello.codecs.iter().find(|c| SUPPORTED_CODECS.contains(c)) else {
+    let Some(&chosen) = hello.codecs.iter().find(|c| supported_codecs.contains(c)) else {
         return Err(reject(
             stream,
             error_code::UNSUPPORTED_CODEC,
@@ -232,11 +239,21 @@ mod tests {
         })
     }
 
-    /// Drive the agent side against a scripted client, returning the agent's result and every
-    /// message the client received.
+    /// Drive the agent side against a scripted client (offering `RAW_BGRA_ONLY`, the common
+    /// case), returning the agent's result and every message the client received.
     async fn run(
         client_hello: Message,
         expected: &'static str,
+    ) -> (Result<Negotiated, HandshakeError>, Vec<Message>) {
+        run_with_codecs(client_hello, expected, RAW_BGRA_ONLY).await
+    }
+
+    /// Like [`run`], but with a caller-chosen `supported_codecs` — for tests where what the
+    /// agent can actually produce (not just what the client asks for) is the point.
+    async fn run_with_codecs(
+        client_hello: Message,
+        expected: &'static str,
+        supported_codecs: &[u8],
     ) -> (Result<Negotiated, HandshakeError>, Vec<Message>) {
         let (mut client_io, mut agent_io) = tokio::io::duplex(64 * 1024);
 
@@ -254,7 +271,10 @@ mod tests {
         });
 
         let mut r = Reassembler::new();
-        let result = negotiate(&mut agent_io, &mut r, 7, |t| t == expected).await;
+        let result = negotiate(&mut agent_io, &mut r, 7, supported_codecs, |t| {
+            t == expected
+        })
+        .await;
         drop(agent_io);
         (result, client.await.unwrap())
     }
@@ -339,5 +359,28 @@ mod tests {
         )
         .await;
         assert_eq!(result.unwrap().codec, codec::RAW_BGRA);
+    }
+
+    #[tokio::test]
+    async fn h264_is_chosen_only_when_the_agent_actually_supports_it() {
+        // `supported_codecs` is a runtime fact, not `RAW_BGRA_ONLY` unconditionally — this is
+        // exactly the case that constant's replacement exists for: the same client offer picks
+        // a different codec depending on what this particular agent process could stand up.
+        let client_offer = || hello("secret", vec![codec::H264, codec::RAW_BGRA], 1, 1);
+
+        let (result, _) =
+            run_with_codecs(client_offer(), "secret", &[codec::RAW_BGRA, codec::H264]).await;
+        assert_eq!(
+            result.unwrap().codec,
+            codec::H264,
+            "H.264 available: the client's own preference (H264 first) wins"
+        );
+
+        let (result, _) = run_with_codecs(client_offer(), "secret", RAW_BGRA_ONLY).await;
+        assert_eq!(
+            result.unwrap().codec,
+            codec::RAW_BGRA,
+            "H.264 unavailable this run: falls back to what the agent can actually produce"
+        );
     }
 }

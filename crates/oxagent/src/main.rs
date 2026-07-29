@@ -10,8 +10,11 @@
 #![allow(unsafe_code)] // windows-rs COM/WinRT calls require unsafe
 
 pub mod config;
+pub mod encode;
+pub mod h264;
 pub mod handshake;
 pub mod input;
+pub mod nv12;
 pub mod pacing;
 pub mod registry;
 pub mod serve;
