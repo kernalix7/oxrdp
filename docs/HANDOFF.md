@@ -326,7 +326,7 @@ the way the old "90 tests, clippy clean" line did.
 **Not started at all:** Media Foundation H.264 encode (in flight, §8), the latency harness (P6),
 QUIC, clipboard, audio, `wgpu`/VA-API presentation (still softbuffer/CPU).
 
-### Input: keys work, targeting does not (measured 2026-07-29)
+### Input: works end to end, targeting fixed (measured 2026-07-29)
 
 Bisected against the live guest rather than inferred, and the earlier entry saying input was
 merely "unverified" understated what is now known:
@@ -344,10 +344,24 @@ merely "unverified" understated what is now known:
   at the last step. `ZZZTEST` went to a PowerShell window stacked over Notepad. Keys then follow
   guest OS focus to the wrong window. It is intermittent in exactly the way that implies:
   whether a click reaches its target depends on the guest's z-order at that instant.
-- Every one of those failures was **silent**. `SetForegroundWindow`'s result is discarded at
-  `crates/oxagent/src/win/input.rs`, and Windows' foreground-lock rules disqualify a background
-  process from forcing focus — so that call may be failing on every attempt with nothing to show
-  for it. Routed, with diagnostics, to the agent.
+- Every one of those failures was **silent**. `SetForegroundWindow`'s result was discarded, and
+  Windows' anti-focus-stealing heuristic disqualifies a background process from raising a window
+  — so it was failing on every attempt with nothing to show for it.
+
+**Fixed and re-measured.** The agent now raises the addressed window before injecting, falling
+back to attaching its input state to the current foreground thread when the plain call is
+refused, and confirms the result rather than assuming it. A click whose raise cannot be
+confirmed is withheld rather than injected somewhere else — the same doctrine already applied to
+input for an unknown window id, and the PowerShell case is why it matters: a misdirected click
+can land somewhere more privileged than the user intended.
+
+The intermittency had its own cause: `last_focused` was recorded before checking whether the
+raise worked, so one silent failure convinced the agent it had already focused that window and
+it never retried.
+
+Verified against the guest in the scenario that previously failed — a Notepad window with two
+Terminal windows stacked over it. Typing after a click now lands in Notepad: its title went from
+`*abcabc - Notepad` to `*abcabczz - Notepad`.
 
 ## 10. Key technical learnings (don't relearn these)
 
