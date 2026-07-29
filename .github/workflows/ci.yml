@@ -2,8 +2,19 @@ name: CI
 on:
   push:
     branches: [main]
+    # A commit touching only prose cannot break a build, and this workflow runs six jobs across
+    # two architectures plus a Windows cross-compile. Much of this repository's history is
+    # documentation, so running all of that to prove a paragraph still compiles is waste.
+    # Anything under `docs/design/` that a test actually enforces is enforced by conformance
+    # vectors in `crates/`, which are not ignored here.
+    paths-ignore:
+      - "**.md"
+      - "LICENSE"
   pull_request:
     branches: [main]
+    paths-ignore:
+      - "**.md"
+      - "LICENSE"
 
 permissions:
   contents: read
@@ -94,9 +105,19 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
-      - uses: rustsec/audit-check@v2
+      # `cargo audit` directly rather than rustsec/audit-check: that action posts its result as
+      # a check run, which needs `checks: write`, and this workflow's token is deliberately
+      # read-only. Widening the token so an advisory scan can draw a nicer annotation is a bad
+      # trade — the findings are just as readable in the job log, and a failing step fails the
+      # job either way. It also removes a third-party action from a security-critical path.
+      - uses: taiki-e/install-action@v2
         with:
-          token: ${{ secrets.GITHUB_TOKEN }}
+          tool: cargo-audit
+      # Not `--deny warnings`: the tree currently carries RUSTSEC-2026-0192, ttf-parser
+      # unmaintained, reached only through winit's Wayland decorations. That is not a
+      # vulnerability and nothing here can act on it, so failing the build over it would trade
+      # one permanently-red job for another. Plain `cargo audit` fails on actual advisories.
+      - run: cargo audit
 
   deny:
     runs-on: ubuntu-latest
