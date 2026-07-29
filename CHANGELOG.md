@@ -35,6 +35,33 @@ report: whether `MF_TRANSFORM_ASYNC_UNLOCK` really drives this guest's hardware 
 synchronously, whether the driver honours the `ICodecAPI` properties rather than silently
 ignoring them, and the COM ownership handling around `MFTEnumEx`.
 
+**Follow-up the same day: the stream was out of spec, and finding out took three rounds of
+instrumentation.** The client's decoder rejected exactly one frame in every thirty — the seventh
+of each GOP. Chasing it produced the following, in order:
+
+- Nothing in the workspace installed a logger, so every `log::warn!` in `oxdisplay` had been
+  going to a no-op sink. The stream had been dropping a frame a second while looking healthy.
+- openh264's `Native:16384` is `dsOutOfMemory`, not a bitstream error — which falsified the
+  parameter-set theory the first round was built on.
+- Raw capture of fifteen rejected access units showed every one was an AUD plus a single
+  non-IDR slice with `nal_ref_idc = 0`: non-reference pictures, which is what B-frames are.
+- Parsing the SPS on both sides — two independently written parsers agreeing — showed Media
+  Foundation encoding at **Main profile**, so `CODECAPI_AVEncMPVDefaultBPictureCount = 0` had
+  been silently ignored, as had the GOP size, and as had the profile property itself, which
+  did not even echo back.
+
+That made it a spec violation rather than a decoder incompatibility: §9.1 forbids B-frames
+because §12's flow control drops the oldest unacknowledged frame, which is unsound the moment a
+later frame can reference a skipped one. The stream was wrong whether or not anything could
+decode it.
+
+Fixed by constraining the profile through the **output media type** rather than a property. A
+media type is negotiated — `SetOutputType` either accepts Constrained Baseline or fails — while
+a property is advisory and this encoder had disregarded three of them. Verified on the guest:
+`profile_idc=66, constraints=0xc0`, and zero rejections where the same setup previously produced
+twelve to twenty-eight. Not yet re-measured under sustained delta frames; the runs after the fix
+carried keyframes only.
+
 ### Security (2026-07-28)
 
 An adversarial review of the agent's network-facing surface, prompted by input injection
