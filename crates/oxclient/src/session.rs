@@ -20,6 +20,79 @@ use crate::clock::ClientClock;
 /// the minimum to represent a genuinely unqueued round trip, which is the one worth trusting.
 const RTT_WINDOW: usize = 128;
 
+/// Exchanges kept as candidates for the offset estimate.
+const OFFSET_CANDIDATES: usize = 64;
+
+/// Assumed worst-case relative drift between the two clocks, in parts per million.
+///
+/// Ordinary crystals are specified to tens of ppm and a virtualised guest clock is usually
+/// disciplined on top of that, so 100 ppm is conservative rather than typical. It is an
+/// assumption, and it is stated here rather than buried because the error bound depends on it:
+/// at 100 ppm a sample one minute old has drifted 6 ms, which dwarfs half the round trip of a
+/// fast exchange. An estimate that ignored this would quote a bound far tighter than it earns.
+const CLOCK_DRIFT_PPM: u64 = 100;
+
+/// One ping/pong exchange, kept as a candidate for the offset estimate.
+#[derive(Debug, Clone, Copy)]
+struct OffsetSample {
+    rtt_us: u64,
+    offset_us: i64,
+    taken_at_us: u64,
+}
+
+impl OffsetSample {
+    /// How far this sample's offset could be out if used at `now_us`.
+    ///
+    /// Two independent errors. Half the round trip is what the symmetric-path assumption costs
+    /// when the path is not symmetric. The drift term is what the two clocks do to each other
+    /// while the sample ages. Both are upper bounds, and they add.
+    fn error_bound_us(&self, now_us: u64) -> u64 {
+        let age_us = now_us.saturating_sub(self.taken_at_us);
+        self.rtt_us / 2 + age_us.saturating_mul(CLOCK_DRIFT_PPM) / 1_000_000
+    }
+}
+
+/// Which exchange the offset estimate should come from.
+///
+/// Not the most recent one. An offset is only as trustworthy as the symmetry of the round trip
+/// it was measured over, so a single congested exchange poisons the estimate for as long as it
+/// is the latest — which was observed: a 100 ms round trip produced a +/-50 ms bound on a stage
+/// whose median was 7 ms, making the figure unusable.
+///
+/// Nor simply the lowest round trip ever seen, which is the standard NTP answer and is
+/// incomplete here: the best exchange may be minutes old, and an old offset is wrong by however
+/// far the clocks have drifted apart since. So the sample chosen is the one whose *total* error
+/// bound is smallest — round-trip asymmetry plus accumulated drift — which prefers a fast recent
+/// exchange, tolerates an older one when nothing better exists, and lets a stale sample age out
+/// on its own rather than by a rule about how old is too old.
+#[derive(Debug, Clone)]
+struct OffsetEstimate {
+    recent: std::collections::VecDeque<OffsetSample>,
+}
+
+impl OffsetEstimate {
+    fn new() -> Self {
+        Self {
+            recent: std::collections::VecDeque::new(),
+        }
+    }
+
+    fn push(&mut self, sample: OffsetSample) {
+        if self.recent.len() >= OFFSET_CANDIDATES {
+            self.recent.pop_front();
+        }
+        self.recent.push_back(sample);
+    }
+
+    /// The candidate with the smallest total error bound at `now_us`.
+    fn best(&self, now_us: u64) -> Option<OffsetSample> {
+        self.recent
+            .iter()
+            .copied()
+            .min_by_key(|sample| sample.error_bound_us(now_us))
+    }
+}
+
 /// What the display/render layer reacts to.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ClientEvent {
@@ -92,6 +165,8 @@ pub struct ClientSession<S> {
     clock: ClientClock,
     /// Round-trip time and agent-clock offset, from the ping/pong exchange below.
     clock_sync: ClockSync,
+    /// Candidate offsets, so the estimate can come from the best exchange rather than the last.
+    offsets: OffsetEstimate,
     /// Sequence number for the next ping this client sends.
     ping_seq: u32,
 }
@@ -127,6 +202,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin> ClientSession<S> {
                         session_id: sh.session_id,
                         clock: ClientClock::new(),
                         clock_sync: ClockSync::new(RTT_WINDOW),
+                        offsets: OffsetEstimate::new(),
                         ping_seq: 0,
                     })
                 }
@@ -211,8 +287,16 @@ impl<S: AsyncRead + AsyncWrite + Unpin> ClientSession<S> {
                 // this is the only thing that lets an agent timestamp be compared with a client
                 // one. Consumed here rather than surfaced: it is housekeeping, like the ping.
                 Message::Pong(p) => {
-                    self.clock_sync
-                        .on_pong(p.seq, p.agent_us, self.clock.now_us());
+                    let now_us = self.clock.now_us();
+                    if let Some(rtt_us) = self.clock_sync.on_pong(p.seq, p.agent_us, now_us) {
+                        if let Some(offset_us) = self.clock_sync.offset_us() {
+                            self.offsets.push(OffsetSample {
+                                rtt_us,
+                                offset_us,
+                                taken_at_us: now_us,
+                            });
+                        }
+                    }
                     continue;
                 }
                 Message::WindowOpened(m) => ClientEvent::WindowOpened(m),
@@ -289,15 +373,16 @@ impl<S: AsyncRead + AsyncWrite + Unpin> ClientSession<S> {
     /// [`ClientSession::rtt_us`]: an offset from a 1 ms round trip is worth far more than one
     /// from a 40 ms round trip.
     pub fn clock_offset_us(&self) -> Option<i64> {
-        self.clock_sync.offset_us()
+        Some(self.offsets.best(self.clock.now_us())?.offset_us)
     }
 
-    /// How far the offset estimate could be out, from `ClockSync` itself.
+    /// How far the offset estimate could be out.
     ///
-    /// Half the round trip of the exchange the current offset was computed from — not of the
-    /// best exchange ever seen, which would claim a precision this estimate does not have.
+    /// The bound of the exchange the offset actually came from — round-trip asymmetry plus the
+    /// drift accumulated since it was taken — never of some other, more flattering sample.
     pub fn offset_error_bound_us(&self) -> Option<u64> {
-        self.clock_sync.offset_error_bound_us()
+        let now_us = self.clock.now_us();
+        Some(self.offsets.best(now_us)?.error_bound_us(now_us))
     }
 
     /// Round-trip time statistics from the ping/pong exchange.
@@ -316,6 +401,81 @@ impl<S: AsyncRead + AsyncWrite + Unpin> ClientSession<S> {
         let sent_us = self.clock.now_us();
         self.clock_sync.on_ping_sent(seq, sent_us);
         self.send(&Message::Ping(Ping { seq, sent_us })).await
+    }
+}
+
+#[cfg(test)]
+mod offset_tests {
+    use super::*;
+
+    fn sample(rtt_us: u64, offset_us: i64, taken_at_us: u64) -> OffsetSample {
+        OffsetSample {
+            rtt_us,
+            offset_us,
+            taken_at_us,
+        }
+    }
+
+    /// The defect this replaces: one congested exchange became the estimate simply by being
+    /// last, and a 100 ms round trip put a +/-50 ms bound on a stage with a 7 ms median.
+    #[test]
+    fn a_congested_exchange_does_not_displace_a_good_one() {
+        let mut estimate = OffsetEstimate::new();
+        estimate.push(sample(1_000, 4_000, 1_000_000));
+        estimate.push(sample(100_000, 9_999, 1_500_000));
+
+        let best = estimate.best(2_000_000).expect("a sample exists");
+
+        assert_eq!(best.offset_us, 4_000, "the fast exchange should win");
+        // Half of 1 ms, plus 1 s of drift at 100 ppm.
+        assert_eq!(best.error_bound_us(2_000_000), 500 + 100);
+    }
+
+    /// And the part plain lowest-RTT selection gets wrong: a very old best sample is not best
+    /// any more, because the clocks have drifted apart since it was taken.
+    #[test]
+    fn a_stale_fast_sample_loses_to_a_fresh_slower_one() {
+        let mut estimate = OffsetEstimate::new();
+        // Excellent round trip, but taken 100 seconds ago: 10 ms of possible drift since.
+        estimate.push(sample(200, -1_000, 0));
+        // Ten times the round trip, but taken just now.
+        estimate.push(sample(2_000, -1_200, 100_000_000));
+
+        let best = estimate.best(100_000_000).expect("a sample exists");
+
+        assert_eq!(
+            best.offset_us, -1_200,
+            "10 ms of drift beats 0.9 ms of round-trip asymmetry"
+        );
+        assert_eq!(best.error_bound_us(100_000_000), 1_000);
+    }
+
+    #[test]
+    fn the_bound_is_the_selected_sample_s_own_and_grows_as_it_ages() {
+        let one = sample(1_000, 0, 0);
+
+        assert_eq!(one.error_bound_us(0), 500, "half the round trip, no age");
+        assert_eq!(one.error_bound_us(10_000_000), 500 + 1_000, "10 s of drift");
+        assert_eq!(one.error_bound_us(60_000_000), 500 + 6_000, "60 s of drift");
+    }
+
+    #[test]
+    fn candidates_are_bounded_and_the_estimate_survives_eviction() {
+        let mut estimate = OffsetEstimate::new();
+        for i in 0..(OFFSET_CANDIDATES as u64 + 20) {
+            estimate.push(sample(5_000, i as i64, i * 1_000_000));
+        }
+
+        assert_eq!(estimate.recent.len(), OFFSET_CANDIDATES);
+        assert!(
+            estimate.best(100_000_000).is_some(),
+            "eviction must not empty the estimate"
+        );
+    }
+
+    #[test]
+    fn nothing_is_claimed_before_the_first_pong() {
+        assert!(OffsetEstimate::new().best(1_000_000).is_none());
     }
 }
 

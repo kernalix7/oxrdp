@@ -410,7 +410,7 @@ impl LatencyMonitor {
         match (error_bound_us, offset_us) {
             (Some(bound), Some(offset)) => out.push_str(&format!(
                 "  clock: agent offset {offset} us, good to about +/-{bound} us \
-                 (half the round trip of the exchange it came from)\n"
+                 (round-trip asymmetry of the exchange it came from, plus drift since)\n"
             )),
             _ => out.push_str(
                 "  clock: no pong yet, so the agent's timestamps cannot be placed on this \
