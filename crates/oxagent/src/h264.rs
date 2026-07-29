@@ -269,6 +269,177 @@ pub fn first_sps_profile(raw: &[u8]) -> Option<(u8, u8, u8)> {
         .and_then(|nal| sps_profile(nal.payload))
 }
 
+/// Remove H.264 emulation-prevention bytes from a NAL payload, turning the escaped byte sequence
+/// a NAL unit carries on the wire into the raw RBSP bit sequence Exp-Golomb fields are coded
+/// against (ITU-T H.264 §7.4.1.1). A `0x03` byte immediately following any `00 00` two-byte run
+/// inside a NAL is not data — it exists only so that run can never be mistaken for a start code —
+/// and must be dropped before any bit past the fixed byte-aligned header fields can be trusted.
+/// [`sps_profile`] never needed this: it only reads fixed-position bytes that come before any
+/// point an emulation-prevention byte could occur this early. Anything using [`BitReader`] does.
+fn unescape_rbsp(payload: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(payload.len());
+    let mut zero_run = 0u32;
+    for &byte in payload {
+        if zero_run >= 2 && byte == 0x03 {
+            // The emulation-prevention byte itself: dropped, not copied. The run that triggered
+            // it is now behind an explicit non-zero marker in the real bitstream, so it cannot
+            // combine with whatever follows to form another `00 00 0x` — reset rather than
+            // decrement.
+            zero_run = 0;
+            continue;
+        }
+        out.push(byte);
+        zero_run = if byte == 0 { zero_run + 1 } else { 0 };
+    }
+    out
+}
+
+/// A read-only, MSB-first bit cursor over an already-unescaped RBSP — the bit order ITU-T
+/// H.264's bitstream syntax (§7.3.2.1.1 and others) is defined in. Exposes exactly the
+/// primitives that syntax needs: a fixed-width unsigned field (`u(n)`) and the two Exp-Golomb
+/// codes (`ue(v)`, `se(v)`, ITU-T H.264 §9.1).
+///
+/// Every method returns `None` on running out of bits, the same "cannot make sense of this,
+/// nothing to report" convention [`split_annexb`] and [`sps_profile`] already use for malformed
+/// input, rather than panicking on a real encoder's output this crate does not otherwise control.
+struct BitReader<'a> {
+    data: &'a [u8],
+    /// 0-indexed from the start of `data`, counting individual bits MSB-first within each byte.
+    bit_pos: usize,
+}
+
+impl<'a> BitReader<'a> {
+    fn new(data: &'a [u8]) -> Self {
+        Self { data, bit_pos: 0 }
+    }
+
+    fn bit(&mut self) -> Option<u32> {
+        let byte = *self.data.get(self.bit_pos / 8)?;
+        let shift = 7 - (self.bit_pos % 8);
+        self.bit_pos += 1;
+        Some(u32::from((byte >> shift) & 1))
+    }
+
+    /// `u(n)`: an unsigned fixed-width field, MSB first, `n <= 32`.
+    fn u(&mut self, n: u32) -> Option<u32> {
+        let mut value = 0u32;
+        for _ in 0..n {
+            value = (value << 1) | self.bit()?;
+        }
+        Some(value)
+    }
+
+    /// `ue(v)`: Exp-Golomb-coded unsigned integer. `None` if the leading-zero-bit run alone
+    /// would not fit this reader's `u32` result — not a value any field this module reads is
+    /// ever legally allowed to reach, so treated as malformed rather than trusted.
+    fn ue(&mut self) -> Option<u32> {
+        let mut leading_zeros = 0u32;
+        while self.bit()? == 0 {
+            leading_zeros += 1;
+            if leading_zeros > 31 {
+                return None;
+            }
+        }
+        if leading_zeros == 0 {
+            return Some(0);
+        }
+        let suffix = self.u(leading_zeros)?;
+        Some((1u32 << leading_zeros) - 1 + suffix)
+    }
+
+    /// `se(v)`: Exp-Golomb-coded signed integer, mapped from `ue(v)` (ITU-T H.264 §9.1.1).
+    fn se(&mut self) -> Option<i32> {
+        let code = self.ue()?;
+        let magnitude = code.div_ceil(2);
+        Some(if code % 2 == 0 {
+            -(magnitude as i32)
+        } else {
+            magnitude as i32
+        })
+    }
+}
+
+/// `profile_idc` values ITU-T H.264 §7.3.2.1.1 requires an extra chroma/bit-depth block for,
+/// between `seq_parameter_set_id` and `log2_max_frame_num_minus4`, that [`sps_ref_frame_info`]
+/// does not implement — see its doc for why returning `None` for one of these is the right
+/// response rather than a guess.
+const SPS_PROFILES_WITH_CHROMA_BLOCK: [u8; 13] =
+    [100, 110, 122, 244, 44, 83, 86, 118, 128, 138, 139, 134, 135];
+
+/// The reference-frame-related fields from an SPS's Exp-Golomb-coded body, past the fixed bytes
+/// [`sps_profile`] reads: `max_num_ref_frames` (how many decoded pictures the encoder told the
+/// decoder to keep around for prediction — the field this exists for) and `pic_order_cnt_type`
+/// (which of three different, differently-shaped ways `max_num_ref_frames` is preceded by is
+/// present — all three are walked correctly, including type 1's variable-length per-cycle
+/// reference-offset list, since bailing out on one and silently mis-locating `max_num_ref_frames`
+/// on the others would be a worse outcome than not parsing at all).
+///
+/// `None` in two cases, both treated the same way — "cannot be trusted, say nothing" rather than
+/// guessing — since a wrong answer here is worse than no answer: `payload` too short to hold even
+/// the fixed header `sps_profile` reads or to hold every field this parser walks past on its way
+/// to `max_num_ref_frames`; and `profile_idc` is one of [`SPS_PROFILES_WITH_CHROMA_BLOCK`], which
+/// this crate's encoder should never produce now that the profile is pinned to Constrained
+/// Baseline (`crate::win::encode`), so seeing one anyway means the encoder drifted *again*,
+/// differently, and guessing past a block this parser does not implement would silently misread
+/// everything after it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SpsRefFrameInfo {
+    pub max_num_ref_frames: u32,
+    pub pic_order_cnt_type: u32,
+}
+
+pub fn sps_ref_frame_info(payload: &[u8]) -> Option<SpsRefFrameInfo> {
+    let profile_idc = *payload.get(1)?;
+    if SPS_PROFILES_WITH_CHROMA_BLOCK.contains(&profile_idc) {
+        return None;
+    }
+    // Bytes 0-3 (header, profile_idc, constraint_flags, level_idc) are the fixed prefix
+    // `sps_profile` already reads; everything from byte 4 on is Exp-Golomb-coded and must go
+    // through emulation-prevention removal before any bit of it means anything.
+    let rbsp = unescape_rbsp(payload.get(4..)?);
+    let mut r = BitReader::new(&rbsp);
+
+    let _seq_parameter_set_id = r.ue()?;
+    let _log2_max_frame_num_minus4 = r.ue()?;
+    let pic_order_cnt_type = r.ue()?;
+    match pic_order_cnt_type {
+        0 => {
+            let _log2_max_pic_order_cnt_lsb_minus4 = r.ue()?;
+        }
+        1 => {
+            let _delta_pic_order_always_zero_flag = r.u(1)?;
+            let _offset_for_non_ref_pic = r.se()?;
+            let _offset_for_top_to_bottom_field = r.se()?;
+            let num_ref_frames_in_pic_order_cnt_cycle = r.ue()?;
+            // Spec-legal range is 0..=255 (ITU-T H.264 §7.4.2.1.1); a larger value is not
+            // something a real encoder emits, and looping on it anyway would be exactly the
+            // kind of guess this parser exists to avoid, not a defensive nicety.
+            if num_ref_frames_in_pic_order_cnt_cycle > 255 {
+                return None;
+            }
+            for _ in 0..num_ref_frames_in_pic_order_cnt_cycle {
+                let _offset_for_ref_frame = r.se()?;
+            }
+        }
+        _ => {} // type 2: no additional fields at this point in the syntax.
+    }
+    let max_num_ref_frames = r.ue()?;
+
+    Some(SpsRefFrameInfo {
+        max_num_ref_frames,
+        pic_order_cnt_type,
+    })
+}
+
+/// [`sps_ref_frame_info`] for the first SPS NAL found in a raw Annex-B access unit, if any —
+/// the bitstream-parsing counterpart to [`first_sps_profile`].
+pub fn first_sps_ref_frame_info(raw: &[u8]) -> Option<SpsRefFrameInfo> {
+    split_annexb(raw)
+        .into_iter()
+        .find(|nal| nal.kind == nal_type::SPS)
+        .and_then(|nal| sps_ref_frame_info(nal.payload))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -563,5 +734,309 @@ mod tests {
     fn first_sps_profile_is_none_when_the_access_unit_has_no_sps() {
         let raw = annexb(&[nal(nal_type::SLICE, 1)]);
         assert_eq!(first_sps_profile(&raw), None);
+    }
+
+    // --- unescape_rbsp ---
+
+    #[test]
+    fn unescape_rbsp_is_a_no_op_when_there_is_nothing_to_escape() {
+        assert_eq!(
+            unescape_rbsp(&[1, 2, 3, 0, 4, 0, 0, 4]),
+            vec![1, 2, 3, 0, 4, 0, 0, 4]
+        );
+    }
+
+    #[test]
+    fn unescape_rbsp_drops_the_emulation_prevention_byte() {
+        // `00 00 03` -> `00 00`: the `03` is not data, only a start-code guard.
+        assert_eq!(unescape_rbsp(&[1, 0, 0, 3, 2]), vec![1, 0, 0, 2]);
+    }
+
+    #[test]
+    fn unescape_rbsp_leaves_a_real_0x03_alone_when_it_is_not_after_two_zeros() {
+        // Only one zero precedes the `03` here, so it is real data, not an emulation guard.
+        assert_eq!(unescape_rbsp(&[1, 0, 3, 2]), vec![1, 0, 3, 2]);
+    }
+
+    #[test]
+    fn unescape_rbsp_handles_two_emulation_sequences_back_to_back() {
+        assert_eq!(
+            unescape_rbsp(&[0, 0, 3, 0, 0, 3, 1]),
+            vec![0, 0, 0, 0, 1],
+            "each `00 00 03` collapses independently, in order"
+        );
+    }
+
+    #[test]
+    fn unescape_rbsp_resets_the_zero_run_after_stripping_so_it_does_not_double_count() {
+        // `00 00 03 00 03`: the first `03` strips (after two zeros); the run then resets, so
+        // the single zero before the second `03` is not enough to strip it too.
+        assert_eq!(unescape_rbsp(&[0, 0, 3, 0, 3]), vec![0, 0, 0, 3]);
+    }
+
+    // --- BitReader ---
+
+    /// Pack MSB-first bits into bytes, padding the final byte with zero bits — enough for a
+    /// reader that only consumes exactly as many bits as a test asks it to.
+    fn bits_to_bytes(bits: &[bool]) -> Vec<u8> {
+        let mut out = vec![0u8; bits.len().div_ceil(8)];
+        for (i, &bit) in bits.iter().enumerate() {
+            if bit {
+                out[i / 8] |= 1 << (7 - (i % 8));
+            }
+        }
+        out
+    }
+
+    /// Exp-Golomb-encode `value` as `ue(v)` (ITU-T H.264 §9.1), appending its bits to `bits`.
+    /// Test-only: the production code only ever needs to decode this, never emit it, but a
+    /// writer this simple is far less error-prone as a test fixture than hand-computed bit
+    /// patterns, and lets these tests cover many values instead of a few worked-by-hand ones.
+    fn write_ue(bits: &mut Vec<bool>, value: u32) {
+        let x = value + 1;
+        let num_bits = 32 - x.leading_zeros();
+        bits.extend(std::iter::repeat_n(false, (num_bits - 1) as usize));
+        for i in (0..num_bits).rev() {
+            bits.push(((x >> i) & 1) == 1);
+        }
+    }
+
+    /// Exp-Golomb-encode `value` as `se(v)` (ITU-T H.264 §9.1.1) via [`write_ue`].
+    fn write_se(bits: &mut Vec<bool>, value: i32) {
+        let code_num = if value <= 0 {
+            (-2 * i64::from(value)) as u32
+        } else {
+            (2 * i64::from(value) - 1) as u32
+        };
+        write_ue(bits, code_num);
+    }
+
+    #[test]
+    fn bit_reader_u_reads_msb_first() {
+        // 0b1011_0000
+        let mut r = BitReader::new(&[0b1011_0000]);
+        assert_eq!(r.u(4), Some(0b1011));
+        assert_eq!(r.u(4), Some(0b0000));
+    }
+
+    #[test]
+    fn bit_reader_u_is_none_past_the_end() {
+        let mut r = BitReader::new(&[0xFF]);
+        assert_eq!(r.u(8), Some(0xFF));
+        assert_eq!(r.u(1), None);
+    }
+
+    #[test]
+    fn ue_round_trips_through_write_ue_for_a_range_of_values() {
+        for value in [
+            0u32, 1, 2, 3, 4, 5, 6, 7, 15, 16, 100, 1000, 65535, 1_000_000,
+        ] {
+            let mut bits = Vec::new();
+            write_ue(&mut bits, value);
+            let bytes = bits_to_bytes(&bits);
+            let mut r = BitReader::new(&bytes);
+            assert_eq!(r.ue(), Some(value), "round trip failed for {value}");
+        }
+    }
+
+    #[test]
+    fn ue_matches_the_spec_table_for_small_code_nums() {
+        // ITU-T H.264 Table 9-2: codeNum -> bit string.
+        let cases: &[(u32, &[bool])] = &[
+            (0, &[true]),
+            (1, &[false, true, false]),
+            (2, &[false, true, true]),
+            (3, &[false, false, true, false, false]),
+            (4, &[false, false, true, false, true]),
+        ];
+        for &(value, expected_bits) in cases {
+            let mut bits = Vec::new();
+            write_ue(&mut bits, value);
+            assert_eq!(bits, expected_bits, "codeNum {value}");
+        }
+    }
+
+    #[test]
+    fn se_round_trips_through_write_se_for_a_range_of_values() {
+        for value in [0i32, 1, -1, 2, -2, 3, -3, 100, -100, 1000, -1000] {
+            let mut bits = Vec::new();
+            write_se(&mut bits, value);
+            let bytes = bits_to_bytes(&bits);
+            let mut r = BitReader::new(&bytes);
+            assert_eq!(r.se(), Some(value), "round trip failed for {value}");
+        }
+    }
+
+    // --- sps_ref_frame_info ---
+
+    /// Build a full, valid SPS NAL payload (header byte included) for `profile_idc = 66`
+    /// (Baseline/Constrained Baseline — outside `SPS_PROFILES_WITH_CHROMA_BLOCK`, so no
+    /// unimplemented chroma block precedes the fields under test) with the given field values.
+    fn build_sps(
+        pic_order_cnt_type: u32,
+        log2_max_pic_order_cnt_lsb_minus4: Option<u32>,
+        max_num_ref_frames: u32,
+    ) -> Vec<u8> {
+        let mut bits = Vec::new();
+        write_ue(&mut bits, 0); // seq_parameter_set_id
+        write_ue(&mut bits, 2); // log2_max_frame_num_minus4
+        write_ue(&mut bits, pic_order_cnt_type);
+        if pic_order_cnt_type == 0 {
+            write_ue(&mut bits, log2_max_pic_order_cnt_lsb_minus4.unwrap());
+        }
+        write_ue(&mut bits, max_num_ref_frames);
+        // Trailing padding well past everything this parser reads, so it never runs off the end
+        // of the buffer while reading a field this test does care about.
+        bits.extend(std::iter::repeat_n(false, 32));
+        let mut payload = vec![nal_type::SPS, 66, 0x40, 31]; // header, profile, constraints, level
+        payload.extend(bits_to_bytes(&bits));
+        payload
+    }
+
+    #[test]
+    fn sps_ref_frame_info_reads_max_num_ref_frames_for_pic_order_cnt_type_0() {
+        let payload = build_sps(0, Some(4), 1);
+        assert_eq!(
+            sps_ref_frame_info(&payload),
+            Some(SpsRefFrameInfo {
+                max_num_ref_frames: 1,
+                pic_order_cnt_type: 0,
+            })
+        );
+    }
+
+    #[test]
+    fn sps_ref_frame_info_reads_max_num_ref_frames_for_pic_order_cnt_type_2() {
+        // Type 2 has no extra field before max_num_ref_frames, unlike type 0's
+        // log2_max_pic_order_cnt_lsb_minus4 — a real way this parser could misalign itself if
+        // the `match` in `sps_ref_frame_info` had the wrong arm for this type.
+        let payload = build_sps(2, None, 3);
+        assert_eq!(
+            sps_ref_frame_info(&payload),
+            Some(SpsRefFrameInfo {
+                max_num_ref_frames: 3,
+                pic_order_cnt_type: 2,
+            })
+        );
+    }
+
+    #[test]
+    fn sps_ref_frame_info_reports_a_nonzero_ref_count_correctly_too() {
+        // Not just "did it find 1" — a real drift back to more reference frames must show up as
+        // something other than 1 too.
+        let payload = build_sps(0, Some(4), 4);
+        assert_eq!(
+            sps_ref_frame_info(&payload).map(|i| i.max_num_ref_frames),
+            Some(4)
+        );
+    }
+
+    /// Build a full SPS payload for `pic_order_cnt_type == 1`, whose per-cycle reference-offset
+    /// list has `cycle_len` entries (each an arbitrary but fixed `se(v)` value) before
+    /// `max_num_ref_frames`.
+    fn build_sps_pic_order_type_1(cycle_len: u32, max_num_ref_frames: u32) -> Vec<u8> {
+        let mut bits = Vec::new();
+        write_ue(&mut bits, 0); // seq_parameter_set_id
+        write_ue(&mut bits, 2); // log2_max_frame_num_minus4
+        write_ue(&mut bits, 1); // pic_order_cnt_type = 1
+        write_ue(&mut bits, 0); // delta_pic_order_always_zero_flag (u(1), value 0 encodes the same either way)
+        write_se(&mut bits, -3); // offset_for_non_ref_pic
+        write_se(&mut bits, 2); // offset_for_top_to_bottom_field
+        write_ue(&mut bits, cycle_len); // num_ref_frames_in_pic_order_cnt_cycle
+        for i in 0..cycle_len {
+            write_se(&mut bits, if i % 2 == 0 { 1 } else { -1 }); // offset_for_ref_frame[i]
+        }
+        write_ue(&mut bits, max_num_ref_frames);
+        bits.extend(std::iter::repeat_n(false, 32));
+        let mut payload = vec![nal_type::SPS, 66, 0x40, 31];
+        payload.extend(bits_to_bytes(&bits));
+        payload
+    }
+
+    #[test]
+    fn sps_ref_frame_info_reads_max_num_ref_frames_for_pic_order_cnt_type_1_with_an_empty_cycle() {
+        let payload = build_sps_pic_order_type_1(0, 1);
+        assert_eq!(
+            sps_ref_frame_info(&payload),
+            Some(SpsRefFrameInfo {
+                max_num_ref_frames: 1,
+                pic_order_cnt_type: 1,
+            })
+        );
+    }
+
+    #[test]
+    fn sps_ref_frame_info_reads_max_num_ref_frames_for_pic_order_cnt_type_1_with_a_nonempty_cycle()
+    {
+        // The part of this parser most likely to misalign itself: a variable-length loop, bound
+        // by a value read earlier in the same bitstream, has to be walked exactly `cycle_len`
+        // times — not zero, not `cycle_len + 1` — or `max_num_ref_frames` lands on the wrong
+        // bits entirely.
+        let payload = build_sps_pic_order_type_1(5, 2);
+        assert_eq!(
+            sps_ref_frame_info(&payload),
+            Some(SpsRefFrameInfo {
+                max_num_ref_frames: 2,
+                pic_order_cnt_type: 1,
+            })
+        );
+    }
+
+    #[test]
+    fn sps_ref_frame_info_is_none_when_the_pic_order_cnt_cycle_length_exceeds_the_spec_limit() {
+        // ITU-T H.264 §7.4.2.1.1 limits `num_ref_frames_in_pic_order_cnt_cycle` to 0..=255; a
+        // larger value is not something a real encoder emits, so this parser refuses it rather
+        // than looping on it.
+        let mut bits = Vec::new();
+        write_ue(&mut bits, 0);
+        write_ue(&mut bits, 2);
+        write_ue(&mut bits, 1); // pic_order_cnt_type = 1
+        write_ue(&mut bits, 0);
+        write_se(&mut bits, 0);
+        write_se(&mut bits, 0);
+        write_ue(&mut bits, 256); // one past the spec-legal maximum
+        let mut payload = vec![nal_type::SPS, 66, 0x40, 31];
+        payload.extend(bits_to_bytes(&bits));
+
+        assert_eq!(sps_ref_frame_info(&payload), None);
+    }
+
+    #[test]
+    fn sps_ref_frame_info_is_none_for_a_profile_with_the_unimplemented_chroma_block() {
+        // profile_idc = 100 (High) is in `SPS_PROFILES_WITH_CHROMA_BLOCK`; this crate's encoder
+        // should never produce it (pinned to Constrained Baseline), so seeing one is treated as
+        // "cannot be trusted" rather than parsed as if the block were not there.
+        let payload = build_sps(0, Some(4), 1);
+        let mut high_profile_payload = payload.clone();
+        high_profile_payload[1] = 100;
+        assert_eq!(sps_ref_frame_info(&high_profile_payload), None);
+    }
+
+    #[test]
+    fn sps_ref_frame_info_is_none_for_a_payload_too_short_to_hold_the_fixed_prefix() {
+        assert_eq!(sps_ref_frame_info(&[nal_type::SPS, 66, 0x40]), None);
+    }
+
+    #[test]
+    fn first_sps_ref_frame_info_finds_the_sps_among_other_nals() {
+        let sps_payload = build_sps(0, Some(4), 1);
+        let raw = annexb(&[
+            nal(nal_type::AUD, 0),
+            sps_payload,
+            nal(nal_type::SLICE_IDR, 9),
+        ]);
+        assert_eq!(
+            first_sps_ref_frame_info(&raw),
+            Some(SpsRefFrameInfo {
+                max_num_ref_frames: 1,
+                pic_order_cnt_type: 0,
+            })
+        );
+    }
+
+    #[test]
+    fn first_sps_ref_frame_info_is_none_when_the_access_unit_has_no_sps() {
+        let raw = annexb(&[nal(nal_type::SLICE, 1)]);
+        assert_eq!(first_sps_ref_frame_info(&raw), None);
     }
 }

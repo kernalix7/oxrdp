@@ -32,21 +32,30 @@
 //!   MFT is free to insert a periodic sync point anyway. Kept as spec hygiene regardless of the
 //!   next bullet's finding: it was this file's first, and as it turned out incomplete, attempt to
 //!   explain a real guest run rejecting one access unit in every thirty. See `GOP_SIZE_FRAMES`.
-//! - **Constrained Baseline is a media-type constraint, not only an `ICodecAPI` request.** Ground
-//!   truth from a guest run's own SPS (this crate now parses and logs it — `crate::h264::
-//!   sps_profile`) confirmed the root cause the periodic decode rejections traced back to: this
-//!   encoder was emitting Main profile (`profile_idc = 77`) regardless of `CODECAPI_AVEncMPVProfile`
-//!   having been set, and Main permits B-pictures — a B-picture is exactly what `nal_ref_idc == 0`
-//!   on a non-IDR slice means, and openh264's Constrained-Baseline-only decoder rejects every one
-//!   it sees. `MF_MT_MPEG2_PROFILE` (`= eAVEncH264VProfile_ConstrainedBase`) is set on the output
-//!   media type instead — Media Foundation's actual attribute for H.264 profile signalling
-//!   despite the legacy "MPEG2" name, and a `SetOutputType` negotiation the transform must accept
-//!   or reject, not a behavioural hint it can silently disregard the way it disregarded
-//!   `CODECAPI_AVEncMPVGOPSize` and `CODECAPI_AVEncMPVDefaultBPictureCount` — both confirmed
-//!   ignored by the same guest run, which is exactly the caveat this file already carried about
-//!   trusting a `SetValue` succeeding. `CODECAPI_AVEncVideoTemporalLayerCount = 0` and the
-//!   `ICodecAPI` profile request are both still set too, best-effort, alongside it — seatbelt,
-//!   not the actual mechanism.
+//! - **Constrained Baseline is a media-type constraint, not only an `ICodecAPI` request — and
+//!   this is confirmed, not theorized.** A guest run's own SPS (this crate parses and logs it —
+//!   `crate::h264::sps_profile`) first caught this encoder emitting Main profile
+//!   (`profile_idc = 77`) regardless of `CODECAPI_AVEncMPVProfile` having been set, which is
+//!   exactly what let B-pictures (`nal_ref_idc == 0` on a non-IDR slice) into the stream and
+//!   openh264's Constrained-Baseline-only decoder reject every one of them. Setting
+//!   `MF_MT_MPEG2_PROFILE` (`= eAVEncH264VProfile_ConstrainedBase`) on the output media type
+//!   instead — Media Foundation's actual attribute for H.264 profile signalling despite the
+//!   legacy "MPEG2" name, and a `SetOutputType` negotiation the transform must accept or reject,
+//!   not a behavioural hint it can silently disregard — fixed it: redeployed and verified on the
+//!   same guest, the SPS now reads Constrained Baseline, `nal_ref_idc` is never `0` on a delta
+//!   frame, and decode rejections went from double digits to zero. That guest run also confirmed
+//!   `CODECAPI_AVEncMPVGOPSize` *and* `CODECAPI_AVEncMPVDefaultBPictureCount` were both accepted
+//!   by `SetValue` and silently ignored — a media-type constraint is not a nicer-sounding version
+//!   of the same request, it is a structurally different, unignorable one, which is why
+//!   `MAX_REF_FRAMES` below is verified from the bitstream rather than trusted from
+//!   `ICodecAPI::GetValue` either.
+//! - **Reference frame count pinned to 1, verified from the SPS, not from the property.** A
+//!   third `ICodecAPI` property on this encoder has now been demonstrated accepted-and-ignored
+//!   (the profile one, above) and a fourth was never checked against the bitstream at all until
+//!   `MAX_REF_FRAMES`. `crate::h264::sps_ref_frame_info` — an Exp-Golomb bitstream reader, not
+//!   just the fixed-byte read `sps_profile` does — reads `max_num_ref_frames` straight out of a
+//!   real keyframe's SPS, logged per frame alongside the `ICodecAPI` readback so the two can be
+//!   compared directly rather than one being assumed to imply the other.
 //!
 //! **What this file's author could not verify without a live Windows guest**, stated plainly
 //! rather than left implicit: whether `MF_TRANSFORM_ASYNC_UNLOCK` actually lets every hardware
@@ -54,18 +63,19 @@
 //! not this crate's invention, but "documented" and "true of the specific driver on the test
 //! guest" are not the same claim); the `MFTEnumEx` output array's ownership handling in
 //! [`first_activate`], which follows the COM ownership rules as documented but has had no COM
-//! debugger anywhere near it; and whether constraining the profile on the media type actually
-//! stops the rejection this time, given two `ICodecAPI` properties on this same encoder have
-//! already turned out to be accepted and ignored — `crate::h264::sps_profile`'s per-frame logging
-//! exists precisely so the next guest run answers that from the SPS itself, not from another
-//! property's return value. Two more items this same guest run surfaced and this crate has not
-//! yet acted on, deliberately, one change at a time rather than batched: `CODECAPI_AVEncMPVGOPSize`
-//! remains demonstrated-ignored (if Constrained Baseline does not also settle the GOP period, this
-//! file will need to force keyframes on its own schedule rather than asking the encoder for one);
-//! and `CODECAPI_AVEncVideoMaxNumRefFrame` is not yet pinned to `1`, which a low-latency,
-//! non-reordering, single-reference screen stream has no use for more of. All of this is exactly
-//! the class of bug the project's own history says only shows up by running the code — see
-//! `crate::win::capture`'s doc comment.
+//! debugger anywhere near it; and whether `CODECAPI_AVEncVideoMaxNumRefFrame` fares any better
+//! than the three properties already shown ignored on this same encoder — `MAX_REF_FRAMES`'s doc
+//! says why the SPS reading is what actually settles it, but that reading has not yet come back
+//! from a guest run. Two items a guest run has already surfaced and this crate has not yet acted
+//! on, deliberately, one change at a time rather than batched: `CODECAPI_AVEncMPVGOPSize` remains
+//! demonstrated-ignored, so the IDRs a guest run saw at 1/31/61/91 are still this encoder's own
+//! choice, not `OXPROTO.md` §9.1's two named events — forcing keyframes on a schedule this crate
+//! controls, rather than asking the encoder for one, is the planned fix; and whether the protocol
+//! needs a keyframe-request message at all, for a transport (unlike today's TCP) that can lose a
+//! frame with no resize in sight to recover at, is a question for `docs/design/OXPROTO.md`'s
+//! owner, not something to decide unilaterally here. All of this is exactly the class of bug the
+//! project's own history says only shows up by running the code — see `crate::win::capture`'s
+//! doc comment.
 
 use std::collections::HashMap;
 use std::ffi::c_void;
@@ -76,16 +86,16 @@ use windows::Win32::Media::MediaFoundation::{
     eAVEncCommonRateControlMode_LowDelayVBR, eAVEncH264VProfile_ConstrainedBase,
     CODECAPI_AVEncCommonMeanBitRate, CODECAPI_AVEncCommonRateControlMode,
     CODECAPI_AVEncMPVDefaultBPictureCount, CODECAPI_AVEncMPVGOPSize, CODECAPI_AVEncMPVProfile,
-    CODECAPI_AVEncVideoForceKeyFrame, CODECAPI_AVEncVideoTemporalLayerCount,
-    CODECAPI_AVLowLatencyMode, ICodecAPI, IMFActivate, IMFMediaBuffer, IMFSample, IMFTransform,
-    MFCreateMediaType, MFCreateMemoryBuffer, MFCreateSample, MFMediaType_Video, MFStartup,
-    MFTEnumEx, MFVideoFormat_H264, MFVideoFormat_NV12, MFVideoInterlace_Progressive,
-    MFSTARTUP_FULL, MFT_CATEGORY_VIDEO_ENCODER, MFT_ENUM_FLAG_HARDWARE,
-    MFT_ENUM_FLAG_SORTANDFILTER, MFT_ENUM_FLAG_SYNCMFT, MFT_MESSAGE_NOTIFY_BEGIN_STREAMING,
-    MFT_MESSAGE_NOTIFY_START_OF_STREAM, MFT_OUTPUT_DATA_BUFFER, MFT_OUTPUT_STREAM_PROVIDES_SAMPLES,
-    MFT_REGISTER_TYPE_INFO, MF_E_TRANSFORM_NEED_MORE_INPUT, MF_MT_AVG_BITRATE, MF_MT_FRAME_RATE,
-    MF_MT_FRAME_SIZE, MF_MT_INTERLACE_MODE, MF_MT_MAJOR_TYPE, MF_MT_MPEG2_PROFILE, MF_MT_SUBTYPE,
-    MF_TRANSFORM_ASYNC, MF_TRANSFORM_ASYNC_UNLOCK, MF_VERSION,
+    CODECAPI_AVEncVideoForceKeyFrame, CODECAPI_AVEncVideoMaxNumRefFrame,
+    CODECAPI_AVEncVideoTemporalLayerCount, CODECAPI_AVLowLatencyMode, ICodecAPI, IMFActivate,
+    IMFMediaBuffer, IMFSample, IMFTransform, MFCreateMediaType, MFCreateMemoryBuffer,
+    MFCreateSample, MFMediaType_Video, MFStartup, MFTEnumEx, MFVideoFormat_H264,
+    MFVideoFormat_NV12, MFVideoInterlace_Progressive, MFSTARTUP_FULL, MFT_CATEGORY_VIDEO_ENCODER,
+    MFT_ENUM_FLAG_HARDWARE, MFT_ENUM_FLAG_SORTANDFILTER, MFT_ENUM_FLAG_SYNCMFT,
+    MFT_MESSAGE_NOTIFY_BEGIN_STREAMING, MFT_MESSAGE_NOTIFY_START_OF_STREAM, MFT_OUTPUT_DATA_BUFFER,
+    MFT_OUTPUT_STREAM_PROVIDES_SAMPLES, MFT_REGISTER_TYPE_INFO, MF_E_TRANSFORM_NEED_MORE_INPUT,
+    MF_MT_AVG_BITRATE, MF_MT_FRAME_RATE, MF_MT_FRAME_SIZE, MF_MT_INTERLACE_MODE, MF_MT_MAJOR_TYPE,
+    MF_MT_MPEG2_PROFILE, MF_MT_SUBTYPE, MF_TRANSFORM_ASYNC, MF_TRANSFORM_ASYNC_UNLOCK, MF_VERSION,
 };
 use windows::Win32::System::Com::CoTaskMemFree;
 
@@ -114,6 +124,15 @@ const TARGET_BITRATE_BPS: u32 = 6_000_000;
 /// session reaches before a resolution change rebuilds the encoder anyway, without depending on
 /// a special-cased meaning for one particular number that varies by vendor.
 const GOP_SIZE_FRAMES: u32 = 1_000_000;
+
+/// `CODECAPI_AVEncVideoMaxNumRefFrame`. A low-latency screen stream has no B-frames (no
+/// reordering) and rarely enough motion complexity for a second reference frame to earn back the
+/// decoder memory and prediction-search cost it adds; one is exactly what a P-frame needs and
+/// nothing more. Verified from the bitstream, not trusted from the property — three `ICodecAPI`
+/// properties on this same encoder have already been demonstrated accepted and silently ignored,
+/// so `crate::h264::sps_ref_frame_info`'s `max_num_ref_frames` reading is the number that
+/// actually matters; see `DIAGNOSTIC_FRAME_LIMIT`'s per-frame log.
+const MAX_REF_FRAMES: u32 = 1;
 
 /// How many access units, per [`WindowEncoder`], to log the raw (pre-[`h264::reframe`]) NAL
 /// makeup of. Diagnostic only, requested to chase down the GOP-boundary decode failure
@@ -389,18 +408,26 @@ impl WindowEncoder {
                     &VARIANT::from(eAVEncH264VProfile_ConstrainedBase.0 as u32),
                 );
                 let _ = api.SetValue(&CODECAPI_AVEncVideoTemporalLayerCount, &VARIANT::from(0u32));
+                // See `MAX_REF_FRAMES`.
+                let _ = api.SetValue(
+                    &CODECAPI_AVEncVideoMaxNumRefFrame,
+                    &VARIANT::from(MAX_REF_FRAMES),
+                );
             }
 
-            // "Check what you are actually getting rather than what you set": read the two
+            // "Check what you are actually getting rather than what you set": read the
             // properties above straight back, immediately, rather than trusting that `SetValue`
             // succeeding means the driver actually adopted them. Best-effort like everything
             // else here — `None` just means this driver does not support reading a property back,
-            // not that the `SetValue` above failed.
+            // not that the `SetValue` above failed — and, per `MAX_REF_FRAMES`'s doc, not
+            // authoritative even when it is `Some` and matches: see the per-frame SPS log below
+            // for what the bitstream itself ends up saying.
             eprintln!(
-                "oxagent: h264: window={handle:#x} encoder configured: profile requested={} reported={:?}, temporal_layers requested=0 reported={:?}",
+                "oxagent: h264: window={handle:#x} encoder configured: profile requested={} reported={:?}, temporal_layers requested=0 reported={:?}, max_ref_frames requested={MAX_REF_FRAMES} reported={:?}",
                 eAVEncH264VProfile_ConstrainedBase.0,
                 get_u32_property(api, &CODECAPI_AVEncMPVProfile),
                 get_u32_property(api, &CODECAPI_AVEncVideoTemporalLayerCount),
+                get_u32_property(api, &CODECAPI_AVEncVideoMaxNumRefFrame),
             );
         }
 
@@ -561,8 +588,19 @@ impl WindowEncoder {
                     format!(" sps_profile_idc={p} sps_constraint_flags={c:#010b} sps_level_idc={l}")
                 })
                 .unwrap_or_default();
+            // The authoritative check for `MAX_REF_FRAMES`: read straight from the bitstream's
+            // own SPS, not from `ICodecAPI::GetValue`, which has already been shown to echo back
+            // values this encoder does not actually honour.
+            let ref_frames = h264::first_sps_ref_frame_info(&raw)
+                .map(|info| {
+                    format!(
+                        " sps_max_num_ref_frames={} sps_pic_order_cnt_type={}",
+                        info.max_num_ref_frames, info.pic_order_cnt_type
+                    )
+                })
+                .unwrap_or_default();
             eprintln!(
-                "oxagent: h264: window={:#x} frame={} nals=[{}]{profile}",
+                "oxagent: h264: window={:#x} frame={} nals=[{}]{profile}{ref_frames}",
                 self.handle,
                 self.frames_seen,
                 nals.join(", ")
