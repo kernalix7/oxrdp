@@ -64,19 +64,23 @@ writing a better client for someone else's.
 
 ## Status
 
-**Pre-alpha.** The protocol, its framing, and the transport are implemented and tested; the
-agent captures windows; the client performs the handshake and event loop. Nothing renders yet.
+**Pre-alpha, but rendering.** A live Windows guest window now appears as a native Linux window
+with live, updating content, and input round-trips back to it — validated against a real guest,
+not just tests (see `HANDOFF.md` §9 for exactly which parts). The gap left is turning that into a
+polished, low-latency multi-window experience: a hardware H.264 encoder on the agent (in flight)
+and a measured latency number are the two biggest missing pieces.
 
 | Component | State |
 | --- | --- |
 | `oxproto` — protocol messages, framing, limits | implemented, tested, fuzzed |
-| `oxtransport` — async chunk IO | implemented, tested |
-| `oxclient` — handshake + event loop | implemented, tested |
-| `oxagent` — window enumeration, WGC capture | implemented (cross-compiles); no listener yet |
-| display / render / input | not started |
+| `oxtransport` — async chunk IO | implemented, tested, cancel-safe (read + write) |
+| `oxclient` — handshake, decode, present, input | implemented; RAW_BGRA render loop and WindowControl validated against a real guest; H.264 decode unit-tested only, keyboard/pointer injection not independently confirmed on the guest yet |
+| `oxagent` — window enumeration, WGC capture, serve | implemented and serving real sessions; capture and window flags validated against a real guest; H.264 encoder in flight, not yet committed |
+| display / render / input | `oxdisplay` (winit + softbuffer CPU presenter) implemented and in use; `wgpu`/VA-API GPU path not started |
 
 Current state and next steps: [`docs/HANDOFF.md`](docs/HANDOFF.md).
-Known gaps, adversarially verified: [`docs/design/AUDIT-2026-07.md`](docs/design/AUDIT-2026-07.md).
+Known gaps, adversarially verified, with a 2026-07-29 status sweep against the current repo:
+[`docs/design/AUDIT-2026-07.md`](docs/design/AUDIT-2026-07.md).
 
 ## Build
 
