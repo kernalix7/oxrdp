@@ -124,10 +124,13 @@ struct WindowLatency {
     /// holding the agent's whole in-flight budget when it turned up. Between them these say
     /// whether a transport-shaped tail is transmission time, or this client's own back-pressure
     /// showing up a frame later.
-    keyframe_transit: Samples,
-    delta_transit: Samples,
-    backlogged_transit: Samples,
-    clear_transit: Samples,
+    /// Encode-to-arrival, split two ways at once rather than twice one way.
+    ///
+    /// A 211 KB keyframe is exactly what pushes the *next* frame over the agent's in-flight
+    /// budget, so "is a keyframe" and "arrived while we were backlogged" are correlated by
+    /// construction. Two one-dimensional splits cannot tell "flow control is slow" from "flow
+    /// control only looks slow because keyframes cause their own backlog"; the cross does.
+    transit: [[Samples; 2]; 2],
     keyframe_bytes: Samples,
     delta_bytes: Samples,
     presented: u64,
@@ -144,10 +147,10 @@ impl WindowLatency {
             decode_to_present: Samples::new(SAMPLE_WINDOW),
             client: Samples::new(SAMPLE_WINDOW),
             total: Samples::new(SAMPLE_WINDOW),
-            keyframe_transit: Samples::new(SAMPLE_WINDOW),
-            delta_transit: Samples::new(SAMPLE_WINDOW),
-            backlogged_transit: Samples::new(SAMPLE_WINDOW),
-            clear_transit: Samples::new(SAMPLE_WINDOW),
+            transit: [
+                [Samples::new(SAMPLE_WINDOW), Samples::new(SAMPLE_WINDOW)],
+                [Samples::new(SAMPLE_WINDOW), Samples::new(SAMPLE_WINDOW)],
+            ],
             keyframe_bytes: Samples::new(SAMPLE_WINDOW),
             delta_bytes: Samples::new(SAMPLE_WINDOW),
             presented: 0,
@@ -348,18 +351,10 @@ impl LatencyMonitor {
 
         window.capture_to_encode.push(stages.capture_to_encode_us);
         window.encode_to_arrival.push(stages.encode_to_arrival_us);
-        if partial.keyframe {
-            window.keyframe_transit.push(stages.encode_to_arrival_us);
-        } else {
-            window.delta_transit.push(stages.encode_to_arrival_us);
-        }
         // At or above the budget, the agent could not have sent this frame any sooner: it was
         // waiting for an acknowledgement this client had not yet produced.
-        if partial.backlog >= AGENT_IN_FLIGHT_BUDGET {
-            window.backlogged_transit.push(stages.encode_to_arrival_us);
-        } else {
-            window.clear_transit.push(stages.encode_to_arrival_us);
-        }
+        let backlogged = usize::from(partial.backlog >= AGENT_IN_FLIGHT_BUDGET);
+        window.transit[usize::from(partial.keyframe)][backlogged].push(stages.encode_to_arrival_us);
         window.arrival_to_decode.push(stages.arrival_to_decode_us);
         window.decode_to_present.push(stages.decode_to_present_us);
         window.client.push(stages.client_us);
@@ -442,51 +437,50 @@ impl LatencyMonitor {
                 ("END TO END      ", &window.total, false),
             ] {
                 out.push_str(&format!(
-                    "    {label} p50 {:>8}  p95 {:>8}  p99 {:>8}  max {:>8}{}\n",
-                    show(samples.percentile(50)),
-                    show(samples.percentile(95)),
-                    show(samples.percentile(99)),
-                    show(samples.max()),
+                    "    {label} {}{}\n",
+                    percentiles(samples),
                     if exact { "" } else { "   (+/- clock error)" }
                 ));
             }
 
-            // Everything below exists to answer one question: when encode-to-arrival has a tail,
-            // is it the transport, or is it this client?
-            out.push_str("    encode->arrival, by what the frame was:\n");
-            for (label, transit, bytes) in [
-                ("keyframe", &window.keyframe_transit, &window.keyframe_bytes),
-                ("delta   ", &window.delta_transit, &window.delta_bytes),
-            ] {
-                if transit.is_empty() {
-                    continue;
+            // Crossed rather than split twice: the two dimensions are correlated, so only the
+            // cross says whether a backlogged row is slow because of the backlog or because it
+            // is full of keyframes.
+            out.push_str(
+                "    encode->arrival, by frame kind x whether the agent was waiting on us:\n",
+            );
+            for keyframe in [true, false] {
+                for backlogged in [true, false] {
+                    let transit = &window.transit[usize::from(keyframe)][usize::from(backlogged)];
+                    if transit.is_empty() {
+                        continue;
+                    }
+                    let bytes = if keyframe {
+                        &window.keyframe_bytes
+                    } else {
+                        &window.delta_bytes
+                    };
+                    out.push_str(&format!(
+                        "      {:8} {:14} {}   median {} bytes\n",
+                        if keyframe { "keyframe" } else { "delta" },
+                        if backlogged {
+                            "we blocked it"
+                        } else {
+                            "agent was free"
+                        },
+                        percentiles(transit),
+                        show(bytes.percentile(50)),
+                    ));
                 }
-                out.push_str(&format!(
-                    "      {label} n={:<5} p50 {:>8}  p95 {:>8}  max {:>8}   median {} bytes\n",
-                    transit.len(),
-                    show(transit.percentile(50)),
-                    show(transit.percentile(95)),
-                    show(transit.max()),
-                    show(bytes.percentile(50)),
-                ));
             }
 
-            out.push_str(
-                "    encode->arrival, by whether the agent was waiting on us (§12 budget):\n",
-            );
-            for (label, transit) in [
-                ("we were backlogged ", &window.backlogged_transit),
-                ("agent was free     ", &window.clear_transit),
-            ] {
-                if transit.is_empty() {
-                    continue;
-                }
+            if window.dropped > 0 {
                 out.push_str(&format!(
-                    "      {label} n={:<5} p50 {:>8}  p95 {:>8}  max {:>8}\n",
-                    transit.len(),
-                    show(transit.percentile(50)),
-                    show(transit.percentile(95)),
-                    show(transit.max()),
+                    "    NOTE {} of this window's frames never reached a percentile above: a \
+                     frame that\n         was dropped has no latency, so a bad stretch removes \
+                     its own worst samples.\n         Read the percentiles and this count \
+                     together.\n",
+                    window.dropped
                 ));
             }
         }
@@ -591,6 +585,36 @@ impl Default for LatencyMonitor {
     fn default() -> Self {
         Self::disabled()
     }
+}
+
+/// One row of percentiles, with its sample count, suppressing figures the count cannot support.
+///
+/// Nearest-rank percentiles collapse onto the maximum for small samples: p95 equals max whenever
+/// n < 20, and p99 whenever n < 100, so printing all three from eleven samples shows one number
+/// three times and implies a precision that is not there. Below the threshold the figure is
+/// printed as `=max`, which is what it is.
+fn percentiles(samples: &Samples) -> String {
+    /// Smallest n for which nearest-rank p95 can differ from the maximum.
+    const P95_MIN: usize = 20;
+    /// Smallest n for which nearest-rank p99 can differ from the maximum.
+    const P99_MIN: usize = 100;
+
+    let n = samples.len();
+    let at = |p: u8, minimum: usize| {
+        if n >= minimum {
+            show(samples.percentile(p))
+        } else {
+            "=max".to_string()
+        }
+    };
+    format!(
+        "n={:<5} p50 {:>8}  p95 {:>8}  p99 {:>8}  max {:>8}",
+        n,
+        show(samples.percentile(50)),
+        at(95, P95_MIN),
+        at(99, P99_MIN),
+        show(samples.max())
+    )
 }
 
 fn show(value: Option<u64>) -> String {
@@ -814,16 +838,20 @@ mod tests {
         }
 
         let window = &monitor.windows[&1];
-        assert_eq!(window.keyframe_transit.len(), 3);
-        assert_eq!(window.delta_transit.len(), 27);
-        assert_eq!(window.keyframe_transit.percentile(50), Some(40_000));
-        assert_eq!(window.delta_transit.percentile(50), Some(1_000));
+        // No frame here arrived while backlogged, so both live in the "agent was free" column.
+        let keyframes = &window.transit[1][0];
+        let deltas = &window.transit[0][0];
+        assert_eq!(keyframes.len(), 3);
+        assert_eq!(deltas.len(), 27);
+        assert_eq!(keyframes.percentile(50), Some(40_000));
+        assert_eq!(deltas.percentile(50), Some(1_000));
         assert_eq!(window.keyframe_bytes.percentile(50), Some(102_400));
 
         let report = monitor.report(10_000_000, Some(100), Some(0));
-        assert!(report.contains("keyframe n=3"), "{report}");
-        assert!(report.contains("delta    n=27"), "{report}");
+        assert!(report.contains("keyframe"), "{report}");
         assert!(report.contains("102400 bytes"), "{report}");
+        // Three samples cannot support a p95 distinct from the maximum, and must not imply one.
+        assert!(report.contains("=max"), "{report}");
     }
 
     /// The other half of the question: was the agent waiting on us? A frame that arrives while
@@ -842,12 +870,12 @@ mod tests {
 
         let window = &monitor.windows[&1];
         assert_eq!(
-            window.clear_transit.len(),
+            window.transit[0][0].len(),
             2,
             "the first two arrived with the agent free to send"
         );
         assert_eq!(
-            window.backlogged_transit.len(),
+            window.transit[0][1].len(),
             1,
             "the third arrived while we already held the whole budget"
         );
@@ -919,6 +947,60 @@ mod tests {
             (interval.fps - 10.0).abs() < 0.001,
             "30 frames in 3 s is 10 fps, got {}",
             interval.fps
+        );
+    }
+
+    /// Percentiles are computed only over frames that made it, so a bad stretch quietly deletes
+    /// its own worst samples. The report has to say so where the numbers are, not elsewhere.
+    #[test]
+    fn the_report_warns_that_dropped_frames_are_missing_from_the_percentiles() {
+        let mut monitor = LatencyMonitor::enabled();
+        monitor.on_arrival(arrived(1, 1, 0, 0, 0));
+        monitor.on_decoded(1, 1, 100);
+        monitor.on_presented(1, 1, 200, 0);
+        monitor.on_arrival(arrived(1, 2, 0, 0, 0));
+        monitor.on_dropped(1, 2);
+
+        let report = monitor.report(1_000_000, Some(100), Some(0));
+
+        assert!(report.contains("never reached a percentile"), "{report}");
+        assert!(report.contains("Read the percentiles"), "{report}");
+    }
+
+    /// Eleven samples cannot produce a p95 that differs from the maximum, and printing one
+    /// implies a precision that is not there.
+    #[test]
+    fn percentiles_a_small_sample_cannot_support_are_not_printed_as_if_it_could() {
+        let mut monitor = LatencyMonitor::enabled();
+        for frame_id in 0..11u64 {
+            monitor.on_arrival(arrived(1, frame_id, 0, 0, 0));
+            monitor.on_decoded(1, frame_id, 100);
+            monitor.on_presented(1, frame_id, 200 + frame_id * 10, 0);
+        }
+
+        let report = monitor.report(1_000_000, Some(100), Some(0));
+
+        assert!(
+            report.contains("n=11"),
+            "every row carries its count: {report}"
+        );
+        assert!(
+            report.contains("p95     =max"),
+            "p95 cannot differ from max at n=11: {report}"
+        );
+
+        // Twenty is the smallest sample for which nearest-rank p95 can differ from the maximum.
+        let mut wider = LatencyMonitor::enabled();
+        for frame_id in 0..20u64 {
+            wider.on_arrival(arrived(2, frame_id, 0, 0, 0));
+            wider.on_decoded(2, frame_id, 100);
+            wider.on_presented(2, frame_id, 200 + frame_id * 10, 0);
+        }
+        let wider_report = wider.report(1_000_000, Some(100), Some(0));
+        assert!(wider_report.contains("n=20"), "{wider_report}");
+        assert!(
+            !wider_report.contains("p95     =max"),
+            "at n=20 a real p95 exists: {wider_report}"
         );
     }
 

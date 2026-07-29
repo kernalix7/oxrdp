@@ -390,11 +390,16 @@ async fn run_windowed(
     let (display_events_tx, display_events_rx) = mpsc::unbounded_channel();
     let (session_result_tx, session_result_rx) = oneshot::channel();
 
+    // The presenter stamps `presented_us`, which is differenced against timestamps taken by the
+    // session — so it has to count from the same instant. Read before the session is moved into
+    // the closure below.
+    let epoch = session.clock().epoch();
+
     // `winit` owns the main-thread event loop, while `ClientSession` is async network IO.
     // Run the session on the Tokio runtime and cross the thread boundary with winit's proxy
     // plus an mpsc channel for display-originated input and presentation events.
     oxdisplay::run(
-        Box::new(CpuPresenter::new()),
+        Box::new(CpuPresenter::with_epoch(epoch)),
         display_events_tx,
         move |commands| {
             tokio::spawn(async move {

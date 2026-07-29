@@ -99,13 +99,31 @@ pub struct CpuPresenter {
 }
 
 impl CpuPresenter {
-    /// Create an empty CPU presenter.
+    /// Create an empty CPU presenter stamping on `epoch`.
+    ///
+    /// The epoch is a parameter, and there is deliberately no constructor that supplies one,
+    /// because minting a private `Instant` here is a bug that hides: the presenter is built
+    /// after the session — a TLS handshake and window-system startup later — so its clock reads
+    /// systematically low for the same real moment. Every timestamp it produces is then on a
+    /// different epoch from every timestamp the session produces, and differences taken across
+    /// the two are biased low by however long that startup took, or clamped to zero.
+    ///
+    /// That bias is invisible to a sum identity: it appears in `decode->present` and in the
+    /// end-to-end total with the same sign and magnitude, so the stages still add up while three
+    /// of the six figures are wrong together. Pass the session's epoch.
     #[must_use]
-    pub fn new() -> Self {
+    pub fn with_epoch(epoch: Instant) -> Self {
         Self {
             windows: HashMap::new(),
-            start: Instant::now(),
+            start: epoch,
         }
+    }
+
+    /// Microseconds since the epoch this presenter was given.
+    #[cfg(test)]
+    #[must_use]
+    pub fn stamp_us(&self) -> u64 {
+        self.now_us()
     }
 
     fn now_us(&self) -> u64 {
@@ -114,12 +132,6 @@ impl CpuPresenter {
             .as_micros()
             .try_into()
             .unwrap_or(u64::MAX)
-    }
-}
-
-impl Default for CpuPresenter {
-    fn default() -> Self {
-        Self::new()
     }
 }
 
@@ -385,7 +397,50 @@ fn platform_error(error: impl fmt::Display) -> PresentError {
 
 #[cfg(test)]
 mod tests {
+    use std::time::Duration;
+
     use super::*;
+
+    /// The defect this catches: a presenter that mints its own `Instant` reads ~0 here, however
+    /// long ago the session started.
+    ///
+    /// The sum identity over the stages cannot catch that — the same bias appears in
+    /// `decode->present` and in the end-to-end total and cancels exactly — so this compares
+    /// against something *outside* the identity: an elapsed time the test already knows.
+    #[test]
+    fn the_presenter_stamps_on_the_epoch_it_was_given() {
+        let five_seconds_ago = Instant::now()
+            .checked_sub(Duration::from_secs(5))
+            .expect("the process has been running for a moment");
+
+        let stamped = CpuPresenter::with_epoch(five_seconds_ago).stamp_us();
+
+        assert!(
+            stamped >= 5_000_000,
+            "stamped {stamped} us since an epoch 5 s ago; a self-minted clock would read ~0"
+        );
+        assert!(
+            stamped < 60_000_000,
+            "stamped {stamped} us, which is not a plausible reading of that epoch"
+        );
+    }
+
+    /// Two presenters sharing an epoch agree; two minting their own do not. This is the property
+    /// that makes a `presented_us` comparable with a timestamp taken anywhere else.
+    #[test]
+    fn presenters_sharing_an_epoch_agree_about_now() {
+        let epoch = Instant::now()
+            .checked_sub(Duration::from_secs(2))
+            .expect("the process has been running for a moment");
+
+        let first = CpuPresenter::with_epoch(epoch).stamp_us();
+        let second = CpuPresenter::with_epoch(epoch).stamp_us();
+
+        assert!(
+            first.abs_diff(second) < 100_000,
+            "{first} and {second} are from the same epoch and should be within a moment"
+        );
+    }
 
     #[test]
     fn frame_len_counts_bgra_bytes() {

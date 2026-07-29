@@ -22,6 +22,21 @@ impl ClientClock {
         }
     }
 
+    /// The instant this clock counts from.
+    ///
+    /// Handed to anything that produces timestamps compared against this clock's — the CPU
+    /// presenter, above all — so there is one epoch rather than one per component.
+    #[must_use]
+    pub fn epoch(&self) -> Instant {
+        self.start
+    }
+
+    /// A clock counting from an epoch someone else already established.
+    #[must_use]
+    pub fn from_epoch(start: Instant) -> Self {
+        Self { start }
+    }
+
     /// Microseconds since [`ClientClock::new`].
     #[must_use]
     pub fn now_us(&self) -> u64 {
