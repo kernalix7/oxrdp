@@ -171,10 +171,15 @@ impl<S: FrameSink> DecodePipeline<S> {
                 frame,
                 queue: queue.clone(),
             }),
-            // The worker is gone, which only happens if its sink closed — the display is
-            // shutting down and there is nothing useful left to do with the frame.
-            Err(mpsc::error::TrySendError::Closed(_)) => {
+            // The worker is gone. A panicking decoder no longer causes this — that is caught in
+            // the worker and logged there — and a thread that failed to start is reported where
+            // it failed, so what remains is the sink having closed: the display is shutting
+            // down. That case stays quiet, but the frame is still acknowledged. It costs
+            // nothing, and a frame swallowed here would hold a slot in the agent's per-window
+            // budget (§12) for as long as the session has left.
+            Err(mpsc::error::TrySendError::Closed(frame)) => {
                 self.workers.remove(&window_id);
+                report_dropped(&self.dropped, window_id, frame.frame_id, self.clock);
                 Ok(())
             }
         }
@@ -257,14 +262,38 @@ fn run_worker<S: FrameSink>(
             }
         }
 
-        let Some(active) = decoder.as_mut() else {
-            report_dropped(dropped, window_id, frame_id, clock);
-            continue;
+        // Scoped so the mutable borrow of `decoder` ends before the panic arm below replaces it.
+        let outcome = {
+            let Some(active) = decoder.as_mut() else {
+                report_dropped(dropped, window_id, frame_id, clock);
+                continue;
+            };
+            // `Decoder` is an extension point — a VA-API implementation is meant to slot in here
+            // — and nothing in its contract forbids panicking. Without this, a panic would kill
+            // the worker thread, and every later frame for the window would find a closed
+            // channel and be dropped with no acknowledgement, silently spending the window's
+            // whole flow-control budget (§12) and stalling it with nothing saying why.
+            //
+            // `AssertUnwindSafe` is honest here only because the decoder is discarded below
+            // rather than reused: its state after a partial decode is not something to rely on.
+            // (This depends on unwinding; a `panic = "abort"` profile would abort instead, which
+            // is at least loud.)
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| active.decode(frame)))
         };
-        let decoded = match active.decode(frame) {
-            Ok(decoded) => decoded,
-            Err(error) => {
+
+        let decoded = match outcome {
+            Ok(Ok(decoded)) => decoded,
+            Ok(Err(error)) => {
                 eprintln!("oxclient: window {window_id} frame {frame_id} dropped: {error}");
+                None
+            }
+            Err(_) => {
+                // The panic itself has already been printed by the default hook.
+                eprintln!(
+                    "oxclient: window {window_id} decoder panicked on frame {frame_id}; \
+                     discarding it and starting a new one at the next keyframe"
+                );
+                decoder = None;
                 None
             }
         };
@@ -484,6 +513,90 @@ mod tests {
             dropped_rx.recv().await.expect("reported").frame_id,
             1,
             "a window whose codec has no decoder must still release its flow-control slot"
+        );
+    }
+
+    /// A decoder that panics, the way a future hardware decoder's FFI wrapper might.
+    struct PanickingDecoder;
+
+    impl Decoder for PanickingDecoder {
+        fn codec(&self) -> u8 {
+            codec::RAW_BGRA
+        }
+
+        fn decode(&mut self, _frame: FrameData) -> Result<Option<FrameData>, DecodeError> {
+            panic!("synthetic decoder panic");
+        }
+    }
+
+    /// A panic must not kill the worker, because a dead worker spends the window's whole
+    /// flow-control budget in silence — no picture, no acknowledgement, no log.
+    ///
+    /// The panic messages this prints are the test working, not the test failing.
+    #[tokio::test]
+    async fn a_panicking_decoder_still_acknowledges_and_keeps_the_window_alive() {
+        let (sink, presented) = sink();
+        let (dropped_tx, mut dropped_rx) = mpsc::unbounded_channel();
+        let mut pipeline = DecodePipeline::with_decoder_factory(
+            sink,
+            dropped_tx,
+            ClientClock::new(),
+            factory_of(|| Box::new(PanickingDecoder)),
+        );
+
+        for frame_id in 0..3 {
+            pipeline
+                .submit(raw_frame(1, frame_id, 2, 2))
+                .expect("submitted");
+        }
+
+        // Every frame is accounted for, including the ones after the first panic — which is
+        // what proves the worker survived rather than the channel having quietly closed.
+        for frame_id in 0..3 {
+            let dropped = tokio::time::timeout(Duration::from_secs(5), dropped_rx.recv())
+                .await
+                .expect("a panicking decoder must not stall the window")
+                .expect("reported");
+            assert_eq!(dropped.frame_id, frame_id);
+        }
+        assert!(presented.try_recv().is_err(), "nothing was presented");
+    }
+
+    /// A sink that refuses everything, as the display does once it is shutting down.
+    #[derive(Clone)]
+    struct ClosedSink;
+
+    impl FrameSink for ClosedSink {
+        fn deliver(&self, _frame: FrameData) -> bool {
+            false
+        }
+    }
+
+    #[tokio::test]
+    async fn frames_for_a_departed_worker_are_still_acknowledged() {
+        let (dropped_tx, mut dropped_rx) = mpsc::unbounded_channel();
+        let mut pipeline = DecodePipeline::new(ClosedSink, dropped_tx, ClientClock::new());
+
+        // The first frame is delivered, the sink refuses it, and the worker stops.
+        pipeline.submit(raw_frame(1, 0, 2, 2)).expect("submitted");
+
+        // Later frames find a closed channel. They must still be acknowledged rather than
+        // vanishing, however little time the session has left.
+        let mut acknowledged = Vec::new();
+        for frame_id in 1..6 {
+            pipeline
+                .submit(raw_frame(1, frame_id, 2, 2))
+                .expect("submitted");
+            if let Ok(Some(dropped)) =
+                tokio::time::timeout(Duration::from_millis(500), dropped_rx.recv()).await
+            {
+                acknowledged.push(dropped.frame_id);
+            }
+        }
+
+        assert!(
+            !acknowledged.is_empty(),
+            "a frame handed to a departed worker must still release its flow-control slot"
         );
     }
 

@@ -19,6 +19,7 @@ h264 = ["dep:openh264"]
 tokio = { version = "1", features = ["io-util", "macros", "net", "rt-multi-thread", "sync", "time"] }
 tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12", "logging"] }
 openh264 = { version = "0.9", optional = true }
+log = "0.4"
 multiversion = "0.8"
 wide = "1.5"
 oxdisplay = { path = "../oxdisplay" }

@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -18,7 +18,7 @@ use x11rb::connection::Connection;
 use x11rb::protocol::xproto::{AtomEnum, PropMode};
 use x11rb::wrapper::ConnectionExt as _;
 
-use crate::input::{key_flags, keycode_to_scancode, locks, modifiers, update_buttons};
+use crate::input::{keycode_to_scancode, locks, modifiers, update_buttons};
 use crate::{
     apply_display_command, display_error, DisplayBackend, DisplayCommand, DisplayError,
     DisplayEvent, PresentError, PresentTimes, Presenter, WindowSpec,
@@ -101,6 +101,9 @@ struct WinitBackend {
     pointer_position: HashMap<u32, (i32, i32)>,
     x11_sidecar: X11Sidecar,
     geometry_echoes: GeometryEchoLedger,
+    /// Keys already reported as untranslatable, so each is warned about once rather than on
+    /// every repeat.
+    unmapped_keys: HashSet<String>,
 }
 
 impl WinitBackend {
@@ -116,6 +119,7 @@ impl WinitBackend {
             pointer_position: HashMap::new(),
             x11_sidecar: X11Sidecar::new(),
             geometry_echoes: GeometryEchoLedger::new(GEOMETRY_ECHO_DEADLINE),
+            unmapped_keys: HashSet::new(),
         }
     }
 
@@ -174,14 +178,34 @@ impl WinitBackend {
                 });
             }
             WindowEvent::KeyboardInput { event, .. } => {
-                if let PhysicalKey::Code(code) = event.physical_key {
-                    if let Some(scancode) = keycode_to_scancode(code) {
-                        let _flags = key_flags(event.state, scancode.extended);
-                        let _ = self.events.send(DisplayEvent::Key {
-                            scancode: scancode.code,
-                            pressed: event.state == ElementState::Pressed,
-                            extended: scancode.extended,
-                        });
+                // A key this build cannot translate is dropped — there is no scancode to send
+                // and inventing one would type the wrong character on the guest — but it is not
+                // dropped *silently*. A key that vanishes with no trace is indistinguishable
+                // from input never arriving at all, which is exactly the failure this path is
+                // most likely to produce. Warned once per key so holding one down cannot flood.
+                match event.physical_key {
+                    PhysicalKey::Code(code) => match keycode_to_scancode(code) {
+                        Some(scancode) => {
+                            let _ = self.events.send(DisplayEvent::Key {
+                                scancode: scancode.code,
+                                pressed: event.state == ElementState::Pressed,
+                                extended: scancode.extended,
+                            });
+                        }
+                        None => {
+                            if self.unmapped_keys.insert(format!("{code:?}")) {
+                                log::warn!(
+                                    "no PS/2 scancode for key {code:?}; it will not reach the guest"
+                                );
+                            }
+                        }
+                    },
+                    PhysicalKey::Unidentified(native) => {
+                        if self.unmapped_keys.insert(format!("{native:?}")) {
+                            log::warn!(
+                                "winit could not identify key {native:?}; it will not reach the guest"
+                            );
+                        }
                     }
                 }
             }

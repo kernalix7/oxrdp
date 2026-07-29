@@ -13,14 +13,26 @@
 //!
 //! 1. **A geometry change the client caused is not the user's intent.** Creating a window and
 //!    applying the guest's own geometry both provoke WM events; both open a short settling
-//!    window during which local reports only *update what the client believes*, and are never
-//!    sent onward.
+//!    window during which local reports are **discarded outright** — not recorded, not sent.
+//!    Recording them was a real bug: a placement reported in two steps straddling the deadline
+//!    had its second step measured against its first and sent as a three-pixel move nobody made.
+//!    Discarding is what keeps the guarantee structural rather than dependent on how fast a
+//!    particular compositor settles.
 //! 2. **Only an observed displacement is ever sent, never an observed position.** A position is
 //!    a host-screen coordinate, which has no meaning on the guest. A displacement is the same
 //!    number in both spaces. The guest position the client sends is always
 //!    `last known guest position + (how far the user just dragged it)`, so it needs two local
-//!    observations to send one move — which makes "echo the WM's placement" structurally
-//!    impossible rather than merely unlikely.
+//!    observations *after settling* to send one move — which makes "echo the WM's placement"
+//!    structurally impossible rather than merely unlikely.
+//!
+//! Size follows the same shape, and pays a price for it. A size is an absolute value, not a
+//! displacement, so nothing about a single report says whether the WM or the user chose it; the
+//! first size seen after settling is therefore taken as a baseline and only a later, different
+//! one is sent. The cost: on a compositor that reports a resize exactly once and never during
+//! the drag, the *first* resize of a window's life is swallowed and the window letterboxes until
+//! the next one. X11 opaque resize reports continuously, so this is a theoretical cost there,
+//! and it is the conservative side of the trade — the failure it prevents is a guest window
+//! being resized to something nobody asked for.
 //!
 //! Rule 2 is a deliberate deviation from `docs/design/client-display.md` §4 rule 2, which says
 //! X11 positions map identically because winpodx mirrors the guest desktop onto the client's
@@ -54,9 +66,9 @@ struct WindowSync {
     settling_until: Instant,
     /// Guest-space position that `local_anchor` corresponds to.
     guest_anchor: (i32, i32),
-    /// Local position last observed, or `None` until the WM has reported one.
+    /// Local position last observed **after settling**, or `None` until one has been.
     local_anchor: Option<(i32, i32)>,
-    /// Local size last observed or applied.
+    /// Local size last observed **after settling**, or `None` until one has been.
     local_size: Option<(u16, u16)>,
 }
 
@@ -73,31 +85,31 @@ impl GeometrySync {
         Self::default()
     }
 
-    /// A native window was just created from the guest's geometry.
-    pub fn created(&mut self, now: Instant, window_id: u32, x: i32, y: i32, size: (u16, u16)) {
+    /// A native window was just created at the guest's position.
+    pub fn created(&mut self, now: Instant, window_id: u32, x: i32, y: i32) {
         self.windows.insert(
             window_id,
             WindowSync {
                 settling_until: now + SETTLE,
                 guest_anchor: (x, y),
-                // Not seeded from the requested position: the WM is free to place the window
-                // somewhere else entirely, and guessing here is exactly how a WM placement gets
-                // mistaken for a drag.
+                // Neither is seeded from what the client asked for: the WM is free to place and
+                // size the window however it likes, and guessing here is exactly how a WM
+                // placement gets mistaken for a gesture.
                 local_anchor: None,
-                local_size: Some(size),
+                local_size: None,
             },
         );
     }
 
     /// The guest moved or resized a window and the client is applying it locally.
-    pub fn guest_moved(&mut self, now: Instant, window_id: u32, x: i32, y: i32, size: (u16, u16)) {
+    pub fn guest_moved(&mut self, now: Instant, window_id: u32, x: i32, y: i32) {
         let Some(state) = self.windows.get_mut(&window_id) else {
             return;
         };
         state.settling_until = now + SETTLE;
         state.guest_anchor = (x, y);
         state.local_anchor = None;
-        state.local_size = Some(size);
+        state.local_size = None;
     }
 
     /// Drops a window's state.
@@ -111,15 +123,17 @@ impl GeometrySync {
     /// window.
     pub fn moved(&mut self, now: Instant, window_id: u32, x: i32, y: i32) -> Option<(i32, i32)> {
         let state = self.windows.get_mut(&window_id)?;
-        let settling = now < state.settling_until;
-        let previous = state.local_anchor.replace((x, y));
-
-        // Rule 1: the window manager is still placing this window.
-        if settling {
+        // Rule 1: the window manager is still placing this window. Discarded outright rather
+        // than remembered — a placement report must not become the anchor either. Remembering it
+        // is what let a *second* placement report, landing after the deadline, measure a
+        // displacement against the first and send a move nobody made. "The first report is only
+        // an anchor" guards the first report; what the design needs is that nothing before real
+        // user action is ever an endpoint, and this is what makes that true again.
+        if now < state.settling_until {
             return None;
         }
         // Rule 2: one observation is an anchor, not a displacement. Nothing to send yet.
-        let (previous_x, previous_y) = previous?;
+        let (previous_x, previous_y) = state.local_anchor.replace((x, y))?;
         let dx = x.saturating_sub(previous_x);
         let dy = y.saturating_sub(previous_y);
         if dx == 0 && dy == 0 {
@@ -157,14 +171,20 @@ impl GeometrySync {
         }
 
         let state = self.windows.get_mut(&window_id)?;
-        let settling = now < state.settling_until;
-        let unchanged = state.local_size == Some((width, height));
-        state.local_size = Some((width, height));
-
-        if settling || unchanged {
+        // Discarded, not recorded, for the same reason as a position: a size seen while the WM
+        // is still sizing the window must not become the baseline that a later report is
+        // measured against.
+        if now < state.settling_until {
             return None;
         }
-        Some((width, height))
+        match state.local_size.replace((width, height)) {
+            // The first size seen after settling is a baseline, not intent. A size on its own
+            // says nothing about who chose it, so — as with a position — it takes a second,
+            // different report before the client will ask the guest to resize.
+            None => None,
+            Some(previous) if previous == (width, height) => None,
+            Some(_) => Some((width, height)),
+        }
     }
 }
 
@@ -205,19 +225,31 @@ mod tests {
         model
     }
 
-    /// A window created, then settled, with the WM having placed it at `placed`.
-    fn settled(
+    /// A window created, placed by the WM, settled, and anchored at `placed`.
+    ///
+    /// Two reports of the same position: the one during settling is discarded outright, and the
+    /// one after the deadline becomes the anchor. Both are silent, which is the point.
+    fn settled(window_id: u32, guest: (i32, i32), placed: (i32, i32)) -> (GeometrySync, Instant) {
+        let start = Instant::now();
+        let mut sync = GeometrySync::new();
+        sync.created(start, window_id, guest.0, guest.1);
+        assert_eq!(sync.moved(start, window_id, placed.0, placed.1), None);
+        let now = start + SETTLE + Duration::from_millis(1);
+        assert_eq!(sync.moved(now, window_id, placed.0, placed.1), None);
+        (sync, now)
+    }
+
+    /// As [`settled`], plus a first post-settling size report to serve as the size baseline.
+    fn settled_with_size(
         window_id: u32,
         guest: (i32, i32),
         size: (u16, u16),
         placed: (i32, i32),
+        model: &WindowModel,
     ) -> (GeometrySync, Instant) {
-        let start = Instant::now();
-        let mut sync = GeometrySync::new();
-        sync.created(start, window_id, guest.0, guest.1, size);
-        // The window manager places the window; this is not a gesture.
-        assert_eq!(sync.moved(start, window_id, placed.0, placed.1), None);
-        (sync, start + SETTLE + Duration::from_millis(1))
+        let (mut sync, now) = settled(window_id, guest, placed);
+        assert_eq!(sync.resized(now, model, window_id, size.0, size.1), None);
+        (sync, now)
     }
 
     #[test]
@@ -226,7 +258,7 @@ mod tests {
         let start = Instant::now();
         let mut sync = GeometrySync::new();
 
-        sync.created(start, 1, 100, 200, (800, 600));
+        sync.created(start, 1, 100, 200);
 
         // Everything the host window manager does while placing the window is silent: the
         // position it chose, the size it chose, and both again a moment later.
@@ -237,9 +269,60 @@ mod tests {
         assert_eq!(sync.resized(later, &model, 1, 466, 77), None);
     }
 
+    /// The phantom move: a window manager that places a window in two steps, the second landing
+    /// after the settling deadline.
+    ///
+    /// Remembering the first step made the second measurable against it, and the client sent a
+    /// three-pixel move nobody made. Nothing here is a gesture, so nothing may reach the guest.
+    #[test]
+    fn two_placement_reports_straddling_the_deadline_send_nothing() {
+        let start = Instant::now();
+        let mut sync = GeometrySync::new();
+        sync.created(start, 1, 100, 200);
+
+        let during = sync.moved(start + Duration::from_millis(100), 1, 3257, 2262);
+        let after = sync.moved(start + Duration::from_millis(900), 1, 3260, 2265);
+
+        assert_eq!(during, None, "a report while settling is not a gesture");
+        assert_eq!(
+            after, None,
+            "nor is the next one, because the first was discarded rather than kept as an anchor"
+        );
+    }
+
+    /// The same shape for size: a window manager that sizes a window in two steps across the
+    /// deadline must not have the second taken for a user resize.
+    #[test]
+    fn two_sizing_reports_straddling_the_deadline_send_nothing() {
+        let model = model_with(1, 100, 200, 800, 600, RESIZABLE);
+        let start = Instant::now();
+        let mut sync = GeometrySync::new();
+        sync.created(start, 1, 100, 200);
+
+        let during = sync.resized(start + Duration::from_millis(100), &model, 1, 122, 47);
+        let after = sync.resized(start + Duration::from_millis(900), &model, 1, 466, 77);
+
+        assert_eq!(during, None);
+        assert_eq!(after, None);
+    }
+
+    /// The same hazard on the other arming path: the guest moves a window, and the WM reports
+    /// the result in two steps across the new deadline.
+    #[test]
+    fn two_reports_straddling_a_guest_move_deadline_send_nothing() {
+        let (mut sync, now) = settled(1, (100, 200), (100, 200));
+
+        sync.guest_moved(now, 1, 640, 480);
+        let during = sync.moved(now + Duration::from_millis(100), 1, 640, 480);
+        let after = sync.moved(now + SETTLE + Duration::from_millis(1), 1, 643, 483);
+
+        assert_eq!(during, None);
+        assert_eq!(after, None);
+    }
+
     #[test]
     fn a_user_drag_after_settling_sends_a_guest_space_position() {
-        let (mut sync, now) = settled(1, (100, 200), (800, 600), (3257, 2262));
+        let (mut sync, now) = settled(1, (100, 200), (3257, 2262));
 
         // The user drags the window 40 right and 15 up. What the guest is told is its own
         // position moved by that much — never the host coordinate.
@@ -250,7 +333,7 @@ mod tests {
 
     #[test]
     fn a_host_screen_position_is_never_sent_as_a_guest_position() {
-        let (mut sync, now) = settled(1, (10, 20), (800, 600), (3257, 2262));
+        let (mut sync, now) = settled(1, (10, 20), (3257, 2262));
 
         // Whatever the user does, the number sent is anchored to the guest's own last position.
         // The host coordinates here are far outside any plausible guest desktop.
@@ -267,7 +350,7 @@ mod tests {
     fn the_first_position_after_settling_is_an_anchor_not_a_move() {
         let start = Instant::now();
         let mut sync = GeometrySync::new();
-        sync.created(start, 1, 100, 200, (800, 600));
+        sync.created(start, 1, 100, 200);
         let now = start + SETTLE + Duration::from_millis(1);
 
         // A window manager that reported nothing at all during settling must still not be able
@@ -278,20 +361,22 @@ mod tests {
 
     #[test]
     fn applying_guest_geometry_does_not_bounce_back() {
-        let (mut sync, now) = settled(1, (100, 200), (800, 600), (100, 200));
+        let (mut sync, now) = settled(1, (100, 200), (100, 200));
 
         // The guest moves its own window; the client applies it and the WM reports the result.
-        sync.guest_moved(now, 1, 640, 480, (800, 600));
+        sync.guest_moved(now, 1, 640, 480);
         assert_eq!(sync.moved(now, 1, 640, 480), None);
 
-        // And the settling window closes again afterwards.
+        // The settling window closes again afterwards, and the anchor is rebuilt from scratch:
+        // the first report after it is a baseline, the next one is the drag.
         let later = now + SETTLE + Duration::from_millis(1);
+        assert_eq!(sync.moved(later, 1, 640, 480), None);
         assert_eq!(sync.moved(later, 1, 650, 480), Some((650, 480)));
     }
 
     #[test]
     fn a_window_that_never_moves_sends_nothing() {
-        let (mut sync, now) = settled(1, (100, 200), (800, 600), (300, 400));
+        let (mut sync, now) = settled(1, (100, 200), (300, 400));
 
         // Repeated reports of the same position are not drags.
         assert_eq!(sync.moved(now, 1, 300, 400), None);
@@ -302,7 +387,7 @@ mod tests {
     fn a_non_resizable_window_never_asks_the_guest_to_resize() {
         // charmap: a fixed-size dialog that reports has_frame without resizable.
         let model = model_with(1, 100, 200, 322, 197, FIXED);
-        let (mut sync, now) = settled(1, (100, 200), (322, 197), (259, 2262));
+        let (mut sync, now) = settled(1, (100, 200), (259, 2262));
 
         assert_eq!(sync.resized(now, &model, 1, 1, 52), None);
         assert_eq!(sync.resized(now, &model, 1, 640, 480), None);
@@ -311,7 +396,7 @@ mod tests {
     #[test]
     fn a_resizable_window_reports_a_real_user_resize() {
         let model = model_with(1, 100, 200, 800, 600, RESIZABLE);
-        let (mut sync, now) = settled(1, (100, 200), (800, 600), (100, 200));
+        let (mut sync, now) = settled_with_size(1, (100, 200), (800, 600), (100, 200), &model);
 
         assert_eq!(sync.resized(now, &model, 1, 1024, 768), Some((1024, 768)));
         // Repeats of the size just reported are not new intent.
@@ -321,7 +406,7 @@ mod tests {
     #[test]
     fn a_zero_sized_report_is_never_a_resize() {
         let model = model_with(1, 100, 200, 800, 600, RESIZABLE);
-        let (mut sync, now) = settled(1, (100, 200), (800, 600), (100, 200));
+        let (mut sync, now) = settled_with_size(1, (100, 200), (800, 600), (100, 200), &model);
 
         // Some window managers report 0x0 when a window is unmapped or minimised. Forwarding
         // that would ask the guest to resize its window to nothing.
@@ -337,7 +422,7 @@ mod tests {
         // wire today, and the agent sends 0) this follows without touching this file.
         let resizable = model_with(1, 100, 200, 800, 600, RESIZABLE);
         let fixed = model_with(1, 100, 200, 800, 600, FIXED);
-        let (mut sync, now) = settled(1, (100, 200), (800, 600), (100, 200));
+        let (mut sync, now) = settled_with_size(1, (100, 200), (800, 600), (100, 200), &resizable);
 
         assert_eq!(sync.resized(now, &fixed, 1, 1024, 768), None);
         assert_eq!(
@@ -349,7 +434,7 @@ mod tests {
     #[test]
     fn a_show_state_change_does_not_make_a_fixed_window_resizable() {
         let mut model = model_with(1, 100, 200, 322, 197, FIXED);
-        let (mut sync, now) = settled(1, (100, 200), (322, 197), (100, 200));
+        let (mut sync, now) = settled(1, (100, 200), (100, 200));
 
         // Minimising and restoring is the one state change the guest does send, and it must not
         // turn charmap into something the client may resize.
@@ -380,7 +465,7 @@ mod tests {
     #[test]
     fn a_forgotten_window_is_silent() {
         let model = model_with(1, 100, 200, 800, 600, RESIZABLE);
-        let (mut sync, now) = settled(1, (100, 200), (800, 600), (100, 200));
+        let (mut sync, now) = settled(1, (100, 200), (100, 200));
 
         sync.forget(1);
 
@@ -392,11 +477,14 @@ mod tests {
     fn windows_do_not_share_anchors() {
         let start = Instant::now();
         let mut sync = GeometrySync::new();
-        sync.created(start, 1, 100, 100, (800, 600));
-        sync.created(start, 2, 500, 500, (400, 300));
+        sync.created(start, 1, 100, 100);
+        sync.created(start, 2, 500, 500);
         assert_eq!(sync.moved(start, 1, 0, 0), None);
         assert_eq!(sync.moved(start, 2, 2000, 2000), None);
         let now = start + SETTLE + Duration::from_millis(1);
+        // Each window anchors on its own first post-settling report.
+        assert_eq!(sync.moved(now, 1, 0, 0), None);
+        assert_eq!(sync.moved(now, 2, 2000, 2000), None);
 
         assert_eq!(sync.moved(now, 1, 10, 5), Some((110, 105)));
         assert_eq!(sync.moved(now, 2, 1990, 2000), Some((490, 500)));
@@ -404,7 +492,7 @@ mod tests {
 
     #[test]
     fn extreme_host_coordinates_cannot_overflow_the_guest_position() {
-        let (mut sync, now) = settled(1, (i32::MAX, i32::MIN), (800, 600), (0, 0));
+        let (mut sync, now) = settled(1, (i32::MAX, i32::MIN), (0, 0));
 
         let target = sync.moved(now, 1, i32::MAX, i32::MIN).expect("a drag");
 
@@ -414,7 +502,7 @@ mod tests {
     #[test]
     fn geometry_events_track_the_model_after_a_guest_geometry_update() {
         let mut model = model_with(1, 100, 200, 800, 600, RESIZABLE);
-        let (mut sync, now) = settled(1, (100, 200), (800, 600), (300, 300));
+        let (mut sync, now) = settled(1, (100, 200), (300, 300));
 
         // The guest reports its own move; the model and the tracker are updated together, the
         // way the session task does it.
@@ -426,12 +514,13 @@ mod tests {
             height: 600,
         }));
         let window = model.get(1).expect("the window is still open");
-        sync.guest_moved(now, 1, window.x, window.y, (window.width, window.height));
+        sync.guest_moved(now, 1, window.x, window.y);
 
         // The WM echo of that move is silent, and a later drag is measured from the guest's new
         // position rather than the one it had before.
         assert_eq!(sync.moved(now, 1, 700, 700), None);
         let later = now + SETTLE + Duration::from_millis(1);
+        assert_eq!(sync.moved(later, 1, 700, 700), None);
         assert_eq!(sync.moved(later, 1, 705, 690), Some((645, 470)));
     }
 }

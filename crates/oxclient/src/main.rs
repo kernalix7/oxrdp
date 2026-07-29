@@ -125,8 +125,54 @@ fn parse_args(args: &[String]) -> Result<Cli, String> {
     })
 }
 
+/// Writes `log` records to stderr, alongside the binary's own `eprintln!` diagnostics.
+///
+/// `oxdisplay` reports through the `log` facade — dropped malformed frames, keys with no
+/// scancode — and until this existed **nothing installed a logger**, so every one of those
+/// records went to a no-op sink. A warning nobody can see is worse than no warning: it reads as
+/// evidence that the path is quiet. Hand-rolled rather than pulling in `env_logger`, because all
+/// that is wanted is a line on stderr.
+struct StderrLogger;
+
+static LOGGER: StderrLogger = StderrLogger;
+
+impl log::Log for StderrLogger {
+    fn enabled(&self, metadata: &log::Metadata<'_>) -> bool {
+        metadata.level() <= log::max_level()
+    }
+
+    fn log(&self, record: &log::Record<'_>) {
+        if self.enabled(record.metadata()) {
+            eprintln!(
+                "oxclient: {}: {}: {}",
+                record.level(),
+                record.target(),
+                record.args()
+            );
+        }
+    }
+
+    fn flush(&self) {}
+}
+
+/// Installs [`LOGGER`] at the level `OXCLIENT_LOG` asks for, warnings by default.
+fn install_logger() {
+    let level = match env::var("OXCLIENT_LOG").as_deref() {
+        Ok("trace") => log::LevelFilter::Trace,
+        Ok("debug") => log::LevelFilter::Debug,
+        Ok("info") => log::LevelFilter::Info,
+        Ok("error") => log::LevelFilter::Error,
+        Ok("off") => log::LevelFilter::Off,
+        _ => log::LevelFilter::Warn,
+    };
+    if log::set_logger(&LOGGER).is_ok() {
+        log::set_max_level(level);
+    }
+}
+
 #[tokio::main]
 async fn main() -> ExitCode {
+    install_logger();
     let args: Vec<String> = env::args().skip(1).collect();
     let cli = match parse_args(&args) {
         Ok(cli) => cli,
@@ -389,24 +435,12 @@ where
                     match &change {
                         ModelChange::Created(id) => {
                             if let Some(window) = model.get(*id) {
-                                geometry.created(
-                                    Instant::now(),
-                                    *id,
-                                    window.x,
-                                    window.y,
-                                    (window.width, window.height),
-                                );
+                                geometry.created(Instant::now(), *id, window.x, window.y);
                             }
                         }
                         ModelChange::Moved(id) => {
                             if let Some(window) = model.get(*id) {
-                                geometry.guest_moved(
-                                    Instant::now(),
-                                    *id,
-                                    window.x,
-                                    window.y,
-                                    (window.width, window.height),
-                                );
+                                geometry.guest_moved(Instant::now(), *id, window.x, window.y);
                             }
                         }
                         ModelChange::Destroyed(id) => {
@@ -874,6 +908,18 @@ mod tests {
     /// The returned stream is the agent's end: whatever the client sends can be read from it,
     /// which is the only way to assert on what the guest would actually be told to do.
     async fn connected_session() -> (ClientSession<DuplexStream>, DuplexStream, Reassembler) {
+        let session = connected_session_with(feature::WINDOW_CONTROL).await;
+        assert!(session.0.has_feature(feature::WINDOW_CONTROL));
+        session
+    }
+
+    /// As [`connected_session`], with the agent advertising exactly `features`.
+    ///
+    /// Feature-gated paths have to be tested from both sides of the gate, so the negotiated set
+    /// is a parameter rather than a constant.
+    async fn connected_session_with(
+        features: u64,
+    ) -> (ClientSession<DuplexStream>, DuplexStream, Reassembler) {
         let (client_io, mut server_io) = tokio::io::duplex(64 * 1024);
         let server = tokio::spawn(async move {
             let mut reassembler = Reassembler::new();
@@ -886,7 +932,7 @@ mod tests {
                 &mut server_io,
                 &Message::ServerHello(ServerHello {
                     version: 1,
-                    features: feature::WINDOW_CONTROL,
+                    features,
                     session_id: 1,
                     codec: oxproto::codec::RAW_BGRA,
                 }),
@@ -901,7 +947,6 @@ mod tests {
             .await
             .expect("the handshake completes");
         let (server_io, reassembler) = server.await.expect("the peer task finishes");
-        assert!(session.has_feature(feature::WINDOW_CONTROL));
         (session, server_io, reassembler)
     }
 
@@ -933,16 +978,22 @@ mod tests {
 
     /// A tracker for a window the host WM has already placed at `placed`, long enough ago that
     /// the settling window has closed by the time the code under test reads the clock.
-    fn settled_geometry(
-        window_id: u32,
-        guest: (i32, i32),
-        size: (u16, u16),
-        placed: (i32, i32),
-    ) -> GeometrySync {
+    fn settled_geometry(window_id: u32, guest: (i32, i32), placed: (i32, i32)) -> GeometrySync {
         let past = Instant::now() - SETTLE - Duration::from_secs(1);
         let mut geometry = GeometrySync::new();
-        geometry.created(past, window_id, guest.0, guest.1, size);
+        geometry.created(past, window_id, guest.0, guest.1);
+        // Placement while settling, then the first post-settling report that becomes the
+        // anchor. Both silent; only a later report can be a gesture.
         assert_eq!(geometry.moved(past, window_id, placed.0, placed.1), None);
+        assert_eq!(
+            geometry.moved(
+                past + SETTLE + Duration::from_millis(1),
+                window_id,
+                placed.0,
+                placed.1
+            ),
+            None
+        );
         geometry
     }
 
@@ -991,7 +1042,7 @@ mod tests {
         let clock = ClientClock::new();
         let model = model_with(1, 100, 200, 800, 600, window_flag::RESIZABLE);
         let mut geometry = GeometrySync::new();
-        geometry.created(Instant::now(), 1, 100, 200, (800, 600));
+        geometry.created(Instant::now(), 1, 100, 200);
 
         // Exactly what the host WM did in the failure, replayed.
         for event in [
@@ -1025,7 +1076,7 @@ mod tests {
         let clock = ClientClock::new();
         // charmap: a fixed-size dialog, which the failure shrank to 1x52.
         let model = model_with(1, 100, 200, 322, 197, window_flag::HAS_FRAME);
-        let mut geometry = settled_geometry(1, (100, 200), (322, 197), (259, 2262));
+        let mut geometry = settled_geometry(1, (100, 200), (259, 2262));
 
         handle_display_event(
             &mut session,
@@ -1055,7 +1106,7 @@ mod tests {
         let clock = ClientClock::new();
         let model = model_with(1, 100, 200, 800, 600, window_flag::RESIZABLE);
         // The window sits at guest (100,200) but at host (3257,2262) on a multi-monitor desktop.
-        let mut geometry = settled_geometry(1, (100, 200), (800, 600), (3257, 2262));
+        let mut geometry = settled_geometry(1, (100, 200), (3257, 2262));
 
         handle_display_event(
             &mut session,
@@ -1076,6 +1127,172 @@ mod tests {
         // The guest is told about the displacement applied to its own position, never about a
         // host screen coordinate it has no room for.
         assert_eq!((control.x, control.y), (140, 185));
+    }
+
+    /// Feeds one display event through the session and returns what reached the agent, or
+    /// `None` if the client sent nothing at all.
+    ///
+    /// A close request is sent afterwards as a sentinel: it always produces a message, so if it
+    /// is the first thing the agent reads then the event under test produced nothing.
+    async fn wire_effect(features: u64, event: DisplayEvent) -> Option<Message> {
+        let (mut session, mut server_io, mut reassembler) = connected_session_with(features).await;
+        let clock = ClientClock::new();
+        let model = model_with(7, 0, 0, 800, 600, window_flag::RESIZABLE);
+        let mut geometry = GeometrySync::new();
+
+        handle_display_event(&mut session, &clock, &model, &mut geometry, event)
+            .await
+            .expect("the event is handled");
+        handle_display_event(
+            &mut session,
+            &clock,
+            &model,
+            &mut geometry,
+            DisplayEvent::CloseRequested { window_id: 7 },
+        )
+        .await
+        .expect("the sentinel is sent");
+
+        let first = read_message(&mut server_io, &mut reassembler)
+            .await
+            .expect("a message arrives")
+            .expect("and decodes");
+        match &first {
+            Message::WindowControl(control) if control.action == window_action::CLOSE => None,
+            _ => Some(first),
+        }
+    }
+
+    /// A keystroke has to reach the agent, with a scancode that is not silently zero.
+    ///
+    /// Typing into the guest did not work end to end, and this is the half of the path that can
+    /// be tested without a display server: everything from `DisplayEvent` to the wire.
+    #[tokio::test]
+    async fn a_key_press_reaches_the_agent_with_its_scancode() {
+        let sent = wire_effect(
+            feature::WINDOW_CONTROL,
+            // 0x1e is `A` in PS/2 set 1.
+            DisplayEvent::Key {
+                scancode: 0x1e,
+                pressed: true,
+                extended: false,
+            },
+        )
+        .await
+        .expect("a key press must reach the agent");
+
+        match sent {
+            Message::KeyEvent(key) => {
+                assert_eq!(key.scancode, 0x1e, "the scancode must survive intact");
+                assert_ne!(
+                    key.scancode, 0,
+                    "a zero scancode types nothing on the guest"
+                );
+                assert_eq!(key.flags & key_flag::PRESSED, key_flag::PRESSED);
+                assert_eq!(key.flags & key_flag::EXTENDED, 0);
+            }
+            other => panic!("expected KeyEvent, got {:#04x}", other.msg_type()),
+        }
+    }
+
+    #[tokio::test]
+    async fn a_key_release_and_the_extended_bit_survive() {
+        let sent = wire_effect(
+            feature::WINDOW_CONTROL,
+            // Right-hand Ctrl: an E0-prefixed key, released.
+            DisplayEvent::Key {
+                scancode: 0x1d,
+                pressed: false,
+                extended: true,
+            },
+        )
+        .await
+        .expect("a key release must reach the agent");
+
+        match sent {
+            Message::KeyEvent(key) => {
+                assert_eq!(key.scancode, 0x1d);
+                assert_eq!(key.flags & key_flag::PRESSED, 0, "this is a release");
+                assert_eq!(key.flags & key_flag::EXTENDED, key_flag::EXTENDED);
+            }
+            other => panic!("expected KeyEvent, got {:#04x}", other.msg_type()),
+        }
+    }
+
+    #[tokio::test]
+    async fn a_pointer_click_reaches_the_agent_window_relative() {
+        let sent = wire_effect(
+            feature::WINDOW_CONTROL,
+            DisplayEvent::Pointer {
+                window_id: 7,
+                x: 475,
+                y: 269,
+                buttons: 1,
+                wheel_x: 0,
+                wheel_y: 3,
+            },
+        )
+        .await
+        .expect("a click must reach the agent");
+
+        match sent {
+            Message::PointerEvent(pointer) => {
+                assert_eq!(pointer.window_id, 7, "addressed to the window under it");
+                assert_eq!((pointer.x, pointer.y), (475, 269));
+                assert_eq!(pointer.buttons, 1, "the button bit must be set");
+                assert_eq!((pointer.wheel_x, pointer.wheel_y), (0, 3));
+            }
+            other => panic!("expected PointerEvent, got {:#04x}", other.msg_type()),
+        }
+    }
+
+    #[tokio::test]
+    async fn modifier_state_reaches_the_agent() {
+        let sent = wire_effect(
+            feature::WINDOW_CONTROL,
+            DisplayEvent::Modifiers {
+                modifiers: 0b0000_0101,
+                locks: 0b0000_0010,
+            },
+        )
+        .await
+        .expect("modifier state must reach the agent");
+
+        match sent {
+            Message::ModifierSync(sync) => {
+                assert_eq!(sync.modifiers, 0b0000_0101);
+                assert_eq!(sync.locks, 0b0000_0010);
+            }
+            other => panic!("expected ModifierSync, got {:#04x}", other.msg_type()),
+        }
+    }
+
+    #[tokio::test]
+    async fn text_input_reaches_the_agent_only_when_negotiated() {
+        let with = wire_effect(
+            feature::WINDOW_CONTROL | feature::TEXT_INPUT,
+            DisplayEvent::Text {
+                text: "한글".to_string(),
+            },
+        )
+        .await
+        .expect("text must reach the agent when the feature is negotiated");
+
+        match with {
+            Message::TextInput(input) => assert_eq!(input.text, "한글"),
+            other => panic!("expected TextInput, got {:#04x}", other.msg_type()),
+        }
+
+        // Without the feature the client must stay silent rather than send a message the agent
+        // never agreed to handle.
+        let without = wire_effect(
+            feature::WINDOW_CONTROL,
+            DisplayEvent::Text {
+                text: "한글".to_string(),
+            },
+        )
+        .await;
+        assert!(without.is_none(), "text must not be sent unnegotiated");
     }
 
     /// `--headless` decodes inline, which is deliberate — it has no display and no input path to
@@ -1292,7 +1509,13 @@ mod tests {
         let (mut session, mut server_io, mut reassembler) = connected_session().await;
         let clock = ClientClock::new();
         let model = model_with(1, 100, 200, 800, 600, window_flag::RESIZABLE);
-        let mut geometry = settled_geometry(1, (100, 200), (800, 600), (100, 200));
+        let mut geometry = settled_geometry(1, (100, 200), (100, 200));
+        // A resize needs a post-settling baseline before a later, different size is intent.
+        assert_eq!(
+            geometry.resized(Instant::now(), &model, 1, 800, 600),
+            None,
+            "the first size after settling is a baseline"
+        );
 
         handle_display_event(
             &mut session,

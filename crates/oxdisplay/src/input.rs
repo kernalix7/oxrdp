@@ -218,6 +218,46 @@ mod tests {
         assert_eq!(keycode_to_scancode(KeyCode::Fn), None);
     }
 
+    /// Everything needed to type into a guest application must map, and map to something
+    /// non-zero.
+    ///
+    /// An unmapped key is dropped by the winit backend — deliberately, since there is no
+    /// scancode to send — so a gap in this table looks exactly like input never arriving at all.
+    /// That is the failure mode worth a test rather than an assumption.
+    #[test]
+    fn every_key_needed_to_type_has_a_scancode() {
+        let typing = [
+            KeyCode::KeyA,
+            KeyCode::KeyE,
+            KeyCode::KeyM,
+            KeyCode::KeyQ,
+            KeyCode::KeyZ,
+            KeyCode::Digit0,
+            KeyCode::Digit9,
+            KeyCode::Space,
+            KeyCode::Enter,
+            KeyCode::Backspace,
+            KeyCode::Tab,
+            KeyCode::Escape,
+            KeyCode::Period,
+            KeyCode::Comma,
+            KeyCode::Slash,
+            KeyCode::Semicolon,
+            KeyCode::Quote,
+            KeyCode::Minus,
+            KeyCode::Equal,
+            KeyCode::ShiftLeft,
+            KeyCode::ControlLeft,
+            KeyCode::AltLeft,
+        ];
+
+        for key in typing {
+            let scancode =
+                keycode_to_scancode(key).unwrap_or_else(|| panic!("{key:?} has no scancode"));
+            assert_ne!(scancode.code, 0, "{key:?} maps to a scancode of zero");
+        }
+    }
+
     #[test]
     fn key_flags_encode_pressed_and_extended_bits() {
         assert_eq!(

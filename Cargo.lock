@@ -1129,6 +1129,7 @@ dependencies = [
 name = "oxclient"
 version = "0.0.0"
 dependencies = [
+ "log",
  "multiversion",
  "openh264",
  "oxdisplay",
