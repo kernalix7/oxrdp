@@ -62,3 +62,63 @@ pub trait InputSink {
         height: u16,
     );
 }
+
+/// Which of `buttons`' bits a pointer sink should actually inject, given whether the window a
+/// newly-pressed edge targets could be confirmed focused.
+///
+/// A free function, not a method, so this one piece of the click-targeting logic — the part with
+/// no platform dependency at all — is exercised on the Linux build host like everything else in
+/// this crate that can be. `crate::win::input::WinInputSink::pointer_event` is the only caller: a
+/// click that raises a window to the foreground before injecting into it (see that type's doc
+/// comment) can have the raise fail, and injecting the button-down anyway would land it on
+/// whatever guest window Windows actually left on top at those screen coordinates — not the one
+/// the client addressed, and not distinguishable from a correctly-targeted click on the wire.
+/// Only the bits a *newly pressed* edge would assert are ever held back; a button that was
+/// already legitimately down, or one being released, always goes through regardless of
+/// `focus_confirmed` — releasing input is never the kind of mistake a misdirected click is.
+pub fn gate_unconfirmed_press(buttons: u8, last_buttons: u8, focus_confirmed: bool) -> u8 {
+    let newly_pressed = buttons & !last_buttons;
+    if newly_pressed != 0 && !focus_confirmed {
+        buttons & !newly_pressed
+    } else {
+        buttons
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_confirmed_press_is_reported_unchanged() {
+        assert_eq!(gate_unconfirmed_press(0b001, 0b000, true), 0b001);
+    }
+
+    #[test]
+    fn an_unconfirmed_new_press_is_withheld() {
+        // Left button was up, is now reported down, but the target window's raise could not be
+        // confirmed: the down bit must not reach the sink.
+        assert_eq!(gate_unconfirmed_press(0b001, 0b000, false), 0b000);
+    }
+
+    #[test]
+    fn an_unconfirmed_press_withholds_only_the_new_bit() {
+        // Left was already down (and stays down); right is the new, unconfirmed press. Left
+        // must survive the gate untouched.
+        assert_eq!(gate_unconfirmed_press(0b011, 0b001, false), 0b001);
+    }
+
+    #[test]
+    fn a_release_is_never_gated_even_when_unconfirmed() {
+        // No new press here at all — buttons is a strict subset of last_buttons — so
+        // `focus_confirmed` must not matter.
+        assert_eq!(gate_unconfirmed_press(0b000, 0b001, false), 0b000);
+    }
+
+    #[test]
+    fn an_unconfirmed_press_alongside_an_unrelated_release_still_only_gates_the_press() {
+        // Right was down and is being released; left is a new, unconfirmed press. The release
+        // must go through even though the press next to it is withheld.
+        assert_eq!(gate_unconfirmed_press(0b001, 0b010, false), 0b000);
+    }
+}

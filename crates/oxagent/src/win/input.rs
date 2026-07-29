@@ -29,6 +29,7 @@ use core::ffi::c_void;
 use oxproto::message::input::{lock_state, modifier, pointer_button, window_action};
 use oxproto::scancode::Key;
 use windows::Win32::Foundation::{GetLastError, HWND, LPARAM, WPARAM};
+use windows::Win32::System::Threading::{AttachThreadInput, GetCurrentThreadId};
 use windows::Win32::UI::Input::KeyboardAndMouse::{
     GetAsyncKeyState, GetKeyState, SendInput, INPUT, INPUT_0, INPUT_KEYBOARD, INPUT_MOUSE,
     KEYBDINPUT, KEYEVENTF_EXTENDEDKEY, KEYEVENTF_KEYUP, KEYEVENTF_SCANCODE, KEYEVENTF_UNICODE,
@@ -39,35 +40,56 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
     VK_LSHIFT, VK_LWIN, VK_NUMLOCK, VK_RCONTROL, VK_RMENU, VK_RSHIFT, VK_RWIN, VK_SCROLL,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    GetSystemMetrics, PostMessageW, SetForegroundWindow, SetWindowPos, ShowWindow,
-    SM_CXVIRTUALSCREEN, SM_CYVIRTUALSCREEN, SM_XVIRTUALSCREEN, SM_YVIRTUALSCREEN, SWP_NOACTIVATE,
-    SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER, SW_MAXIMIZE, SW_MINIMIZE, SW_RESTORE, WM_CLOSE, XBUTTON1,
-    XBUTTON2,
+    BringWindowToTop, GetForegroundWindow, GetSystemMetrics, GetWindowThreadProcessId,
+    PostMessageW, SetForegroundWindow, SetWindowPos, ShowWindow, SM_CXVIRTUALSCREEN,
+    SM_CYVIRTUALSCREEN, SM_XVIRTUALSCREEN, SM_YVIRTUALSCREEN, SWP_NOACTIVATE, SWP_NOMOVE,
+    SWP_NOSIZE, SWP_NOZORDER, SW_MAXIMIZE, SW_MINIMIZE, SW_RESTORE, WM_CLOSE, XBUTTON1, XBUTTON2,
 };
 
 use super::enumerate;
-use crate::input::InputSink;
+use crate::input::{gate_unconfirmed_press, InputSink};
 
 /// Injects input on the Windows guest via `SendInput`.
 ///
 /// # Focus
-/// `SendInput` has no "inject into this HWND" primitive: injected keyboard and mouse-button
-/// input always goes to whatever window currently has Win32 focus. So a session driving one
-/// particular window must bring it to the foreground before injecting into it — but doing that
-/// on *every* event would fight a user physically at the guest console and flicker the
-/// z-order. This struct foregrounds a window only on a state change:
-/// - the first pointer button-press edge that targets a window other than the one last
-///   focused ([`WinInputSink::pointer_event`]), so passive mouse movement over a window never
-///   steals focus, only an actual click does;
-/// - an explicit `WindowControl::ACTIVATE`, which *always* forces it, unconditionally on the
-///   `last_focused` bookkeeping — it is itself the client's explicit "bring this forward"
-///   request (e.g. the user clicked a taskbar entry for a minimized window), and skipping it
-///   just because this struct's state still points at that same handle from before the window
-///   was minimized would silently drop the request.
+/// `SendInput` has no "inject into this HWND" primitive: injected keyboard input, and any
+/// mouse-button injection, always goes to whatever window currently has Win32 focus, and mouse
+/// motion/clicks are hit-tested purely by screen coordinate against whatever window is topmost
+/// in z-order there — the actual target `HWND` is never consulted by `SendInput` at all. So a
+/// session driving one particular window must both bring it to the foreground *and* have that
+/// confirmed to have actually happened, before injecting a click meant for it; otherwise the
+/// click lands on whatever window Windows really left on top, silently, which looks from the
+/// wire exactly like a correctly-targeted click. (This was a real, observed bug: a click at the
+/// right coordinates for the right window landed in an unrelated window stacked above it on the
+/// guest, because raising the target had silently failed.)
+///
+/// This struct raises a window only on a state change — the first pointer button-press edge that
+/// targets a window other than the one last confirmed focused
+/// ([`WinInputSink::pointer_event`]), or an explicit `WindowControl::ACTIVATE` — never on plain
+/// motion, so passive mouse movement over a window never steals focus and this does not fight a
+/// user physically at the guest console on every event. Should a click raise its target at all,
+/// though? On a real desktop, yes: clicking a background window raises it, and every
+/// `PointerEvent` this receives already represents the *client's* full attention on that
+/// specific window, addressed by `window_id` — stronger evidence of intent than an ordinary
+/// desktop click gets, since the guest's internal z-order is an implementation detail the
+/// client-side user cannot even see, on a client that streams several guest windows into
+/// separate native windows of their own. So "any window switch forces a raise" (what this
+/// already does) is the right amount of force, not a half-measure: there is no meaningful sense
+/// in which a *more* aggressive policy (raising on every event, not just a switch) would be more
+/// correct — it would only add z-order flicker for zero addressing benefit, since motion and
+/// wheel deltas carry no targeting ambiguity `SendInput` needs help resolving.
+///
+/// A plain `SetForegroundWindow` is not enough to make any of this reliable: Windows' anti-
+/// focus-stealing heuristic refuses it from a process that "didn't just receive input," which an
+/// injection agent never has on its own — see [`force_foreground`] for the `AttachThreadInput`
+/// fallback and how its success is verified rather than assumed.
 #[derive(Debug, Default)]
 pub struct WinInputSink {
-    /// Handle last given an explicit `SetForegroundWindow`, so repeated clicks inside the
-    /// window that already has focus do not re-issue it.
+    /// Handle last *confirmed* focused (see [`force_foreground`]), so repeated clicks inside the
+    /// window that already has focus do not re-issue `SetForegroundWindow`, and so a raise that
+    /// silently failed is not misremembered as having succeeded — the latter used to be exactly
+    /// this field's bug: it recorded the target as focused unconditionally, before its own
+    /// discarded return value was even checked.
     last_focused: Option<isize>,
     /// Buttons reported held by the previous `PointerEvent`, so the next one's absolute
     /// bitmask can be turned into the down/up transitions `SendInput` wants.
@@ -81,36 +103,111 @@ impl WinInputSink {
     }
 
     /// Bring `handle` (as `hwnd`) to the foreground if it is not already the tracked focus.
-    fn focus_on_change(&mut self, hwnd: HWND, handle: isize) {
-        if self.last_focused != Some(handle) {
-            set_foreground(hwnd, handle);
+    /// Returns whether `hwnd` is now confirmed foreground either way. On failure, `last_focused`
+    /// is deliberately left untouched (not set to `handle`) so the next call — the very next
+    /// tick, if the client's button is still held, since the wire keeps reporting the same
+    /// press — retries from the same state instead of wrongly remembering a focus change that
+    /// never happened.
+    fn focus_on_change(&mut self, hwnd: HWND, handle: isize) -> bool {
+        if self.last_focused == Some(handle) {
+            return true;
+        }
+        let confirmed = force_foreground(hwnd, handle);
+        if confirmed {
             self.last_focused = Some(handle);
         }
+        confirmed
     }
 }
 
-/// Bring `hwnd` to the foreground and log whether it worked.
+/// Bring `hwnd` to the foreground, retrying through `AttachThreadInput` if a plain
+/// `SetForegroundWindow` is refused, and confirm which (if either) actually worked. Returns
+/// whether `hwnd` is now the foreground window.
 ///
 /// `SetForegroundWindow`'s `BOOL` return used to be discarded outright with `let _ =`. That
-/// matters more than most discarded booleans here: Windows imposes documented conditions on
-/// when a background process may steal the foreground at all, and a caller that fails silently
-/// has every subsequent injected keyboard/mouse-button event go wherever focus already was
-/// instead of `hwnd` — which looks, from the wire, exactly like a click or keystroke that was
-/// dropped, not one that landed on the wrong window.
-fn set_foreground(hwnd: HWND, handle: isize) {
+/// matters more than most discarded booleans here: Windows refuses a bare `SetForegroundWindow`
+/// from a process that "didn't just receive input" — the documented anti-focus-stealing
+/// heuristic every modern Windows enforces — and an injection agent calling it out of the blue,
+/// on a click that arrived over the network rather than through the guest's own input queue, is
+/// exactly the case that heuristic exists to deny. A caller that fails silently there has every
+/// subsequent injected keyboard/mouse-button event go wherever focus already was instead of
+/// `hwnd` — which looks, from the wire, exactly like input that landed on the *wrong* window,
+/// not input that was dropped, since nothing about the injection itself fails.
+///
+/// The fallback is the standard, documented way around that heuristic, without touching any
+/// system-wide policy or lowering any process's privilege: `AttachThreadInput` lets this thread
+/// temporarily share input state with the thread that owns the *current* foreground window. Once
+/// attached, this thread is — as far as the heuristic can tell — the same thread that just
+/// legitimately had input, so its own `SetForegroundWindow` call is no longer "out of the blue"
+/// and is let through. `BringWindowToTop` alongside it is belt-and-suspenders: the documented
+/// idiom pairs the two, and this crate has no live Windows session to confirm
+/// `SetForegroundWindow` alone is always sufficient for z-order once attached, only that pairing
+/// them is not documented to be wrong.
+///
+/// # Why checking `GetForegroundWindow()` right after is not a race
+/// What a click needs true before it is safe to inject is "this window is now the foreground
+/// window and on top of the z-order at the click's screen coordinates" — not "this window's own
+/// message loop has processed `WM_ACTIVATE`". The first two are applied synchronously, inside
+/// the `SetForegroundWindow`/`BringWindowToTop` calls themselves, as part of the window
+/// manager's shared state; only the *notification* to the window being activated
+/// (`WM_ACTIVATE`/`WM_SETFOCUS`, posted to its own queue for its own thread to process whenever
+/// it next pumps messages) is asynchronous, and this needs none of that to inject correctly.
+/// `GetForegroundWindow` reads the same shared state `SetForegroundWindow` just wrote, on this
+/// thread, without waiting for the target's message loop to run at all — a direct read of the
+/// fact this cares about, not a guess at when some other thread gets around to it.
+fn force_foreground(hwnd: HWND, handle: isize) -> bool {
+    // SAFETY: takes no arguments and cannot fail.
+    if unsafe { GetForegroundWindow() } == hwnd {
+        return true;
+    }
+
     // SAFETY: `hwnd` is derived from a handle the driver resolved through its own window table
     // for this exact event; a handle that has since gone stale simply makes the call fail, which
     // is `BOOL(0)`, not unsound.
-    let ok = unsafe { SetForegroundWindow(hwnd) };
-    if !ok.as_bool() {
-        // SAFETY: queried immediately after the call whose failure this explains; nothing
+    unsafe {
+        let _ = SetForegroundWindow(hwnd);
+    }
+
+    // SAFETY: takes no arguments and cannot fail.
+    let mut current = unsafe { GetForegroundWindow() };
+    if current != hwnd {
+        // The plain attempt above was refused — see this function's doc for why, and why
+        // `AttachThreadInput` is the fix rather than a workaround for a workaround.
+        // SAFETY: `current` was just queried live; an invalid/null HWND (no foreground window
+        // at all) is a documented, harmless input to `GetWindowThreadProcessId` — it returns 0,
+        // it does not fault. `None` for the process-id out-param means only the thread id, the
+        // function's ordinary return value, is wanted.
+        let fg_thread = unsafe { GetWindowThreadProcessId(current, None) };
+        // SAFETY: takes no arguments and cannot fail.
+        let this_thread = unsafe { GetCurrentThreadId() };
+        if fg_thread != 0 && fg_thread != this_thread {
+            // SAFETY: both thread ids were just queried live. The detach below runs
+            // unconditionally once attach succeeds, on the same thread, before this function
+            // returns, so the attachment is never left outstanding.
+            if unsafe { AttachThreadInput(this_thread, fg_thread, true) }.as_bool() {
+                // SAFETY: `hwnd` as above; `this_thread`/`fg_thread` are the pair just attached.
+                unsafe {
+                    let _ = BringWindowToTop(hwnd);
+                    let _ = SetForegroundWindow(hwnd);
+                    let _ = AttachThreadInput(this_thread, fg_thread, false);
+                }
+            }
+        }
+        // SAFETY: takes no arguments and cannot fail.
+        current = unsafe { GetForegroundWindow() };
+    }
+
+    let confirmed = current == hwnd;
+    if !confirmed {
+        // SAFETY: queried immediately after the sequence whose failure this explains; nothing
         // between the two calls can have overwritten the calling thread's last-error value.
         let err = unsafe { GetLastError() };
         eprintln!(
-            "oxagent: input: SetForegroundWindow({handle:#x}) failed, GetLastError={}",
+            "oxagent: input: could not bring {handle:#x} to the foreground, GetLastError={}",
             err.0
         );
     }
+    confirmed
 }
 
 impl InputSink for WinInputSink {
@@ -133,10 +230,16 @@ impl InputSink for WinInputSink {
 
         // A newly pressed button (one that was not down a moment ago) is what "clicking into a
         // window" means; plain motion must never steal focus from whatever the user is doing.
+        // A newly-pressed edge whose raise cannot be confirmed is gated out below — injecting it
+        // anyway would land on whatever window Windows actually left on top instead, not the
+        // one the client addressed (see the type-level doc's "Focus" section).
         let newly_pressed = buttons & !self.last_buttons;
-        if newly_pressed != 0 {
-            self.focus_on_change(hwnd, handle);
-        }
+        let focus_confirmed = if newly_pressed != 0 {
+            self.focus_on_change(hwnd, handle)
+        } else {
+            true
+        };
+        let buttons = gate_unconfirmed_press(buttons, self.last_buttons, focus_confirmed);
 
         // Window-relative -> guest screen coordinates, through the same extended frame bounds
         // capture uses (OXPROTO.md §6), so a click lands on the pixel the user actually sees.
@@ -280,10 +383,14 @@ impl InputSink for WinInputSink {
                 }
             }
             window_action::ACTIVATE => {
-                // See the type-level doc: this always forces focus, never throttled on
-                // `last_focused`.
-                set_foreground(hwnd, handle);
-                self.last_focused = Some(handle);
+                // See the type-level doc: this always attempts the raise, never throttled on
+                // `last_focused` — it is itself the client's explicit "bring this forward"
+                // request. `last_focused` is only updated on confirmed success, same as
+                // `focus_on_change`, so a failed raise here does not stop a later click on this
+                // same window from retrying.
+                if force_foreground(hwnd, handle) {
+                    self.last_focused = Some(handle);
+                }
             }
             window_action::MINIMIZE => {
                 // SAFETY: same as above.
