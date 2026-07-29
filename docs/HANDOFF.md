@@ -326,6 +326,29 @@ the way the old "90 tests, clippy clean" line did.
 **Not started at all:** Media Foundation H.264 encode (in flight, §8), the latency harness (P6),
 QUIC, clipboard, audio, `wgpu`/VA-API presentation (still softbuffer/CPU).
 
+### Input: keys work, targeting does not (measured 2026-07-29)
+
+Bisected against the live guest rather than inferred, and the earlier entry saying input was
+merely "unverified" understated what is now known:
+
+- **Keyboard injection works end to end.** Typing `abc` in the client produced scancodes
+  `0x1e/0x30/0x2e` with correct press and release pairs on the wire, and the characters arrived
+  in the guest's Notepad — its title became `*abc - Notepad`. A later run typed `ZZZTEST` and it
+  arrived as uppercase, so scancode and modifier handling are sound.
+- **The client's X11 window genuinely holds keyboard focus** — window id, `getactivewindow`,
+  `_NET_ACTIVE_WINDOW` and `getwindowfocus` all agree, so no `KeyboardInput` events are being
+  lost before the protocol.
+- **Window targeting is the defect.** The agent resolves a `PointerEvent`'s `window_id` to the
+  right `HWND` and converts to absolute screen coordinates correctly, but the injected click
+  lands on whatever guest window is **topmost at that position** — the addressing is discarded
+  at the last step. `ZZZTEST` went to a PowerShell window stacked over Notepad. Keys then follow
+  guest OS focus to the wrong window. It is intermittent in exactly the way that implies:
+  whether a click reaches its target depends on the guest's z-order at that instant.
+- Every one of those failures was **silent**. `SetForegroundWindow`'s result is discarded at
+  `crates/oxagent/src/win/input.rs`, and Windows' foreground-lock rules disqualify a background
+  process from forcing focus — so that call may be failing on every attempt with nothing to show
+  for it. Routed, with diagnostics, to the agent.
+
 ## 10. Key technical learnings (don't relearn these)
 
 - **Cancel-safety is not optional once anything uses `tokio::select!`.** `read_exact`/`write_all`
