@@ -10,12 +10,13 @@ use std::env;
 use std::io;
 use std::path::PathBuf;
 use std::process::ExitCode;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use oxclient::clock::ClientClock;
-use oxclient::decode::pipeline::{Backpressure, DecodePipeline, DroppedFrame, FrameSink};
+use oxclient::decode::pipeline::{Backpressure, DecodePipeline, FrameReport, FrameSink};
 use oxclient::decode::{self, WindowDecoders};
 use oxclient::geometry::GeometrySync;
+use oxclient::latency::LatencyMonitor;
 use oxclient::session::{ClientSession, SessionConfig};
 use oxclient::{ClientEvent, ModelChange, RemoteWindow, WindowModel};
 use oxdisplay::{CommandSender, CpuPresenter, DisplayCommand, DisplayEvent, WindowSpec};
@@ -35,6 +36,15 @@ use tokio_rustls::TlsConnector;
 /// Every `n`th frame per window is printed, after the first. Otherwise a 30-60fps stream of
 /// `RAW_BGRA` frames drowns the terminal in output within a second or two.
 const FRAME_LOG_STRIDE: u64 = 60;
+
+/// How often the client pings the agent, per `OXPROTO.md` §15.
+///
+/// Every one of these is also a clock-offset sample, which is the only way an agent timestamp
+/// can be compared with a client one.
+const PING_INTERVAL: Duration = Duration::from_secs(1);
+
+/// How often the latency report is printed, when it is enabled at all.
+const LATENCY_REPORT_INTERVAL: Duration = Duration::from_secs(10);
 
 const USAGE: &str =
     "usage: oxclient <host:port> --pin <spki-hex> --token-file <path> [--name <client-name>] [--headless]";
@@ -153,6 +163,25 @@ impl log::Log for StderrLogger {
     }
 
     fn flush(&self) {}
+}
+
+/// A latency monitor, on only when `OXCLIENT_LATENCY` is set.
+///
+/// Off by default because the accounting keeps per-frame state and prints a block of numbers
+/// nobody asked for; on, it is the only way to answer the question this project exists to
+/// answer. What it measures and what it cannot see is documented in `oxclient::latency`.
+fn latency_monitor() -> LatencyMonitor {
+    match env::var("OXCLIENT_LATENCY") {
+        Ok(value) if value != "0" && !value.eq_ignore_ascii_case("off") => {
+            eprintln!(
+                "oxclient: measuring capture-to-present latency; a report follows every {} seconds \
+                 and once at exit",
+                LATENCY_REPORT_INTERVAL.as_secs()
+            );
+            LatencyMonitor::enabled()
+        }
+        _ => LatencyMonitor::disabled(),
+    }
 }
 
 /// Installs [`LOGGER`] at the level `OXCLIENT_LOG` asks for, warnings by default.
@@ -388,7 +417,31 @@ async fn wait_for_decode_room(queue: Option<tokio::sync::mpsc::Sender<FrameData>
 async fn run_session_task<S, C>(
     mut session: ClientSession<S>,
     commands: C,
+    display_events: mpsc::UnboundedReceiver<DisplayEvent>,
+) -> io::Result<()>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+    C: CommandSink,
+{
+    let mut latency = latency_monitor();
+    let result = run_session_loop(&mut session, commands, display_events, &mut latency).await;
+
+    // Printed however the session ended, including on an error, because a session that fell over
+    // is exactly the one whose numbers are worth reading.
+    if latency.is_enabled() && latency.has_samples() {
+        eprint!(
+            "{}",
+            latency.report(session.rtt_us().last(), session.clock_offset_us())
+        );
+    }
+    result
+}
+
+async fn run_session_loop<S, C>(
+    session: &mut ClientSession<S>,
+    commands: C,
     mut display_events: mpsc::UnboundedReceiver<DisplayEvent>,
+    latency: &mut LatencyMonitor,
 ) -> io::Result<()>
 where
     S: AsyncRead + AsyncWrite + Unpin,
@@ -396,13 +449,17 @@ where
 {
     let mut model = WindowModel::new();
     let mut geometry = GeometrySync::new();
-    let clock = ClientClock::new();
+    // The session's own clock, not a second one: every timestamp compared below has to share an
+    // epoch with the ones the session puts on the wire.
+    let clock = session.clock();
 
     // Decode runs on one worker thread per window, and decoded frames go from there straight to
     // the display thread. This task keeps only the protocol: reading the wire, writing input,
     // and acknowledging frames.
     let (dropped_tx, mut dropped_rx) = mpsc::unbounded_channel();
     let mut decoders = DecodePipeline::new(DisplaySink(commands.clone()), dropped_tx, clock);
+    let mut pings = tokio::time::interval(PING_INTERVAL);
+    let mut reports = tokio::time::interval(LATENCY_REPORT_INTERVAL);
     // A frame a worker had no room for. While one is held, this task stops reading the wire —
     // see `oxclient::decode::pipeline` for why the client must not simply drop it.
     let mut stalled: Option<Backpressure> = None;
@@ -446,6 +503,7 @@ where
                         ModelChange::Destroyed(id) => {
                             decoders.forget(*id);
                             geometry.forget(*id);
+                            latency.forget(*id);
                         }
                         _ => {}
                     }
@@ -454,6 +512,15 @@ where
                         // pixels to the display thread itself, so no frame's decode time is
                         // charged to the input path.
                         ModelChange::Frame(frame) => {
+                            // Stamped here, the moment the frame is off the wire, because this
+                            // is the boundary between "the network had it" and "we have it".
+                            latency.on_arrival(
+                                frame.window_id,
+                                frame.frame_id,
+                                frame.captured_us,
+                                frame.encoded_us,
+                                clock.now_us(),
+                            );
                             if let Err(backpressure) = decoders.submit(frame) {
                                 stalled = Some(backpressure);
                             }
@@ -488,24 +555,56 @@ where
             // mid-GOP would otherwise spend that budget on frames it dropped and stall the
             // window. The decision now happens on a worker, which is why this arrives by channel
             // rather than being decided here.
-            dropped = dropped_rx.recv() => {
-                let Some(DroppedFrame { window_id, frame_id, finished_us }) = dropped else {
+            report = dropped_rx.recv() => {
+                let Some(report) = report else {
                     return Ok(());
                 };
-                if let Err(error) =
-                    send_frame_ack(&mut session, window_id, frame_id, finished_us, finished_us)
-                        .await
-                {
+                match report {
+                    // The only place the decode-completion time is known. The display thread
+                    // sees the frame long after, so it cannot report this itself.
+                    FrameReport::Decoded { window_id, frame_id, decoded_us } => {
+                        latency.on_decoded(window_id, frame_id, decoded_us);
+                    }
+                    FrameReport::Dropped { window_id, frame_id, finished_us } => {
+                        latency.on_dropped(window_id, frame_id);
+                        if let Err(error) = send_frame_ack(
+                            session, window_id, frame_id, finished_us, finished_us,
+                        ).await {
+                            commands.send(DisplayCommand::Shutdown);
+                            return Err(error);
+                        }
+                    }
+                }
+            }
+            // Liveness, and the only source of clock-offset samples. Until this existed the
+            // client sent no pings at all, so agent timestamps could not be placed on the
+            // client's clock and none of the accounting below was possible.
+            _ = pings.tick() => {
+                if let Err(error) = session.ping().await {
                     commands.send(DisplayCommand::Shutdown);
                     return Err(error);
+                }
+            }
+            _ = reports.tick(), if latency.is_enabled() => {
+                if latency.has_samples() {
+                    // The *last* round trip, not the best one: the offset estimate comes from the
+                    // most recent pong, so the error bound has to come from that same exchange.
+                    // Quoting the minimum RTT beside an offset derived from a different, slower
+                    // sample would claim a precision the estimate does not have.
+                    eprint!(
+                        "{}",
+                        latency.report(session.rtt_us().last(), session.clock_offset_us())
+                    );
                 }
             }
             event = display_events.recv() => {
                 let Some(event) = event else {
                     return Ok(());
                 };
-                if let Err(error) =
-                    handle_display_event(&mut session, &clock, &model, &mut geometry, event).await
+                if let Err(error) = handle_display_event(
+                    session, &clock, &model, &mut geometry, latency, event,
+                )
+                .await
                 {
                     commands.send(DisplayCommand::Shutdown);
                     return Err(error);
@@ -561,6 +660,7 @@ async fn handle_display_event<S: AsyncRead + AsyncWrite + Unpin>(
     clock: &ClientClock,
     model: &WindowModel,
     geometry: &mut GeometrySync,
+    latency: &mut LatencyMonitor,
     event: DisplayEvent,
 ) -> io::Result<()> {
     match event {
@@ -724,6 +824,9 @@ async fn handle_display_event<S: AsyncRead + AsyncWrite + Unpin>(
             decoded_us,
             presented_us,
         } => {
+            if let Some(offset) = session.clock_offset_us() {
+                latency.on_presented(window_id, frame_id, presented_us, offset);
+            }
             send_frame_ack(session, window_id, frame_id, decoded_us, presented_us).await?;
         }
         DisplayEvent::BackendError { message } => {
@@ -1013,6 +1116,7 @@ mod tests {
             clock,
             model,
             geometry,
+            &mut LatencyMonitor::disabled(),
             DisplayEvent::CloseRequested { window_id },
         )
         .await
@@ -1057,9 +1161,16 @@ mod tests {
                 height: 47,
             },
         ] {
-            handle_display_event(&mut session, &clock, &model, &mut geometry, event)
-                .await
-                .expect("the event is handled");
+            handle_display_event(
+                &mut session,
+                &clock,
+                &model,
+                &mut geometry,
+                &mut LatencyMonitor::disabled(),
+                event,
+            )
+            .await
+            .expect("the event is handled");
         }
 
         send_sentinel(&mut session, &clock, &model, &mut geometry, 1).await;
@@ -1083,6 +1194,7 @@ mod tests {
             &clock,
             &model,
             &mut geometry,
+            &mut LatencyMonitor::disabled(),
             DisplayEvent::ResizeRequested {
                 window_id: 1,
                 width: 1,
@@ -1113,6 +1225,7 @@ mod tests {
             &clock,
             &model,
             &mut geometry,
+            &mut LatencyMonitor::disabled(),
             DisplayEvent::MoveRequested {
                 window_id: 1,
                 x: 3297,
@@ -1140,14 +1253,22 @@ mod tests {
         let model = model_with(7, 0, 0, 800, 600, window_flag::RESIZABLE);
         let mut geometry = GeometrySync::new();
 
-        handle_display_event(&mut session, &clock, &model, &mut geometry, event)
-            .await
-            .expect("the event is handled");
         handle_display_event(
             &mut session,
             &clock,
             &model,
             &mut geometry,
+            &mut LatencyMonitor::disabled(),
+            event,
+        )
+        .await
+        .expect("the event is handled");
+        handle_display_event(
+            &mut session,
+            &clock,
+            &model,
+            &mut geometry,
+            &mut LatencyMonitor::disabled(),
             DisplayEvent::CloseRequested { window_id: 7 },
         )
         .await
@@ -1293,6 +1414,59 @@ mod tests {
         )
         .await;
         assert!(without.is_none(), "text must not be sent unnegotiated");
+    }
+
+    /// Nothing could be measured across the two ends until this worked: the client sent no
+    /// pings and discarded every pong, so an agent timestamp could not be placed on the client's
+    /// clock at all.
+    #[tokio::test]
+    async fn a_ping_round_trip_produces_a_clock_estimate() {
+        let (mut session, mut server_io, mut reassembler) = connected_session().await;
+        assert_eq!(
+            session.clock_offset_us(),
+            None,
+            "nothing is known before a pong"
+        );
+
+        session.ping().await.expect("the ping is sent");
+
+        let ping = match read_message(&mut server_io, &mut reassembler)
+            .await
+            .expect("a message arrives")
+            .expect("and decodes")
+        {
+            Message::Ping(ping) => ping,
+            other => panic!("expected Ping, got {:#04x}", other.msg_type()),
+        };
+
+        // The agent answers with its own clock, which here reads a long way ahead of ours.
+        let agent_us = ping.sent_us + 1_000_000;
+        write_message(
+            &mut server_io,
+            &Message::Pong(oxproto::message::Pong {
+                seq: ping.seq,
+                sent_us: ping.sent_us,
+                agent_us,
+            }),
+            channel::CONTROL,
+        )
+        .await
+        .expect("the pong is written");
+
+        // The pong is housekeeping, so it is consumed rather than surfaced. Reading one event
+        // drives the session far enough to take it in; the peer then closes, ending the stream.
+        drop(server_io);
+        assert_eq!(session.next_event().await.expect("no error"), None);
+
+        let offset = session.clock_offset_us().expect("a pong has landed");
+        // The estimate assumes a symmetric path, so it lands within half the round trip of the
+        // true offset. The round trip here is microseconds over an in-memory pipe.
+        let rtt = session.rtt_us().last().expect("an rtt sample");
+        let error = (offset - 1_000_000).unsigned_abs();
+        assert!(
+            error <= rtt / 2 + 1,
+            "offset {offset} is further than half the {rtt} us round trip from the truth"
+        );
     }
 
     /// `--headless` decodes inline, which is deliberate — it has no display and no input path to
@@ -1478,16 +1652,23 @@ mod tests {
             })
             .expect("the session task is listening");
 
-        // The pointer event must arrive while decode is still frozen. Without the timeout a
-        // regression here would hang rather than fail.
-        let pointer = tokio::time::timeout(
-            Duration::from_secs(5),
-            read_message(&mut server_io, &mut reassembler),
-        )
+        // The pointer event must arrive while decode is still frozen. Housekeeping is skipped
+        // rather than asserted against: the session pings on connect and every second after, and
+        // this test is about input not queueing behind decode. Without the timeout a regression
+        // here would hang rather than fail.
+        let pointer = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let message = read_message(&mut server_io, &mut reassembler)
+                    .await
+                    .expect("a message arrives")
+                    .expect("and decodes");
+                if !matches!(message, Message::Ping(_) | Message::Pong(_)) {
+                    return message;
+                }
+            }
+        })
         .await
-        .expect("input must not wait for decode")
-        .expect("a message arrives")
-        .expect("and decodes");
+        .expect("input must not wait for decode");
 
         match pointer {
             Message::PointerEvent(event) => {
@@ -1522,6 +1703,7 @@ mod tests {
             &clock,
             &model,
             &mut geometry,
+            &mut LatencyMonitor::disabled(),
             DisplayEvent::ResizeRequested {
                 window_id: 1,
                 width: 1024,

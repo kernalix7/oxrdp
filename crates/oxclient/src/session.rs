@@ -6,10 +6,19 @@
 use std::io;
 
 use oxproto::envelope::{channel, Reassembler};
+use oxproto::latency::ClockSync;
 use oxproto::message::{ClientHello, DisplayLayout, Message, Ping, Pong};
 use oxproto::{error_code, feature, MIN_SUPPORTED_VERSION, PROTOCOL_VERSION};
 use oxtransport::{read_message, write_message, ChunkReader};
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
+
+use crate::clock::ClientClock;
+
+/// Round-trip samples kept for the clock-offset estimate.
+///
+/// At one ping a second (`OXPROTO.md` §15) this is a couple of minutes of history — enough for
+/// the minimum to represent a genuinely unqueued round trip, which is the one worth trusting.
+const RTT_WINDOW: usize = 128;
 
 /// What the display/render layer reacts to.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -78,6 +87,13 @@ pub struct ClientSession<S> {
     pub codec: u8,
     /// Opaque session id, for correlating logs with the agent.
     pub session_id: u64,
+    /// The session's monotonic clock. Every client-side timestamp on the wire comes from here,
+    /// and so does everything the latency accounting compares, so they share one epoch.
+    clock: ClientClock,
+    /// Round-trip time and agent-clock offset, from the ping/pong exchange below.
+    clock_sync: ClockSync,
+    /// Sequence number for the next ping this client sends.
+    ping_seq: u32,
 }
 
 impl<S: AsyncRead + AsyncWrite + Unpin> ClientSession<S> {
@@ -109,6 +125,9 @@ impl<S: AsyncRead + AsyncWrite + Unpin> ClientSession<S> {
                         features: sh.features & feature::SUPPORTED,
                         codec: sh.codec,
                         session_id: sh.session_id,
+                        clock: ClientClock::new(),
+                        clock_sync: ClockSync::new(RTT_WINDOW),
+                        ping_seq: 0,
                     })
                 }
                 Some(Message::Error(e)) => {
@@ -188,7 +207,14 @@ impl<S: AsyncRead + AsyncWrite + Unpin> ClientSession<S> {
                     self.queue(&pong)?;
                     continue;
                 }
-                Message::Pong(_) => continue,
+                // The agent's answer to one of our pings. It carries the agent's own clock, so
+                // this is the only thing that lets an agent timestamp be compared with a client
+                // one. Consumed here rather than surfaced: it is housekeeping, like the ping.
+                Message::Pong(p) => {
+                    self.clock_sync
+                        .on_pong(p.seq, p.agent_us, self.clock.now_us());
+                    continue;
+                }
                 Message::WindowOpened(m) => ClientEvent::WindowOpened(m),
                 Message::WindowGeometry(m) => ClientEvent::WindowGeometry(m),
                 Message::WindowTitle(m) => ClientEvent::WindowTitle(m),
@@ -250,8 +276,37 @@ impl<S: AsyncRead + AsyncWrite + Unpin> ClientSession<S> {
         self.stream.flush().await
     }
 
-    /// Send a liveness probe.
-    pub async fn ping(&mut self, seq: u32, sent_us: u64) -> io::Result<()> {
+    /// The session's clock. Copy it rather than starting another, or timestamps taken in
+    /// different places cannot be compared.
+    pub fn clock(&self) -> ClientClock {
+        self.clock
+    }
+
+    /// How far ahead of the client's clock the agent's is, once a pong has landed.
+    ///
+    /// The estimate assumes the network delays both directions equally, so its error is half the
+    /// path asymmetry and is bounded by half the round-trip time. Read it together with
+    /// [`ClientSession::rtt_us`]: an offset from a 1 ms round trip is worth far more than one
+    /// from a 40 ms round trip.
+    pub fn clock_offset_us(&self) -> Option<i64> {
+        self.clock_sync.offset_us()
+    }
+
+    /// Round-trip time statistics from the ping/pong exchange.
+    pub fn rtt_us(&self) -> &oxproto::latency::Samples {
+        self.clock_sync.rtt()
+    }
+
+    /// Send a liveness probe, and register it so the matching pong updates the clock estimate.
+    ///
+    /// `OXPROTO.md` §15 has both ends do this every second. Until this was called the client
+    /// sent no pings at all and discarded every pong, so there was no way to relate an agent
+    /// timestamp to a client one.
+    pub async fn ping(&mut self) -> io::Result<()> {
+        let seq = self.ping_seq;
+        self.ping_seq = self.ping_seq.wrapping_add(1);
+        let sent_us = self.clock.now_us();
+        self.clock_sync.on_ping_sent(seq, sent_us);
         self.send(&Message::Ping(Ping { seq, sent_us })).await
     }
 }

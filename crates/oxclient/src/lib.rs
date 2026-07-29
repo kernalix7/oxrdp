@@ -10,12 +10,14 @@
 pub mod clock;
 pub mod decode;
 pub mod geometry;
+pub mod latency;
 pub mod model;
 pub mod session;
 
 pub use clock::ClientClock;
-pub use decode::pipeline::{DecodePipeline, DroppedFrame, FrameSink};
+pub use decode::pipeline::{DecodePipeline, FrameReport, FrameSink};
 pub use decode::{DecodeError, Decoder, WindowDecoders};
 pub use geometry::GeometrySync;
+pub use latency::{FrameStages, LatencyMonitor};
 pub use model::{ModelChange, RemoteWindow, WindowModel};
 pub use session::{ClientEvent, ClientSession, SessionConfig};

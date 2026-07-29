@@ -72,18 +72,52 @@ pub trait FrameSink: Clone + Send + 'static {
     fn deliver(&self, frame: FrameData) -> bool;
 }
 
-/// A frame the decoder finished with that will never reach the display.
+/// What a decode worker tells the session task about a frame it has finished with.
 ///
-/// It still has to be acknowledged. `OXPROTO.md` §12 bounds the agent's unacknowledged frames per
-/// window, and a frame the client silently swallows would hold a slot in that budget forever.
+/// Two things need saying. A frame that will never be presented still has to be acknowledged —
+/// `OXPROTO.md` §12 bounds the agent's unacknowledged frames per window, and a frame the client
+/// swallows silently would hold a slot in that budget forever. And a frame that *was* decoded
+/// needs its decode-completion time reported, because that instant is known only on the worker
+/// thread: by the time the display sees the frame the decode is long finished, and nothing
+/// downstream can say when it happened.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct DroppedFrame {
-    /// Window the frame belonged to.
-    pub window_id: u32,
-    /// Frame that will not be presented.
-    pub frame_id: u64,
-    /// When the decoder finished with it, on the client clock.
-    pub finished_us: u64,
+pub enum FrameReport {
+    /// A picture was produced and handed to the display.
+    Decoded {
+        /// Window the frame belongs to.
+        window_id: u32,
+        /// Frame that was decoded.
+        frame_id: u64,
+        /// When the decoder finished, on the client clock.
+        decoded_us: u64,
+    },
+    /// The decoder finished with a frame that will never be presented.
+    Dropped {
+        /// Window the frame belonged to.
+        window_id: u32,
+        /// Frame that will not be presented.
+        frame_id: u64,
+        /// When the decoder finished with it, on the client clock.
+        finished_us: u64,
+    },
+}
+
+impl FrameReport {
+    /// Window the report is about.
+    #[must_use]
+    pub fn window_id(&self) -> u32 {
+        match self {
+            Self::Decoded { window_id, .. } | Self::Dropped { window_id, .. } => *window_id,
+        }
+    }
+
+    /// Frame the report is about.
+    #[must_use]
+    pub fn frame_id(&self) -> u64 {
+        match self {
+            Self::Decoded { frame_id, .. } | Self::Dropped { frame_id, .. } => *frame_id,
+        }
+    }
 }
 
 /// Builds a decoder for one window's stream, given the window id and the codec on the wire.
@@ -111,7 +145,7 @@ pub struct Backpressure {
 /// Per-window decode workers.
 pub struct DecodePipeline<S: FrameSink> {
     sink: S,
-    dropped: mpsc::UnboundedSender<DroppedFrame>,
+    dropped: mpsc::UnboundedSender<FrameReport>,
     clock: ClientClock,
     factory: DecoderFactory,
     workers: HashMap<u32, mpsc::Sender<FrameData>>,
@@ -121,7 +155,7 @@ impl<S: FrameSink> DecodePipeline<S> {
     /// Creates a pipeline that delivers decoded frames to `sink` and reports undeliverable ones
     /// on `dropped`.
     #[must_use]
-    pub fn new(sink: S, dropped: mpsc::UnboundedSender<DroppedFrame>, clock: ClientClock) -> Self {
+    pub fn new(sink: S, dropped: mpsc::UnboundedSender<FrameReport>, clock: ClientClock) -> Self {
         Self::with_decoder_factory(
             sink,
             dropped,
@@ -134,7 +168,7 @@ impl<S: FrameSink> DecodePipeline<S> {
     #[must_use]
     pub fn with_decoder_factory(
         sink: S,
-        dropped: mpsc::UnboundedSender<DroppedFrame>,
+        dropped: mpsc::UnboundedSender<FrameReport>,
         clock: ClientClock,
         factory: DecoderFactory,
     ) -> Self {
@@ -208,7 +242,7 @@ impl<S: FrameSink> DecodePipeline<S> {
 fn spawn_worker<S: FrameSink>(
     window_id: u32,
     sink: S,
-    dropped: mpsc::UnboundedSender<DroppedFrame>,
+    dropped: mpsc::UnboundedSender<FrameReport>,
     clock: ClientClock,
     factory: DecoderFactory,
 ) -> mpsc::Sender<FrameData> {
@@ -233,7 +267,7 @@ fn run_worker<S: FrameSink>(
     window_id: u32,
     mut frames: mpsc::Receiver<FrameData>,
     sink: &S,
-    dropped: &mpsc::UnboundedSender<DroppedFrame>,
+    dropped: &mpsc::UnboundedSender<FrameReport>,
     clock: ClientClock,
     factory: &DecoderFactory,
 ) {
@@ -300,6 +334,13 @@ fn run_worker<S: FrameSink>(
 
         match decoded {
             Some(frame) => {
+                // Stamped before delivery, because this is the last moment at which the decode's
+                // completion time is knowable — the display thread has no idea when it happened.
+                let _ = dropped.send(FrameReport::Decoded {
+                    window_id,
+                    frame_id,
+                    decoded_us: clock.now_us(),
+                });
                 if !sink.deliver(frame) {
                     return;
                 }
@@ -310,12 +351,12 @@ fn run_worker<S: FrameSink>(
 }
 
 fn report_dropped(
-    dropped: &mpsc::UnboundedSender<DroppedFrame>,
+    dropped: &mpsc::UnboundedSender<FrameReport>,
     window_id: u32,
     frame_id: u64,
     clock: ClientClock,
 ) {
-    let _ = dropped.send(DroppedFrame {
+    let _ = dropped.send(FrameReport::Dropped {
         window_id,
         frame_id,
         finished_us: clock.now_us(),
@@ -463,14 +504,17 @@ mod tests {
 
         pipeline.submit(raw_frame(1, 7, 2, 2)).expect("submitted");
 
-        let dropped = dropped_rx.recv().await.expect("the drop is reported");
-        assert_eq!(
-            dropped,
-            DroppedFrame {
-                window_id: 1,
-                frame_id: 7,
-                finished_us: dropped.finished_us,
-            }
+        let report = dropped_rx.recv().await.expect("the drop is reported");
+        assert!(
+            matches!(
+                report,
+                FrameReport::Dropped {
+                    window_id: 1,
+                    frame_id: 7,
+                    ..
+                }
+            ),
+            "unexpected report: {report:?}"
         );
         assert!(presented.try_recv().is_err(), "nothing was presented");
     }
@@ -493,8 +537,9 @@ mod tests {
         }
 
         for frame_id in 0..3 {
-            let dropped = dropped_rx.recv().await.expect("each failure is reported");
-            assert_eq!(dropped.frame_id, frame_id, "the worker kept going");
+            let report = dropped_rx.recv().await.expect("each failure is reported");
+            assert!(matches!(report, FrameReport::Dropped { .. }));
+            assert_eq!(report.frame_id(), frame_id, "the worker kept going");
         }
     }
 
@@ -510,7 +555,7 @@ mod tests {
         pipeline.submit(raw_frame(1, 1, 2, 2)).expect("submitted");
 
         assert_eq!(
-            dropped_rx.recv().await.expect("reported").frame_id,
+            dropped_rx.recv().await.expect("reported").frame_id(),
             1,
             "a window whose codec has no decoder must still release its flow-control slot"
         );
@@ -553,11 +598,11 @@ mod tests {
         // Every frame is accounted for, including the ones after the first panic — which is
         // what proves the worker survived rather than the channel having quietly closed.
         for frame_id in 0..3 {
-            let dropped = tokio::time::timeout(Duration::from_secs(5), dropped_rx.recv())
+            let report = tokio::time::timeout(Duration::from_secs(5), dropped_rx.recv())
                 .await
                 .expect("a panicking decoder must not stall the window")
                 .expect("reported");
-            assert_eq!(dropped.frame_id, frame_id);
+            assert_eq!(report.frame_id(), frame_id);
         }
         assert!(presented.try_recv().is_err(), "nothing was presented");
     }
@@ -587,10 +632,12 @@ mod tests {
             pipeline
                 .submit(raw_frame(1, frame_id, 2, 2))
                 .expect("submitted");
-            if let Ok(Some(dropped)) =
+            if let Ok(Some(report)) =
                 tokio::time::timeout(Duration::from_millis(500), dropped_rx.recv()).await
             {
-                acknowledged.push(dropped.frame_id);
+                if matches!(report, FrameReport::Dropped { .. }) {
+                    acknowledged.push(report.frame_id());
+                }
             }
         }
 
@@ -731,10 +778,21 @@ mod tests {
         assert_eq!(frame.data.len(), 4 * 2 * 4);
         assert_eq!(frame.codec, codec::RAW_BGRA);
 
+        // ...and reported as decoded, which is what carries the decode-completion time.
+        let decoded = dropped_rx.recv().await.expect("reported");
+        assert!(
+            matches!(decoded, FrameReport::Decoded { frame_id: 0, .. }),
+            "unexpected report: {decoded:?}"
+        );
+
         // ...and a malformed one is acknowledged rather than presented.
         let mut broken = raw_frame(3, 1, 4, 2);
         broken.data.truncate(3);
         pipeline.submit(broken).expect("submitted");
-        assert_eq!(dropped_rx.recv().await.expect("reported").frame_id, 1);
+        let dropped = dropped_rx.recv().await.expect("reported");
+        assert!(
+            matches!(dropped, FrameReport::Dropped { frame_id: 1, .. }),
+            "unexpected report: {dropped:?}"
+        );
     }
 }
