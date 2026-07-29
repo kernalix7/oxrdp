@@ -56,11 +56,15 @@ impl Samples {
     }
 
     /// Arithmetic mean, or `None` when empty.
+    ///
+    /// Saturates rather than overflowing: a session pathological enough to hit this (each of a
+    /// full window's samples within reach of `u64::MAX`) has bigger problems than a wrong mean,
+    /// but silently wrapping into a small, plausible-looking number would hide that.
     pub fn mean(&self) -> Option<u64> {
         if self.is_empty() {
             return None;
         }
-        let sum: u64 = self.iter().sum();
+        let sum = self.iter().fold(0u64, u64::saturating_add);
         Some(sum / self.len as u64)
     }
 
@@ -101,11 +105,30 @@ impl Samples {
 }
 
 /// Round-trip time and clock-offset estimation from Ping/Pong exchanges.
+///
+/// This is the standard SNTP simplification of NTP's four-timestamp exchange: the agent reports
+/// one clock reading (`agent_us`) rather than separate receive/send times, so the offset assumes
+/// the agent's own processing between the two is negligible, and RTT/2 assumes the network
+/// delays both directions equally. Neither is guaranteed by a TCP connection through a VM port
+/// forward — the true error can exceed half the RTT if the path is asymmetric. What *is*
+/// guaranteed: [`ClockSync::offset_error_bound_us`] never overstates precision, because it is
+/// always half the RTT of the exact sample the current offset came from, not a smoothed or
+/// assumed figure. See `OXPROTO.md` §12.1.
 #[derive(Debug, Clone)]
 pub struct ClockSync {
     pending: std::collections::HashMap<u32, u64>,
     rtt: Samples,
     offset: Option<i64>,
+    /// RTT of the sample `offset` was computed from — kept paired with the estimate it
+    /// describes rather than left for the caller to separately match against `rtt()`.
+    offset_rtt: Option<u64>,
+    /// Send time (client clock) of the most recent sample actually applied to `offset`, so a
+    /// Pong that arrives out of order relative to when its Ping was sent cannot overwrite a
+    /// newer estimate with a stale one. Not reachable today — a single TCP connection delivers
+    /// in order, and the agent answers Pings strictly in the order it receives them — but the
+    /// estimator should not depend on that holding forever, especially with QUIC planned
+    /// (`OXPROTO.md` §2).
+    applied_sent_us: Option<u64>,
 }
 
 impl ClockSync {
@@ -115,6 +138,8 @@ impl ClockSync {
             pending: std::collections::HashMap::new(),
             rtt: Samples::new(window),
             offset: None,
+            offset_rtt: None,
+            applied_sent_us: None,
         }
     }
 
@@ -126,13 +151,34 @@ impl ClockSync {
     /// Record a Pong. `agent_us` is the agent's clock from the message, `now_us` the client
     /// time it arrived. Returns the round-trip time, or `None` if this seq was never sent
     /// (a duplicate or forged Pong must not corrupt the estimate).
+    ///
+    /// The RTT sample is always recorded, even for a Pong answering an older Ping than the one
+    /// the current offset estimate is based on. The offset itself is not updated by such a
+    /// sample — `applied_sent_us` only moves forward — so a reordered reply can add a data
+    /// point to `rtt()`'s statistics without ever making the offset estimate worse.
     pub fn on_pong(&mut self, seq: u32, agent_us: u64, now_us: u64) -> Option<u64> {
         let sent_us = self.pending.remove(&seq)?;
         let rtt = now_us.saturating_sub(sent_us);
-        let rtt_half = rtt / 2;
-        let offset = agent_us.saturating_sub(sent_us.saturating_add(rtt_half)) as i64;
         self.rtt.push(rtt);
-        self.offset = Some(offset);
+
+        if self
+            .applied_sent_us
+            .is_none_or(|applied| sent_us >= applied)
+        {
+            let rtt_half = rtt / 2;
+            let midpoint = sent_us.saturating_add(rtt_half);
+            // Widened to i128 so the subtraction can never overflow regardless of how the two
+            // u64 clocks relate, then clamped into the i64 range every caller of `offset_us`
+            // expects. The previous version computed this as an unsigned `saturating_sub` before
+            // casting to `i64`, which floors at zero instead of going negative whenever the
+            // agent's clock reads behind the client's — silently reporting "no skew" for exactly
+            // half of all possible clock-skew directions. There was no test for that direction.
+            let offset = (i128::from(agent_us) - i128::from(midpoint))
+                .clamp(i128::from(i64::MIN), i128::from(i64::MAX)) as i64;
+            self.offset = Some(offset);
+            self.offset_rtt = Some(rtt);
+            self.applied_sent_us = Some(sent_us);
+        }
         Some(rtt)
     }
 
@@ -147,117 +193,30 @@ impl ClockSync {
         self.offset
     }
 
+    /// Half the RTT of the sample [`ClockSync::offset_us`] was computed from: the error bound
+    /// the symmetric-path assumption promises, *if* the path really is symmetric. An offset
+    /// without this is not defensible on its own; a caller quoting `offset_us()` should always
+    /// quote this alongside it.
+    pub fn offset_error_bound_us(&self) -> Option<u64> {
+        Some(self.offset_rtt? / 2)
+    }
+
     /// Convert an agent timestamp into client time using the current offset estimate.
     pub fn agent_to_client(&self, agent_us: u64) -> Option<u64> {
-        let offset = self.offset?;
-        if offset >= 0 {
-            Some(agent_us.saturating_sub(offset as u64))
-        } else {
-            Some(agent_us.saturating_sub((-offset) as u64))
-        }
+        Some(agent_to_client(agent_us, self.offset?))
     }
 }
 
-/// One frame's measured pipeline, all in microseconds.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct FrameTiming {
-    /// Frame this describes.
-    pub frame_id: u64,
-    /// Agent-side capture to encode-complete.
-    pub encode_us: u64,
-    /// Encode-complete to the client having it decoded (includes the network).
-    pub transit_us: u64,
-    /// Decode-complete to on screen.
-    pub present_us: u64,
-    /// Capture to on screen — the number that actually matters.
-    pub total_us: u64,
-}
-
-/// End-to-end latency accounting for one window's frames.
-#[derive(Debug, Clone)]
-pub struct FrameLatency {
-    in_flight: std::collections::BTreeMap<u64, FrameRecord>,
-    total: Samples,
-}
-
-#[derive(Debug, Clone)]
-struct FrameRecord {
-    captured_us: u64,
-    encoded_us: u64,
-    decoded_us: u64,
-}
-
-impl FrameLatency {
-    /// A tracker keeping `window` completed-frame samples.
-    pub fn new(window: usize) -> Self {
-        Self {
-            in_flight: std::collections::BTreeMap::new(),
-            total: Samples::new(window),
-        }
-    }
-
-    /// Record a frame's arrival: its agent-side timestamps, and the client time it was decoded.
-    pub fn on_frame(&mut self, frame_id: u64, captured_us: u64, encoded_us: u64, decoded_us: u64) {
-        self.in_flight.insert(
-            frame_id,
-            FrameRecord {
-                captured_us,
-                encoded_us,
-                decoded_us,
-            },
-        );
-        while self.in_flight.len() > 256 {
-            let oldest = *self.in_flight.keys().next().unwrap();
-            self.in_flight.remove(&oldest);
-        }
-    }
-
-    /// Record that a frame reached the screen at client time `presented_us`. Returns the
-    /// completed timing, or `None` if the frame was never recorded by `on_frame` (it may have
-    /// been dropped by the agent's in-flight budget, which is normal).
-    pub fn on_presented(
-        &mut self,
-        frame_id: u64,
-        presented_us: u64,
-        offset_us: i64,
-    ) -> Option<FrameTiming> {
-        let rec = self.in_flight.remove(&frame_id)?;
-
-        let captured_client = agent_to_client(rec.captured_us, offset_us);
-        let encoded_client = agent_to_client(rec.encoded_us, offset_us);
-
-        let encode_us = rec.encoded_us.saturating_sub(rec.captured_us);
-        let transit_us = rec.decoded_us.saturating_sub(encoded_client);
-        let present_us = presented_us.saturating_sub(rec.decoded_us);
-        let total_us = presented_us.saturating_sub(captured_client);
-
-        let timing = FrameTiming {
-            frame_id,
-            encode_us,
-            transit_us,
-            present_us,
-            total_us,
-        };
-        self.total.push(total_us);
-        Some(timing)
-    }
-
-    /// Statistics over `total_us` for completed frames.
-    pub fn total(&self) -> &Samples {
-        &self.total
-    }
-
-    /// Frames recorded but never presented — the agent's drops plus anything lost.
-    pub fn incomplete(&self) -> usize {
-        self.in_flight.len()
-    }
-}
-
+/// Converts an agent-clock timestamp into the equivalent client-clock timestamp, given
+/// `offset_us = agent_clock - client_clock`. `unsigned_abs` rather than negating `offset_us`
+/// directly: negating `i64::MIN` overflows i64's range, and while no session runs anywhere near
+/// long enough to produce an offset that large, a conversion this central should not carry a
+/// panic that a pathological-but-representable input could reach.
 fn agent_to_client(agent_us: u64, offset_us: i64) -> u64 {
     if offset_us >= 0 {
-        agent_us.saturating_sub(offset_us as u64)
+        agent_us.saturating_sub(offset_us.unsigned_abs())
     } else {
-        agent_us.saturating_add((-offset_us) as u64)
+        agent_us.saturating_add(offset_us.unsigned_abs())
     }
 }
 
@@ -298,7 +257,7 @@ mod tests {
     }
 
     #[test]
-    fn clock_sync_estimates_rtt_and_offset() {
+    fn clock_sync_estimates_rtt_and_offset_when_the_agent_is_ahead() {
         let mut c = ClockSync::new(8);
         // Client sends at 1000, agent replies stamped 5100, client receives at 1200.
         // rtt = 200, offset = 5100 - (1000 + 100) = 4000.
@@ -306,8 +265,26 @@ mod tests {
         assert_eq!(c.on_pong(1, 5100, 1200), Some(200));
         assert_eq!(c.rtt().last(), Some(200));
         assert_eq!(c.offset_us(), Some(4000));
+        assert_eq!(c.offset_error_bound_us(), Some(100), "half the 200us RTT");
         // An agent timestamp of 5100 corresponds to client time 1100.
         assert_eq!(c.agent_to_client(5100), Some(1100));
+    }
+
+    /// The case the original implementation got wrong: it computed the offset as an unsigned
+    /// `saturating_sub` before casting to `i64`, which floors at zero instead of going negative,
+    /// so every agent-behind-client session silently reported "no clock skew" instead of the
+    /// true offset. Nothing here was reachable via the crate's own tests before this one.
+    #[test]
+    fn clock_sync_estimates_a_negative_offset_when_the_agent_is_behind() {
+        let mut c = ClockSync::new(8);
+        // Client sends at 10_000, agent replies stamped 8_000 (2000us behind), client receives
+        // at 10_200. rtt = 200, offset = 8000 - (10000 + 100) = -2100.
+        c.on_ping_sent(1, 10_000);
+        assert_eq!(c.on_pong(1, 8_000, 10_200), Some(200));
+        assert_eq!(c.offset_us(), Some(-2_100));
+        // An agent timestamp of 8_000 corresponds to client time 10_100 — later than the agent
+        // timestamp's own numeric value, because the agent's clock reads behind.
+        assert_eq!(c.agent_to_client(8_000), Some(10_100));
     }
 
     #[test]
@@ -322,45 +299,35 @@ mod tests {
         assert_eq!(c.on_pong(1, 500, 200), None);
     }
 
+    /// A Pong answering an older Ping than the one behind the current estimate must not replace
+    /// a good estimate with a worse one — it still counts for RTT statistics, just not for
+    /// `offset_us`. Not reachable over the current TCP transport (see the field doc on
+    /// `ClockSync::applied_sent_us`), but the estimator must not silently assume that forever.
     #[test]
-    fn frame_latency_splits_the_pipeline() {
-        let mut f = FrameLatency::new(16);
-        // Agent clock is 4000us ahead of the client's.
-        // captured at agent 5000 (client 1000), encoded at agent 5100 (client 1100),
-        // decoded on the client at 1300, presented at 1350.
-        f.on_frame(7, 5000, 5100, 1300);
-        let t = f.on_presented(7, 1350, 4000).expect("frame was recorded");
-        assert_eq!(t.frame_id, 7);
-        assert_eq!(t.encode_us, 100); // 5100 - 5000
-        assert_eq!(t.transit_us, 200); // client 1300 - client 1100
-        assert_eq!(t.present_us, 50); // 1350 - 1300
-        assert_eq!(t.total_us, 350); // client 1350 - client 1000
-        assert_eq!(f.total().last(), Some(350));
-        assert_eq!(f.incomplete(), 0);
-    }
+    fn a_pong_for_an_older_ping_updates_rtt_but_not_the_stale_offset() {
+        let mut c = ClockSync::new(8);
+        c.on_ping_sent(2, 2_000);
+        c.on_ping_sent(1, 1_000);
+        // The newer ping (seq 2, sent later) is answered first.
+        assert_eq!(c.on_pong(2, 6_000, 2_200), Some(200));
+        assert_eq!(c.offset_us(), Some(3_900)); // 6000 - (2000 + 100)
 
-    #[test]
-    fn presenting_an_unknown_frame_is_not_an_error() {
-        let mut f = FrameLatency::new(4);
-        assert_eq!(f.on_presented(1, 100, 0), None);
-    }
-
-    #[test]
-    fn negative_intervals_saturate_instead_of_wrapping() {
-        let mut f = FrameLatency::new(4);
-        // Nonsensical ordering (encoded before captured, presented before decoded).
-        f.on_frame(1, 5000, 4000, 1300);
-        let t = f.on_presented(1, 1200, 4000).unwrap();
-        assert_eq!(t.encode_us, 0);
-        assert_eq!(t.present_us, 0);
-    }
-
-    #[test]
-    fn in_flight_frames_are_bounded() {
-        let mut f = FrameLatency::new(4);
-        for id in 0..1000 {
-            f.on_frame(id, 0, 0, 0);
-        }
-        assert!(f.incomplete() <= 256, "un-presented frames must be bounded");
+        // Now the older ping's reply arrives, with a wildly different (implausible) offset. If
+        // applied, this would corrupt the estimate with stale data.
+        assert_eq!(
+            c.on_pong(1, 50_000, 1_200),
+            Some(200),
+            "still a valid RTT sample"
+        );
+        assert_eq!(
+            c.offset_us(),
+            Some(3_900),
+            "the older ping's reply must not overwrite the newer estimate"
+        );
+        assert_eq!(
+            c.rtt().len(),
+            2,
+            "both round trips still count as RTT samples"
+        );
     }
 }

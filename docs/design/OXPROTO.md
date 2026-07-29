@@ -123,8 +123,9 @@ private/experimental extensions and must never appear in a release.
 - Coordinates are **i32 screen coordinates in the guest's virtual desktop space**, using the
   DWM *extended frame bounds* of a window — the visible frame, matching exactly what capture
   produces. Sizes are `u16` pixels.
-- **Clock**: `u64` microseconds on the agent's monotonic clock, zeroed at `ServerHello`. The
-  client estimates the offset with `Ping`/`Pong` and never needs wall-clock sync.
+- **Clock**: `u64` microseconds on the sender's own monotonic clock, zeroed around `ServerHello`.
+  The client estimates the agent's offset from its own with `Ping`/`Pong` and never needs
+  wall-clock sync — see §12.1 for what that estimate does and does not promise.
 - `window_id: u32` is assigned by the agent, **monotonically increasing and never reused**
   within a session (native handles are recycled by the OS; ids must not be).
 
@@ -401,6 +402,70 @@ exact failure that makes naive streamers feel worse than RDP.
 
 **`QualityHint`** (C→A) — `{ window_id (0 = all), target_fps u16, max_bitrate_kbps u32, flags u8
 (bit0 prefer_latency_over_quality) }`.
+
+### 12.1 Interpreting timestamps
+
+Every timestamp on the wire (`captured_us`/`encoded_us` in `FrameData`; `decoded_us`/
+`presented_us` in `FrameAck`; `sent_us`/`agent_us` in `Ping`/`Pong`; `timestamp` in
+`PointerEvent`/`KeyEvent`) is `u64` microseconds since a **per-session monotonic clock**, per §6
+— never a wall-clock value. Each side's clock is backed by its own `Instant` (`ClientClock`
+client-side, `elapsed_us` off the connection's own `Instant::now()` agent-side), which gives two
+guarantees a receiver may rely on and one it may not:
+
+- **Neither clock steps.** `Instant` is monotonic on every platform this project targets, immune
+  to NTP adjustments, leap seconds, or the system clock being changed mid-session. A stall shows
+  up as a large delta between two timestamps on the same clock; it never shows up as a delta
+  going backwards.
+- **u64 microseconds does not realistically overflow.** ~584,942 years of headroom; both sides
+  saturate at `u64::MAX` rather than wrapping if that ever changes.
+- **The two clocks do not start at the same real-world instant, and nothing makes them.** The
+  client's clock is zeroed on receiving `ServerHello`; the agent's is zeroed a short time before
+  it *sends* `ServerHello` (session setup that follows takes a small, unaccounted-for amount of
+  time). Comparing a raw agent timestamp to a raw client timestamp directly is meaningless — they
+  are two independent stopwatches until `Ping`/`Pong` produces an offset estimate.
+
+**The offset estimate, and what it does not promise.** `oxproto::latency::ClockSync` is the
+reference implementation of the `Ping`/`Pong` estimator (§15); a client is not required to use it,
+but must reproduce its guarantees if it writes its own. It is the standard SNTP simplification of
+NTP's four-timestamp exchange: the agent reports one clock reading (`Pong.agent_us`) rather than
+separate receive/send times, and round-trip delay is assumed symmetric. **Neither assumption is
+guaranteed by this protocol's transport** — a TCP connection through a VM's port-forwarded
+loopback is not proven to delay both directions equally, so the offset's true error can exceed
+half the round-trip time if the path is asymmetric in either direction. What a receiver *may*
+assume: the reported offset is always the exact result of the stated formula for some real
+`Ping`/`Pong` pair — never smoothed, averaged, or invented — and its documented error bound
+(`ClockSync::offset_error_bound_us`) is always half the round-trip time of the specific sample the
+offset came from, not an assumed or stale figure. **A latency number that depends on the offset
+must always be reported alongside the round-trip time it was computed under.** An offset without
+it is not defensible: the same offset value means something very different behind a 0.3ms round
+trip than behind a 40ms one.
+
+**Capture-to-present is what this protocol can measure; glass-to-glass is not.** `captured_us`
+through `presented_us` covers from the agent finishing WGC capture of a window to the client
+finishing the call that writes decoded pixels to a surface. It does **not** include the guest's
+own compositor time before capture (DWM composing the window before WGC reads it), or the local
+display server and monitor's own latency after `presented_us` (the window manager's compositor,
+the X/Wayland server, the physical display's own input lag). Nothing in this process can observe
+either of those, so nothing in this process may claim to measure them. A true glass-to-glass
+number needs an external reference — a camera pointed at both screens, or a hardware probe — not
+a wire timestamp.
+
+**Only one leg of a frame's journey crosses clocks.** A frame's total latency splits into: agent
+capture→encode (agent clock only), encode→arrival on the wire (spans both clocks), arrival→decode
+(client clock only), decode→present (client clock only). Only encode→arrival — and therefore the
+end-to-end total, which contains it — depends on the offset estimate and inherits its error; the
+other three legs are each a difference between two timestamps on the *same* clock, so they are
+exact regardless of how well the offset estimate holds up. A report that blends all four into one
+number without saying which parts are exact and which carry the clock-offset error is overstating
+its own precision.
+
+This four-leg breakdown is deliberately not part of `oxproto` itself: splitting arrival from
+decode-completion requires knowing a client's own internal pipeline (e.g. whether decode runs off
+the session task, per `HANDOFF.md` §4), which is application structure, not wire protocol. This
+document defines the two shared primitives every implementation needs — `oxproto::latency::Samples`
+(a bounded window with honest nearest-rank percentiles, not a mean that would hide a stall) and
+`ClockSync` (the offset estimator above) — and leaves per-stage accounting to the client, the way
+`oxclient`'s own latency module does.
 
 ## 13. Input
 
