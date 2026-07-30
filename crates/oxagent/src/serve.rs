@@ -7,13 +7,15 @@
 //! Structure of a session:
 //!
 //! ```text
-//!   reader task  ──mpsc──▶  driver loop  ──writes──▶  client
-//!   (decodes incoming)      (ticks at target_fps)
+//!   reader task  ──mpsc──▶  driver loop  ──mpsc──▶  writer task  ──writes──▶  client
+//!   (decodes incoming)      (ticks at target_fps)     (ChunkWriter)
 //! ```
 //!
 //! Splitting the read side into its own task is what lets a `FrameAck` arrive while a frame is
 //! being written; a single-threaded read-then-write loop would deadlock the flow control it is
-//! supposed to implement.
+//! supposed to implement. Splitting the write side out too keeps socket back-pressure from
+//! delaying the next capture tick; the driver may reserve bounded send-queue space, but it never
+//! awaits a socket write in the tick branch.
 
 use std::collections::HashMap;
 use std::io;
@@ -27,9 +29,10 @@ use oxproto::message::{
     WindowState, WindowTitle,
 };
 use oxproto::{close_reason, error_code, feature, msg_type};
-use oxtransport::{read_message, write_message, write_raw};
+use oxtransport::{read_message, write_message, ChunkWriter};
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
 use tokio::sync::{mpsc, Semaphore};
+use tokio::task::JoinHandle;
 
 use crate::encode::FrameEncoder;
 use crate::handshake::{negotiate, HandshakeError, Negotiated};
@@ -148,6 +151,22 @@ struct WindowStream {
 /// own constant rather than shared: this one lives on the platform-independent side and measures
 /// scheduling delay within `pump_frames` itself, not anything about the encoder.
 const CAPTURE_DIAGNOSTIC_FRAME_LIMIT: u32 = 100;
+
+/// Bounded post-handshake outbound queue, in protocol messages/chunked bodies.
+///
+/// Frames are additionally bounded per window by [`FrameBudget`]. This cap exists to keep a
+/// stalled socket from turning the write task's mailbox into an unbounded latency buffer. A
+/// frame must reserve a slot before capture/encode; if no slot is available, that tick simply
+/// produces no frame for that window, so an encoded H.264 access unit is never dropped after
+/// encoding.
+const OUTBOUND_QUEUE_CAPACITY: usize = 64;
+
+#[derive(Debug)]
+struct OutboundChunk {
+    msg_type: u8,
+    channel: u16,
+    body: Vec<u8>,
+}
 
 /// Tracks which kinds of input this session has already logged the first occurrence of.
 ///
@@ -290,14 +309,17 @@ where
     // protocol error), it just should not silently work.
     let text_input_enabled = negotiated.features & feature::TEXT_INPUT != 0;
     let window_control_enabled = negotiated.features & feature::WINDOW_CONTROL != 0;
+    let (outbound_tx, outbound_rx) = mpsc::channel::<OutboundChunk>(OUTBOUND_QUEUE_CAPACITY);
+    let mut writer_task = tokio::spawn(write_outbound(writer, outbound_rx));
 
     let outcome = drive(
-        &mut writer,
+        &outbound_tx,
         source,
         sink,
         encoder,
         &mut rx,
         &mut ticker,
+        &mut writer_task,
         &mut registry,
         &mut streams,
         &params,
@@ -309,21 +331,28 @@ where
     )
     .await;
 
+    drop(outbound_tx);
     reader_task.abort();
-    let _ = writer.shutdown().await;
+    if writer_task.is_finished() {
+        let _ = writer_task.await;
+    } else {
+        writer_task.abort();
+        let _ = writer_task.await;
+    }
     outcome?;
     Ok(negotiated)
 }
 
 /// The steady-state loop: announce window changes, send frames, apply acks and input.
 #[allow(clippy::too_many_arguments)]
-async fn drive<W, WR, I, E>(
-    writer: &mut WR,
+async fn drive<W, I, E>(
+    outbound: &mpsc::Sender<OutboundChunk>,
     source: &mut W,
     sink: &mut I,
     encoder: &mut E,
     rx: &mut mpsc::Receiver<Message>,
     ticker: &mut tokio::time::Interval,
+    writer_task: &mut JoinHandle<io::Result<()>>,
     registry: &mut WindowRegistry,
     streams: &mut HashMap<u32, WindowStream>,
     params: &SessionParams,
@@ -335,7 +364,6 @@ async fn drive<W, WR, I, E>(
 ) -> io::Result<()>
 where
     W: WindowSource,
-    WR: AsyncWrite + Unpin,
     I: InputSink,
     E: FrameEncoder,
 {
@@ -367,7 +395,7 @@ where
                             sent_us: p.sent_us,
                             agent_us: elapsed_us(started),
                         });
-                        send(writer, &pong, channel::CONTROL).await?;
+                        send(outbound, &pong, channel::CONTROL)?;
                     }
                     Message::PointerEvent(p) => {
                         // `streams` is exactly the set of windows this session has announced
@@ -490,15 +518,25 @@ where
                 }
             }
 
+            writer_result = &mut *writer_task => {
+                return match writer_result {
+                    Ok(result) => result,
+                    Err(err) => Err(io::Error::new(
+                        io::ErrorKind::BrokenPipe,
+                        format!("writer task failed: {err}"),
+                    )),
+                };
+            }
+
             _ = ticker.tick() => {
                 // Taken here, not inside `pump_frames`, so a later window's
                 // `tick_to_capture_us` also reflects `sync_windows`' own cost this tick, not
                 // just the windows processed before it — the gap `pump_frames`'s doc means by
                 // "the tick firing", not just "this function being entered".
                 let tick_started = Instant::now();
-                sync_windows(writer, source, encoder, registry, streams, params).await?;
+                sync_windows(outbound, source, encoder, registry, streams, params)?;
                 pump_frames(
-                    writer,
+                    outbound,
                     source,
                     encoder,
                     streams,
@@ -506,8 +544,7 @@ where
                     tick_started,
                     acks_enabled,
                     codec,
-                )
-                .await?;
+                )?;
             }
         }
     }
@@ -550,8 +587,8 @@ fn show_state(w: &SourceWindow) -> u8 {
 
 /// Diff the platform's window list against what the client has been told.
 #[allow(clippy::too_many_arguments)]
-async fn sync_windows<W, WR, E>(
-    writer: &mut WR,
+fn sync_windows<W, E>(
+    outbound: &mpsc::Sender<OutboundChunk>,
     source: &mut W,
     encoder: &mut E,
     registry: &mut WindowRegistry,
@@ -560,7 +597,6 @@ async fn sync_windows<W, WR, E>(
 ) -> io::Result<()>
 where
     W: WindowSource,
-    WR: AsyncWrite + Unpin,
     E: FrameEncoder,
 {
     let live = source.live_windows();
@@ -569,7 +605,7 @@ where
         let (tracked, is_new) = registry.track(w.handle);
         if is_new {
             send(
-                writer,
+                outbound,
                 &Message::WindowOpened(WindowOpened {
                     window_id: tracked.window_id,
                     video_channel: tracked.video_channel,
@@ -585,8 +621,7 @@ where
                     owner_id: 0,
                 }),
                 channel::WINDOW,
-            )
-            .await?;
+            )?;
             streams.insert(
                 tracked.window_id,
                 WindowStream {
@@ -617,14 +652,13 @@ where
         if stream.title != w.title {
             stream.title.clone_from(&w.title);
             send(
-                writer,
+                outbound,
                 &Message::WindowTitle(WindowTitle {
                     window_id: tracked.window_id,
                     title: w.title.clone(),
                 }),
                 channel::WINDOW,
-            )
-            .await?;
+            )?;
         }
 
         // `WindowState.flags` carries the *same* bitmask `WindowOpened.flags` does, always the
@@ -650,15 +684,14 @@ where
             stream.show_state = new_show_state;
             stream.flags = new_flags;
             send(
-                writer,
+                outbound,
                 &Message::WindowState(WindowState {
                     window_id: tracked.window_id,
                     state: new_show_state,
                     flags: new_flags,
                 }),
                 channel::WINDOW,
-            )
-            .await?;
+            )?;
         }
 
         // Geometry is skipped entirely while minimized: a minimized window's frame bounds are
@@ -689,7 +722,7 @@ where
                     stream.needs_keyframe = true;
                 }
                 send(
-                    writer,
+                    outbound,
                     &Message::WindowGeometry(WindowGeometry {
                         window_id: tracked.window_id,
                         x: w.x,
@@ -698,8 +731,7 @@ where
                         height: w.height,
                     }),
                     channel::WINDOW,
-                )
-                .await?;
+                )?;
             }
         }
     }
@@ -710,13 +742,12 @@ where
             encoder.forget(stream.handle);
         }
         send(
-            writer,
+            outbound,
             &Message::WindowClosed(WindowClosed {
                 window_id: gone.window_id,
             }),
             channel::WINDOW,
-        )
-        .await?;
+        )?;
     }
     Ok(())
 }
@@ -738,16 +769,14 @@ where
 /// encoder's output can lag its input by a frame or more, so "captured a frame" and "have
 /// something to send" are not the same event once a codec is doing real work.
 ///
-/// `tick_started` is when this tick fired, taken by the caller before `sync_windows` — a guest
-/// measurement found `capture->encode` costing roughly 6ms more than the encoder's own conversion
-/// and compute could account for, and nobody had checked whether any of that was scheduling delay
-/// inside this loop rather than the capture call itself. `tick_to_capture_us`, logged per window
-/// right before `source.next_frame`, answers that: near-zero for the first window processed each
-/// tick, and rising for later ones exactly to the extent earlier windows' work delayed them —
-/// which is real, attributable cost, not measurement noise.
+/// `tick_started` is when this tick fired, taken by the caller before `sync_windows` — originally
+/// so the diagnostic included lifecycle writes and prior windows' frame writes. Writes now run on
+/// `write_outbound`, so `tick_to_capture_us` no longer measures socket back-pressure. It measures
+/// driver-side scheduling delay before capture: window diffing, outbound-queue reservation, and
+/// earlier windows' capture/encode work on this same tick.
 #[allow(clippy::too_many_arguments)]
-async fn pump_frames<W, WR, E>(
-    writer: &mut WR,
+fn pump_frames<W, E>(
+    outbound: &mpsc::Sender<OutboundChunk>,
     source: &mut W,
     encoder: &mut E,
     streams: &mut HashMap<u32, WindowStream>,
@@ -758,7 +787,6 @@ async fn pump_frames<W, WR, E>(
 ) -> io::Result<()>
 where
     W: WindowSource,
-    WR: AsyncWrite + Unpin,
     E: FrameEncoder,
 {
     // Deterministic order so a window is never starved by map iteration order.
@@ -781,10 +809,18 @@ where
         if stream.show_state == window_show::MINIMIZED {
             continue;
         }
-        // Without acks there is no feedback to pace against, so send every capture and let the
-        // transport apply back-pressure.
+        let Some(permit) = reserve_frame_slot(outbound)? else {
+            // No slot means no commitment to send. Do not capture, submit, or poll: dropping an
+            // encoded H.264 access unit after this point would let the encoder's reference
+            // chain drift away from what the client receives.
+            continue;
+        };
+        // With acks, the budget decides which unacknowledged frame becomes stale when a newer
+        // frame is admitted. The bounded outbound queue is separate: if it had no slot above,
+        // this code never reached capture/encode, so there is no encoded frame to drop.
         if acks_enabled && !stream.budget.has_headroom() {
-            // Still capture: `on_captured` displaces the stale frame rather than queueing.
+            // Still capture: `on_captured` below displaces the oldest unacknowledged frame
+            // rather than queueing this one behind it.
         }
         let tick_to_capture_us = tick_started.elapsed().as_micros() as u64;
         let Some(frame) = source.next_frame(stream.handle) else {
@@ -865,16 +901,69 @@ where
         .encode_body()
         .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
 
-        write_raw(writer, msg_type::FRAME_DATA, stream.video_channel, &body).await?;
+        permit.send(OutboundChunk {
+            msg_type: msg_type::FRAME_DATA,
+            channel: stream.video_channel,
+            body,
+        });
     }
     Ok(())
 }
 
-async fn send<WR: AsyncWrite + Unpin>(writer: &mut WR, msg: &Message, ch: u16) -> io::Result<()> {
+fn reserve_frame_slot(
+    outbound: &mpsc::Sender<OutboundChunk>,
+) -> io::Result<Option<mpsc::Permit<'_, OutboundChunk>>> {
+    match outbound.try_reserve() {
+        Ok(permit) => Ok(Some(permit)),
+        Err(mpsc::error::TrySendError::Full(())) => Ok(None),
+        Err(mpsc::error::TrySendError::Closed(())) => {
+            Err(io::Error::from(io::ErrorKind::BrokenPipe))
+        }
+    }
+}
+
+fn send(outbound: &mpsc::Sender<OutboundChunk>, msg: &Message, ch: u16) -> io::Result<()> {
     let body = msg
         .encode_body()
         .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
-    write_raw(writer, msg.msg_type(), ch, &body).await
+    queue_raw(outbound, msg.msg_type(), ch, body)
+}
+
+fn queue_raw(
+    outbound: &mpsc::Sender<OutboundChunk>,
+    msg_type: u8,
+    channel: u16,
+    body: Vec<u8>,
+) -> io::Result<()> {
+    match outbound.try_send(OutboundChunk {
+        msg_type,
+        channel,
+        body,
+    }) {
+        Ok(()) => Ok(()),
+        Err(mpsc::error::TrySendError::Full(_)) => Err(io::Error::new(
+            io::ErrorKind::WouldBlock,
+            "outbound queue full",
+        )),
+        Err(mpsc::error::TrySendError::Closed(_)) => {
+            Err(io::Error::from(io::ErrorKind::BrokenPipe))
+        }
+    }
+}
+
+async fn write_outbound<WR>(
+    mut writer: WR,
+    mut outbound: mpsc::Receiver<OutboundChunk>,
+) -> io::Result<()>
+where
+    WR: AsyncWrite + Unpin,
+{
+    let mut chunks = ChunkWriter::new();
+    while let Some(msg) = outbound.recv().await {
+        chunks.queue_raw(msg.msg_type, msg.channel, &msg.body)?;
+        chunks.flush(&mut writer).await?;
+    }
+    writer.shutdown().await
 }
 
 /// Microseconds since the session started — the clock every protocol timestamp uses.
@@ -1242,6 +1331,118 @@ mod tests {
     /// timeout itself never comes close to hitting it.
     fn far_deadline() -> Instant {
         Instant::now() + Duration::from_secs(30)
+    }
+
+    fn test_stream(max_frames_in_flight: u8) -> WindowStream {
+        WindowStream {
+            handle: 0x1000,
+            video_channel: channel::VIDEO_BASE,
+            budget: FrameBudget::new(max_frames_in_flight),
+            geometry: (0, 0, 4, 1),
+            title: "test".into(),
+            show_state: window_show::NORMAL,
+            flags: 0,
+            needs_keyframe: true,
+            capture_diag_logged: CAPTURE_DIAGNOSTIC_FRAME_LIMIT,
+        }
+    }
+
+    #[test]
+    fn a_full_outbound_queue_skips_capture_and_encoding() {
+        let (outbound, _rx) = mpsc::channel(1);
+        outbound
+            .try_send(OutboundChunk {
+                msg_type: msg_type::PING,
+                channel: channel::CONTROL,
+                body: Vec::new(),
+            })
+            .unwrap();
+
+        let mut source = FakeSource::one_window(1);
+        let (calls_tx, mut calls_rx) = mpsc::unbounded_channel();
+        let mut encoder = RecordingEncoder::new(calls_tx);
+        let mut streams = HashMap::from([(1, test_stream(1))]);
+
+        pump_frames(
+            &outbound,
+            &mut source,
+            &mut encoder,
+            &mut streams,
+            Instant::now(),
+            Instant::now(),
+            true,
+            oxproto::codec::H264,
+        )
+        .unwrap();
+
+        assert_eq!(
+            source.frames_left, 1,
+            "no send slot means no capture is taken"
+        );
+        assert!(
+            calls_rx.try_recv().is_err(),
+            "no send slot means no encoded access unit is produced and then dropped"
+        );
+        let stream = streams.get(&1).unwrap();
+        assert_eq!(stream.budget.sent(), 0);
+        assert_eq!(stream.budget.dropped(), 0);
+    }
+
+    #[test]
+    fn a_full_frame_budget_retires_oldest_unacked_before_sending_newest() {
+        let (outbound, mut rx) = mpsc::channel(4);
+        let mut source = FakeSource::one_window(2);
+        let mut encoder = NoopEncoder;
+        let mut streams = HashMap::from([(1, test_stream(1))]);
+        let started = Instant::now();
+
+        pump_frames(
+            &outbound,
+            &mut source,
+            &mut encoder,
+            &mut streams,
+            started,
+            Instant::now(),
+            true,
+            oxproto::codec::RAW_BGRA,
+        )
+        .unwrap();
+        let first = rx.try_recv().unwrap();
+        assert_eq!(first.msg_type, msg_type::FRAME_DATA);
+        let Message::FrameData(first_frame) =
+            Message::decode_body(first.msg_type, &first.body).unwrap()
+        else {
+            panic!("expected FrameData")
+        };
+        assert_eq!(first_frame.frame_id, 1);
+
+        pump_frames(
+            &outbound,
+            &mut source,
+            &mut encoder,
+            &mut streams,
+            started,
+            Instant::now(),
+            true,
+            oxproto::codec::RAW_BGRA,
+        )
+        .unwrap();
+        let second = rx.try_recv().unwrap();
+        let Message::FrameData(second_frame) =
+            Message::decode_body(second.msg_type, &second.body).unwrap()
+        else {
+            panic!("expected FrameData")
+        };
+        assert_eq!(second_frame.frame_id, 2);
+
+        let stream = streams.get(&1).unwrap();
+        assert_eq!(stream.budget.sent(), 2);
+        assert_eq!(
+            stream.budget.dropped(),
+            1,
+            "the second admitted frame displaces frame 1 from unacked tracking"
+        );
+        assert_eq!(stream.budget.in_flight(), 1);
     }
 
     #[test]
