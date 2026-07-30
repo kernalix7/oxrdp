@@ -121,6 +121,8 @@ pub struct WindowCapture {
     /// How many frames this instance has captured so far, counted only up to
     /// `DIAGNOSTIC_FRAME_LIMIT`.
     frames_seen: u32,
+    /// Whether the D3D11 device is a real GPU rather than WARP. Gates the GPU NV12 path.
+    hardware: bool,
 }
 
 /// How many frames, per [`WindowCapture`], to log the readback timing split of — the same
@@ -133,7 +135,18 @@ const DIAGNOSTIC_FRAME_LIMIT: u32 = 100;
 impl WindowCapture {
     /// Begin capturing `hwnd`.
     pub fn new(hwnd: HWND) -> WinResult<Self> {
-        let (device, context) = create_d3d_device()?;
+        let (device, context, hardware) = create_d3d_device()?;
+        // Reported once per capture so the first question about GPU-path performance has an
+        // answer in the log rather than requiring a guess about the guest's graphics stack.
+        eprintln!(
+            "oxagent: capture: D3D11 device is {} for {:#x}",
+            if hardware {
+                "hardware"
+            } else {
+                "WARP (software)"
+            },
+            hwnd.0 as isize
+        );
         let d3d_device = winrt_device(&device)?;
 
         // A capture item is created from an HWND through the Win32 interop factory.
@@ -171,6 +184,7 @@ impl WindowCapture {
             pool_size,
             handle: hwnd.0 as isize,
             frames_seen: 0,
+            hardware,
         })
     }
 
@@ -228,7 +242,11 @@ impl WindowCapture {
         // SAFETY: `texture` is valid and `desc` is a valid out-pointer.
         unsafe { texture.GetDesc(&mut desc) };
 
-        if intent == CaptureIntent::GpuNv12Preferred {
+        // Offered only on a real GPU. On a WARP device this "GPU" path is a software video
+        // processor, and a guest measurement found it took `capture->encode` from 3.7 ms to
+        // 49 ms — slower than the CPU loop it exists to replace, because the conversion is still
+        // software and now also allocates an NV12 texture per frame.
+        if intent == CaptureIntent::GpuNv12Preferred && self.hardware {
             if self.frames_seen < DIAGNOSTIC_FRAME_LIMIT {
                 self.frames_seen += 1;
                 eprintln!(
@@ -338,7 +356,13 @@ impl WindowCapture {
 
 /// Create a D3D11 device, preferring the GPU and falling back to WARP (software) so the
 /// agent still runs on a guest without GPU acceleration.
-fn create_d3d_device() -> WinResult<(ID3D11Device, ID3D11DeviceContext)> {
+///
+/// The third element of the result says whether the device is a real GPU. It is load-bearing,
+/// not informational: on a WARP device the "GPU" NV12 conversion is a software video processor,
+/// and a guest measurement found it 13x *slower* than the hand-written CPU loop it replaces —
+/// `capture->encode` went from 3.7 ms to 49 ms. So the GPU path is offered only when the device
+/// is hardware.
+fn create_d3d_device() -> WinResult<(ID3D11Device, ID3D11DeviceContext, bool)> {
     let mut last = None;
     for driver in [D3D_DRIVER_TYPE_HARDWARE, D3D_DRIVER_TYPE_WARP] {
         for flags in [
@@ -367,7 +391,8 @@ fn create_d3d_device() -> WinResult<(ID3D11Device, ID3D11DeviceContext)> {
             match result {
                 Ok(()) => {
                     if let (Some(device), Some(context)) = (device, context) {
-                        return Ok((device, context));
+                        let hardware = driver == D3D_DRIVER_TYPE_HARDWARE;
+                        return Ok((device, context, hardware));
                     }
                 }
                 Err(e) => last = Some(e),
