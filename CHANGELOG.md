@@ -63,6 +63,44 @@ where the same setup previously produced twelve to twenty-eight rejections. The 
 log carries the direct proof that B-frames are gone — every delta slice now reports
 `ref_idc=3`, where the rejected frames had been `ref_idc=0` non-reference pictures.
 
+### The transport tail is connection warm-up, not steady state (2026-07-30)
+
+Localising the tail in time answered a question the aggregate percentiles could not. 172 frames,
+one-second buckets, one window:
+
+```
+  t/s  frames  out   e->a p50   e->a max   c->e p50   total p50
+    0       9     7      80323      84735       9119      100665
+    1      21     1       9778      80329       7290       24331
+    2      19     0       1018       9669       6888       15475
+    3      21     0       1123      41454       6169       14716
+   ...
+    9      18     0        991      41528       8985       16662
+8 outliers, in 2 of 11 buckets; the heaviest holds 7
+slowest frames: w1/f1 84735, w1/f4 81323, w1/f5 80473, w1/f8 80470, w1/f10 80329, ...
+```
+
+Every outlier is in the first second and a half, and the named frames are the session's **first
+ten**. After that, `encode->arrival` sits at about **1 ms** with no outlier in nine seconds — and
+`capture->encode` is unremarkable through the burst, so it is the transport stage specifically,
+not the pipeline stalling together.
+
+So the p95 and p99 figures quoted for `encode->arrival` all week were connection warm-up sampled
+by short runs, not a steady-state property. That is why six explanations inside the code all failed
+to account for it: none of them was about the first ten frames of a TCP connection.
+
+Two phenomena, not one, and the second is easy to miss: the startup burst at ~80 ms, and a
+recurring ~40 ms spike visible in the `max` column of nearly every later bucket. Those later
+spikes count as zero outliers only because the threshold — the timeline's own p95 — is itself
+inflated by the burst. They are the thing left to explain.
+
+The benchmark had to be fixed twice to get here, and both failures are worth recording because
+they produced confident-looking numbers. `timeout /t 1` repaints once a second, so a 60-second run
+yielded 61 frames with every frame isolated — no back-to-back condition, and too few samples to
+distinguish a clustered tail from a spread one. `ping -w` as a sub-second sleep was worse, since
+its real delay depends on how the unreachable address fails. The committed benchmark paces with
+PowerShell's `Start-Sleep -Milliseconds`, which means what it says.
+
 ### The transport tail is not ours (2026-07-30)
 
 The agent now measures its own half of the one stage nothing had explained. `encode->arrival`

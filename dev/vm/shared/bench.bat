@@ -1,17 +1,12 @@
 @echo off
-rem A repaint benchmark with a *fixed* rate and a *fixed* amount of change per frame.
+rem A repaint benchmark at a fixed rate with a fixed amount of change per frame.
 rem
-rem The previous benchmark was `for /L ... echo`, whose output rate follows guest scheduling and
-rem whose per-frame delta depends on how much text scrolled. Two runs were therefore not the same
-rem workload, and run-to-run variance swamped every effect worth measuring. This one repaints a
-rem constant-width line on a timer, so the encoded size per frame stays roughly constant and the
-rem rate is set by us rather than by the scheduler.
+rem Rate matters as much as constancy, and cmd cannot pace below a second: `timeout /t 1` gave 61
+rem frames in a 60 s run where ~400 were needed to tell a clustered latency tail from a spread one,
+rem and every frame arrived isolated rather than back-to-back. `ping -w` as a sub-second sleep was
+rem worse — its actual delay depends on how the unreachable address fails.
 rem
-rem `timeout /t 1` is one second of real waiting, not a busy loop, so the guest is not also being
-rem loaded by the thing measuring it.
-setlocal enabledelayedexpansion
-set LINE=OXRDP BENCH ################################################################
-:loop
-echo %LINE% !RANDOM!
-timeout /t 1 /nobreak >nul
-goto loop
+rem PowerShell's Start-Sleep takes milliseconds and means it, so this repaints ten times a second
+rem without spinning. Do not "simplify" this back into a cmd loop.
+start "" powershell -NoExit -Command "while ($true) { Write-Host ('OXRDP BENCH ################################################################ ' + (Get-Random)); Start-Sleep -Milliseconds 100 }"
+exit /b 0
