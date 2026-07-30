@@ -63,6 +63,49 @@ where the same setup previously produced twelve to twenty-eight rejections. The 
 log carries the direct proof that B-frames are gone — every delta slice now reports
 `ref_idc=3`, where the rejected frames had been `ref_idc=0` non-reference pictures.
 
+### The transport tail is not ours (2026-07-30)
+
+The agent now measures its own half of the one stage nothing had explained. `encode->arrival`
+spans from the encoder finishing to the client reading a frame, and that contains the agent's path
+to the socket as well as the network. Split agent-side, no wire change, 243 frames:
+
+```
+queue_wait_us        p50    76 us   p95   240   max 6,149
+socket_write_us      p50   170 us   p95   617   max 2,420
+encode_to_write_us   p50   252 us   p95 1,248   max 7,088
+```
+
+The whole "the agent still had it" span is a quarter of a millisecond at p50 and 1.2 ms at p95.
+The client observes that same stage at p50 955 us and p95 ~9 ms. **Roughly 7.7 ms of the p95
+happens after the socket write returned** — in the TCP buffer, the port forward, and the client's
+read.
+
+That is the signal predicted in advance when the measurement was built: a small agent-side span
+beside a large observed one is what it looks like when the tail lives between the syscall
+returning and the bytes actually moving. It closes the question with positive evidence rather than
+by elimination, and it agrees with the independent clue already on record — ping/pong round trips,
+tiny control messages that no frame-size, flow-control or Nagle mechanism can touch, ranged from
+1 ms to 21 ms across runs and once implied ~100 ms.
+
+Six explanations inside this project's own code were eliminated to get here, each by measurement:
+keyframe size, flow-control backlog, the client's read pauses, Nagle alone, the agent's send path,
+and now the agent's whole pre-wire span. **The remaining latency tail belongs to the environment —
+a QEMU port forward over passt, on a WiFi host where the guest cannot have its own L2 address, so
+there is no direct path to compare against.** Measuring oxrdp's real transport latency needs a
+different host, and until then `encode->arrival` and the end-to-end total are bounded below by our
+code and above by the environment.
+
+One caveat kept deliberately: the agent's span and the client's are from adjacent runs rather than
+the same one, so the 7.7 ms is a difference between distributions rather than per-frame. Frame-id
+correlation is in the logs and would tighten it; the conclusion does not rest on the exact figure,
+because the agent's span never exceeds 7 ms even at its maximum while the client's p99 reaches 36.
+
+Also fixed here: the agent's session check asked `WTSGetActiveConsoleSessionId`, which answers who
+owns the physical console rather than whether this session has a desktop that can receive input.
+On this guest that produced a false alarm — dockur's autologon owns session 1 and an RDP client
+takes it over — so it warned that input could not work while input demonstrably worked. It now
+queries its own session's connect state and explains the topology instead of alarming about it.
+
 ### A rebuilt guest, a controlled benchmark, and the GPU path gated (2026-07-30)
 
 The guest had accumulated twenty-odd windows and stuck dialogs across two days of testing, and
