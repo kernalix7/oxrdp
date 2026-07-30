@@ -15,8 +15,14 @@ use oxsec::AgentIdentity;
 use tokio::net::TcpListener;
 use tokio::sync::Semaphore;
 use tokio_rustls::TlsAcceptor;
+use windows::core::PWSTR;
 use windows::Win32::Foundation::HWND;
-use windows::Win32::System::RemoteDesktop::{ProcessIdToSessionId, WTSGetActiveConsoleSessionId};
+use windows::Win32::System::RemoteDesktop::{
+    ProcessIdToSessionId, WTSActive, WTSConnectQuery, WTSConnectState, WTSConnected,
+    WTSDisconnected, WTSDown, WTSFreeMemory, WTSGetActiveConsoleSessionId, WTSIdle, WTSInit,
+    WTSListen, WTSQuerySessionInformationW, WTSReset, WTSShadow, WTS_CONNECTSTATE_CLASS,
+    WTS_CURRENT_SERVER_HANDLE,
+};
 use windows::Win32::System::Threading::GetCurrentProcessId;
 use windows::Win32::UI::HiDpi::{
     SetProcessDpiAwarenessContext, DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2,
@@ -58,17 +64,34 @@ fn set_dpi_awareness() {
     }
 }
 
-/// Log which Windows session this process is running in, and whether it is the one with the
-/// interactive desktop.
+/// Log which Windows session this process is running in, and whether that session's desktop can
+/// actually receive injected input.
 ///
 /// `SendInput` only ever reaches windows in the calling process's own session — there is no
-/// cross-session variant. If this process's session does not match the active console session,
-/// every keyboard/mouse injection this agent will ever attempt is doomed before it even calls
-/// `SendInput`, and this is exactly the shape of setup that produces that: a guest agent
-/// installed as a Windows service runs in Session 0 by default (Session 0 Isolation, since
-/// Vista), completely separate from the interactive user's session, with no visible desktop of
-/// its own to inject into. Purely informational — a mismatch does not stop the agent from
-/// starting, since it affects only input, not capture or anything else this process does.
+/// cross-session variant — so the question that matters is "does *this* session have an
+/// interactive desktop attached", not "is this session the one on the physical console"
+/// (`WTSGetActiveConsoleSessionId`, this function's previous check). Those two questions have the
+/// same answer only on a machine nobody has ever remoted into. In this project's own topology
+/// they do not: dockur's autologon owns session 1, and an RDP client reconnecting as the same
+/// user *takes over* session 1 rather than creating a new one, leaving a fresh, unused console
+/// session behind. A process does not move sessions, so an agent already running in session 1
+/// stays there — in the session the user is actually driving — while `WTSGetActiveConsoleSessionId`
+/// now reports the different, idle session left behind. Comparing against the console session
+/// flagged exactly that as broken; it was the working case the whole time.
+///
+/// The right question is `WTSQuerySessionInformation(WTSConnectState)` on this process's own
+/// session (see [`session_connect_state`]): [`WTSActive`] — "a user is logged on... actively
+/// connected to the device" — is the one state input can reach, on the console or over RDP
+/// alike, and it says so directly instead of by comparing against a session id that means
+/// something else. Every other state means there is no live desktop on the other end of
+/// `SendInput` — most usefully [`WTSDisconnected`], which per its own documentation covers not
+/// only a disconnected RDP session but a *locked* one ("such as when the user has chosen to exit
+/// to the lock screen"), and Session 0, which never reports `Active` because no interactive user
+/// is ever logged onto it — exactly the case of a guest agent installed as a true Windows service
+/// (Session 0 Isolation, since Vista).
+///
+/// Purely informational either way — a bad state does not stop the agent from starting, since it
+/// affects only input, not capture or anything else this process does.
 fn log_session_context() {
     // SAFETY: takes no arguments and cannot fail.
     let pid = unsafe { GetCurrentProcessId() };
@@ -76,16 +99,157 @@ fn log_session_context() {
     // SAFETY: `pid` is this process's own id, valid for the lifetime of this call;
     // `own_session` is a local out-parameter.
     let resolved = unsafe { ProcessIdToSessionId(pid, &mut own_session) }.is_ok();
-    // SAFETY: takes no arguments and cannot fail.
-    let active_session = unsafe { WTSGetActiveConsoleSessionId() };
     if !resolved {
         eprintln!("oxagent: session: could not resolve this process's session id");
-    } else if own_session == active_session {
-        eprintln!("oxagent: session: running in session {own_session}, the active console session");
+        return;
+    }
+
+    // `WTS_CONNECTSTATE_CLASS`'s variants (`WTSActive`, `WTSDisconnected`, ...) are named after
+    // the Win32 API, not Rust's `UPPER_SNAKE_CASE` convention for constants, so matching them as
+    // bare pattern identifiers trips `non_upper_case_globals` — rustc's guard against a pattern
+    // that looks like it binds a fresh variable but is actually comparing against a constant.
+    // Comparing with `==` sidesteps that entirely and is no less clear.
+    let Some(state) = session_connect_state(own_session) else {
+        eprintln!(
+            "oxagent: session: could not query connect state for session {own_session}; input \
+             health is unknown"
+        );
+        return;
+    };
+
+    if state == WTSActive {
+        // Still worth a note when this differs from the console session: that is exactly the
+        // RDP-takeover topology this function's doc explains, not a problem, and an operator
+        // staring at "session 1, but session 3 is the console" deserves that context rather
+        // than silence about it.
+        // SAFETY: takes no arguments and cannot fail.
+        let active_session = unsafe { WTSGetActiveConsoleSessionId() };
+        if own_session == active_session {
+            eprintln!(
+                "oxagent: session: running in session {own_session}, WTSConnectState=Active — \
+                 this is also the active console session"
+            );
+        } else {
+            eprintln!(
+                "oxagent: session: running in session {own_session}, WTSConnectState=Active — \
+                 input can reach this session's desktop (the active console session is \
+                 {active_session} instead; that differs whenever a client has taken this \
+                 session over via RDP, which is expected here, not broken)"
+            );
+        }
     } else {
         eprintln!(
-            "oxagent: session: running in session {own_session}, but the active console session is {active_session} — synthetic keyboard/mouse input cannot reach a different session's desktop"
+            "oxagent: session: running in session {own_session}, WTSConnectState={} — {} — \
+             synthetic keyboard/mouse input will not reach a real desktop",
+            connect_state_name(state),
+            connect_state_reason(state)
         );
+    }
+}
+
+/// Query `session_id`'s [`WTS_CONNECTSTATE_CLASS`] via `WTSQuerySessionInformationW`, or `None`
+/// if the query itself fails — the info class has existed since Vista so this is not expected,
+/// but this diagnostic should degrade to silence rather than assume a state it never observed.
+fn session_connect_state(session_id: u32) -> Option<WTS_CONNECTSTATE_CLASS> {
+    let mut buffer = PWSTR::null();
+    let mut bytes_returned: u32 = 0;
+    // SAFETY: `WTS_CURRENT_SERVER_HANDLE` is a sentinel value meaning "the local RD Session
+    // Host", not a real handle, so there is nothing here to validate or close; `session_id` was
+    // just resolved by `ProcessIdToSessionId` for this very process; `buffer` and
+    // `bytes_returned` are valid, uniquely-owned out-parameters for the duration of this call.
+    // On success the call allocates the buffer `buffer` ends up pointing to, which must be
+    // released with `WTSFreeMemory` — done by `WtsBuffer`'s `Drop`, below, once constructed.
+    let ok = unsafe {
+        WTSQuerySessionInformationW(
+            WTS_CURRENT_SERVER_HANDLE,
+            session_id,
+            WTSConnectState,
+            &mut buffer,
+            &mut bytes_returned,
+        )
+    }
+    .is_ok();
+    if !ok || buffer.is_null() {
+        return None;
+    }
+    let buffer = WtsBuffer(buffer);
+    if (bytes_returned as usize) < std::mem::size_of::<i32>() {
+        return None;
+    }
+    // SAFETY: the `WTSConnectState` info class returns a single `WTS_CONNECTSTATE_CLASS` (a
+    // 4-byte value) in the buffer just allocated; `bytes_returned`, checked above, covers at
+    // least that many bytes, and `buffer` (via `WtsBuffer`) keeps the allocation alive for this
+    // read.
+    let state = unsafe { *(buffer.0.as_ptr() as *const WTS_CONNECTSTATE_CLASS) };
+    Some(state)
+}
+
+/// Frees the buffer `WTSQuerySessionInformationW` allocates, on every return path out of
+/// [`session_connect_state`] once constructed — mirrors `appid::ProcessHandleGuard`.
+struct WtsBuffer(PWSTR);
+
+impl Drop for WtsBuffer {
+    fn drop(&mut self) {
+        // SAFETY: `self.0` was allocated by the successful `WTSQuerySessionInformationW` call in
+        // `session_connect_state`, the only place this type is constructed, and is owned solely
+        // by this guard.
+        unsafe {
+            WTSFreeMemory(self.0.as_ptr().cast());
+        }
+    }
+}
+
+/// A short name for `state`, for logging — the identifier the constant is actually named, not
+/// its raw `i32`, which by itself says nothing to whoever is reading agent stderr. `==`
+/// comparisons rather than pattern matching — see the comment in `log_session_context`.
+fn connect_state_name(state: WTS_CONNECTSTATE_CLASS) -> &'static str {
+    if state == WTSActive {
+        "Active"
+    } else if state == WTSConnected {
+        "Connected"
+    } else if state == WTSConnectQuery {
+        "ConnectQuery"
+    } else if state == WTSShadow {
+        "Shadow"
+    } else if state == WTSDisconnected {
+        "Disconnected"
+    } else if state == WTSIdle {
+        "Idle"
+    } else if state == WTSListen {
+        "Listen"
+    } else if state == WTSReset {
+        "Reset"
+    } else if state == WTSDown {
+        "Down"
+    } else if state == WTSInit {
+        "Init"
+    } else {
+        "Unknown"
+    }
+}
+
+/// Why `state` (never [`WTSActive`] — that case has its own message above) means input cannot
+/// reach a real desktop, in terms drawn from `WTS_CONNECTSTATE_CLASS`'s own documentation rather
+/// than guessed at.
+fn connect_state_reason(state: WTS_CONNECTSTATE_CLASS) -> &'static str {
+    if state == WTSDisconnected {
+        "signed in but not connected (a disconnected RDP session, or a console session locked to \
+         the lock screen) — nothing is attached to receive what gets drawn there"
+    } else if state == WTSListen {
+        "a listener session waiting for a connection — no user is logged on"
+    } else if state == WTSIdle {
+        "waiting for a client to connect — no user is logged on yet"
+    } else if state == WTSInit || state == WTSConnectQuery || state == WTSReset {
+        "still transitioning towards a connected state"
+    } else if state == WTSDown {
+        "down due to an error"
+    } else if state == WTSShadow {
+        "shadowing another session rather than hosting an interactive one of its own"
+    } else if state == WTSConnected {
+        "connected but not (yet) reported active — treated as not-yet-safe rather than assumed \
+         to be"
+    } else {
+        "not in the Active state"
     }
 }
 

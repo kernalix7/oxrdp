@@ -171,6 +171,9 @@ struct WindowStream {
     /// How many `tick_to_capture_us` samples have been logged for this window so far, counted
     /// only up to `CAPTURE_DIAGNOSTIC_FRAME_LIMIT` — see `pump_frames`.
     capture_diag_logged: u32,
+    /// How many `encode_to_write_us` samples have been logged for this window so far, counted
+    /// only up to `TRANSPORT_DIAGNOSTIC_FRAME_LIMIT` — see `pump_frames` and `write_outbound`.
+    transport_diag_logged: u32,
 }
 
 /// How many `tick_to_capture_us` samples, per window, to log — the same bounded,
@@ -178,6 +181,14 @@ struct WindowStream {
 /// own constant rather than shared: this one lives on the platform-independent side and measures
 /// scheduling delay within `pump_frames` itself, not anything about the encoder.
 const CAPTURE_DIAGNOSTIC_FRAME_LIMIT: u32 = 100;
+
+/// How many `encode_to_write_us` samples, per window, to log — the same bounded,
+/// permanent-diagnostic shape as `CAPTURE_DIAGNOSTIC_FRAME_LIMIT` above and
+/// `crate::win::encode`'s `DIAGNOSTIC_FRAME_LIMIT`, kept as its own constant because it measures
+/// a third, still different stage: the gap between the encoder (or, for `RAW_BGRA`, capture)
+/// handing back a frame's bytes and this process handing those bytes to the socket — see
+/// `TransportDiag`.
+const TRANSPORT_DIAGNOSTIC_FRAME_LIMIT: u32 = 100;
 
 /// Bounded post-handshake outbound queue, in protocol messages/chunked bodies.
 ///
@@ -193,6 +204,27 @@ struct OutboundChunk {
     msg_type: u8,
     channel: u16,
     body: Vec<u8>,
+    /// Set only for the first `TRANSPORT_DIAGNOSTIC_FRAME_LIMIT` `FrameData` chunks per window —
+    /// see [`TransportDiag`] and `write_outbound`.
+    diag: Option<TransportDiag>,
+}
+
+/// Correlates one `FrameData` chunk back to the frame it carries and marks when its bytes were
+/// ready, so `write_outbound` can log how long the agent itself held a frame after encoding —
+/// queued behind other outbound work, then however long the socket write itself took — split
+/// from everything past that point (network transit, the client's own read), which this process
+/// has no way to see. `encode->arrival`, measured client-side, has been the one unexplained stage
+/// in every latency report so far; this narrows it to "the agent still had it" vs. "the wire had
+/// it" without changing the wire format.
+#[derive(Debug)]
+struct TransportDiag {
+    window_id: u32,
+    frame_id: u64,
+    /// When the encoder (or, for `RAW_BGRA`, capture) finished producing this frame's bytes —
+    /// the same instant `FrameData.encoded_us` is derived from, kept as an `Instant` rather than
+    /// the wire's session-relative microseconds so `write_outbound` can diff it directly against
+    /// its own clock reading without reconstructing the session's start offset.
+    encode_done_at: Instant,
 }
 
 /// Tracks which kinds of input this session has already logged the first occurrence of.
@@ -665,6 +697,7 @@ where
                     // itself is new. `RAW_BGRA` ignores this field entirely.
                     needs_keyframe: true,
                     capture_diag_logged: 0,
+                    transport_diag_logged: 0,
                 },
             );
             continue;
@@ -927,6 +960,10 @@ where
                 // payload as the fallback frame.
                 continue;
             };
+        // Taken right where `encoded_us` above is finalized (H.264: just after `encoder.poll()`
+        // returned; `RAW_BGRA`: capture itself, since there is no separate encode step) — see
+        // `TransportDiag::encode_done_at`.
+        let encode_done_at = Instant::now();
 
         let frame_id = stream.budget.on_captured();
         let body = Message::FrameData(FrameData {
@@ -943,10 +980,22 @@ where
         .encode_body()
         .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
 
+        let diag = if stream.transport_diag_logged < TRANSPORT_DIAGNOSTIC_FRAME_LIMIT {
+            stream.transport_diag_logged += 1;
+            Some(TransportDiag {
+                window_id: id,
+                frame_id,
+                encode_done_at,
+            })
+        } else {
+            None
+        };
+
         permit.send(OutboundChunk {
             msg_type: msg_type::FRAME_DATA,
             channel: stream.video_channel,
             body,
+            diag,
         });
     }
     Ok(())
@@ -981,6 +1030,7 @@ fn queue_raw(
         msg_type,
         channel,
         body,
+        diag: None,
     }) {
         Ok(()) => Ok(()),
         Err(mpsc::error::TrySendError::Full(_)) => Err(io::Error::new(
@@ -1002,8 +1052,39 @@ where
 {
     let mut chunks = ChunkWriter::new();
     while let Some(msg) = outbound.recv().await {
+        // As soon as this chunk is off the channel: everything before this point is time the
+        // frame spent queued behind other outbound work and this task's own scheduling
+        // (`queue_wait_us` below); everything from here to `flush` completing is the write
+        // itself (`socket_write_us`).
+        let dequeued_at = Instant::now();
+        let diag = msg.diag.as_ref();
         chunks.queue_raw(msg.msg_type, msg.channel, &msg.body)?;
         chunks.flush(&mut writer).await?;
+        // Bracketed at the write's *completion*, not when it started: a timestamp taken before
+        // `flush` only proves the call was made, not that any byte left this process. Even at
+        // completion this proves only that the bytes reached TLS and a userspace socket buffer,
+        // not that they reached the wire — `flush` awaits `AsyncWrite::write`/`flush` on the TLS
+        // stream, which is as far downstream as this process can honestly observe. `window_id`
+        // and `frame_id` (the protocol ids), not the native handle the other capture/encode
+        // diagnostics key by, because this one exists to be lined up against the client's own
+        // per-frame report, and the client has never heard of a Win32 `HWND`.
+        if let Some(diag) = diag {
+            let write_done_at = Instant::now();
+            let queue_wait_us = dequeued_at
+                .saturating_duration_since(diag.encode_done_at)
+                .as_micros() as u64;
+            let socket_write_us = write_done_at
+                .saturating_duration_since(dequeued_at)
+                .as_micros() as u64;
+            let encode_to_write_us = write_done_at
+                .saturating_duration_since(diag.encode_done_at)
+                .as_micros() as u64;
+            eprintln!(
+                "oxagent: transport: window_id={} frame_id={} queue_wait_us={queue_wait_us} \
+                 socket_write_us={socket_write_us} encode_to_write_us={encode_to_write_us}",
+                diag.window_id, diag.frame_id
+            );
+        }
     }
     writer.shutdown().await
 }
@@ -1378,6 +1459,7 @@ mod tests {
             flags: 0,
             needs_keyframe: true,
             capture_diag_logged: CAPTURE_DIAGNOSTIC_FRAME_LIMIT,
+            transport_diag_logged: TRANSPORT_DIAGNOSTIC_FRAME_LIMIT,
         }
     }
 
@@ -1389,6 +1471,7 @@ mod tests {
                 msg_type: msg_type::PING,
                 channel: channel::CONTROL,
                 body: Vec::new(),
+                diag: None,
             })
             .unwrap();
 
