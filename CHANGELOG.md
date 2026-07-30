@@ -63,6 +63,47 @@ where the same setup previously produced twelve to twenty-eight rejections. The 
 log carries the direct proof that B-frames are gone — every delta slice now reports
 `ref_idc=3`, where the rejected frames had been `ref_idc=0` non-reference pictures.
 
+### A rebuilt guest, a controlled benchmark, and the GPU path gated (2026-07-30)
+
+The guest had accumulated twenty-odd windows and stuck dialogs across two days of testing, and
+every measurement was being taken against that. Rebuilt from scratch — which also validated the
+OEM self-provisioning path for the first time: dockur copied `dev/vm/oem/` into the guest, ran
+`install.bat` unattended, and the agent came up on its own with a scheduled task, its identity
+generated, listening in the interactive session. That path had been written and marked untestable
+against the old guest.
+
+Two things follow from measuring on a clean guest with a fixed-rate benchmark instead of a `cmd`
+loop whose output rate followed the guest scheduler.
+
+**The GPU NV12 conversion is 7.5x slower here, and is now gated on the device being real.**
+
+```
+capture->encode   CPU path   p50  6,542 us
+                  GPU path   p50 49,224 us
+END TO END        CPU path   p50 13,195 us
+                  GPU path   p50 59,628 us
+```
+
+This guest has no GPU passthrough, so `create_d3d_device` falls back to WARP and the "GPU" video
+processor is software — slower than the hand-written CPU loop, and now also allocating an NV12
+texture per frame. The path is offered only on a hardware device, and which device was chosen is
+logged, because until now the code fell back to WARP with nothing to say so. The conversion
+itself is correct and will pay on a real GPU; what it lacked was any notion that "GPU" might not
+mean a GPU.
+
+**The noise floor collapsed, which makes the numbers usable.** Within one run, `encode->arrival`
+p50 now varies 1.2x and the frame rate 1.0x, against 3x a day earlier. A difference larger than
+1.2x is now a signal rather than something the environment could have produced on its own — and
+the earlier conclusion that four in-code explanations for the transport tail were all wrong holds
+up better for it.
+
+One finding from the rebuild worth recording on its own: the agent's session diagnostic fired with
+`running in session 1, but the active console session is 3`. That is a false alarm in this
+topology — dockur's autologon owns session 1 and an RDP client reconnecting as the same user takes
+it over, leaving a fresh console session behind — but the underlying point is real: an agent
+started by a logon task is in whichever session logged on, and `WTSGetActiveConsoleSessionId` is
+the wrong question to ask when the user is on RDP.
+
 ### Sends off the tick loop, and the tail is the VM's port forward (2026-07-30)
 
 `drive()` handled each tick in one task, awaiting socket writes, so a blocked send delayed the
