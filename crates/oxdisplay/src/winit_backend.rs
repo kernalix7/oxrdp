@@ -410,7 +410,9 @@ impl DisplayBackend for WinitBackendAdapter<'_> {
         let Some(entry) = self.inner.windows.get(&remote.window_id) else {
             return Ok(());
         };
-        if let Some(rgba) = argb_to_rgba(&icon.argb, icon.width, icon.height) {
+        // Not `bgra_premul_to_rgba`, despite the identical byte order: an icon's alpha is straight
+        // and a cursor's is premultiplied, so the two paths must not be merged.
+        if let Some(rgba) = bgra_to_rgba(&icon.bgra, icon.width, icon.height) {
             if let Ok(icon) = Icon::from_rgba(rgba, u32::from(icon.width), u32::from(icon.height)) {
                 entry.window.set_window_icon(Some(icon));
             }
@@ -634,7 +636,12 @@ fn x11_window_id(window: &Window) -> Option<u32> {
     }
 }
 
-fn argb_to_rgba(data: &[u8], width: u16, height: u16) -> Option<Vec<u8>> {
+/// `WindowIcon`'s payload to what winit's [`Icon`] wants.
+///
+/// The source is BGRA8 in memory order with **straight** alpha (`OXPROTO.md`, `WindowIcon`) — the
+/// two ways this differs from its sibling below, and both matter. `CursorShape` is premultiplied
+/// and an icon is not, so un-premultiplying here would lighten every semi-transparent pixel.
+fn bgra_to_rgba(data: &[u8], width: u16, height: u16) -> Option<Vec<u8>> {
     let expected = usize::from(width)
         .checked_mul(usize::from(height))?
         .checked_mul(4)?;
@@ -643,7 +650,7 @@ fn argb_to_rgba(data: &[u8], width: u16, height: u16) -> Option<Vec<u8>> {
     }
     let mut out = Vec::with_capacity(data.len());
     for px in data.chunks_exact(4) {
-        out.extend_from_slice(&[px[1], px[2], px[3], px[0]]);
+        out.extend_from_slice(&[px[2], px[1], px[0], px[3]]);
     }
     Some(out)
 }
@@ -752,10 +759,25 @@ mod tests {
         assert!(!ledger.take_if_echo(now + Duration::from_millis(11), 7, geometry));
     }
 
+    /// Written against `WindowIcon`'s documented byte order rather than against its old field
+    /// name: the name said ARGB, the payload has always been BGRA, and reading it as ARGB put
+    /// green where red belongs and the blue channel into alpha.
     #[test]
-    fn argb_to_rgba_reorders_channels_and_rejects_wrong_lengths() {
-        assert_eq!(argb_to_rgba(&[4, 1, 2, 3], 1, 1), Some(vec![1, 2, 3, 4]));
-        assert_eq!(argb_to_rgba(&[4, 1, 2], 1, 1), None);
+    fn bgra_to_rgba_reorders_channels_and_rejects_wrong_lengths() {
+        // Blue 1, green 2, red 3, alpha 4 in, red-green-blue-alpha out.
+        assert_eq!(bgra_to_rgba(&[1, 2, 3, 4], 1, 1), Some(vec![3, 2, 1, 4]));
+        // The exact input the old test asserted the wrong answer for, kept so the correction is
+        // legible: as BGRA it is blue 4, green 1, red 2, alpha 3, which is [2, 1, 4, 3] as RGBA.
+        // The bug returned [1, 2, 3, 4] — the alpha byte becoming blue is what made icons opaque
+        // in the wrong places rather than merely mis-tinted.
+        assert_eq!(bgra_to_rgba(&[4, 1, 2, 3], 1, 1), Some(vec![2, 1, 4, 3]));
+        assert_eq!(bgra_to_rgba(&[1, 2, 3], 1, 1), None);
+        // Straight alpha, unlike `CursorShape`: a semi-transparent pixel passes through
+        // untouched, where un-premultiplying it would brighten every channel.
+        assert_eq!(
+            bgra_to_rgba(&[10, 20, 30, 128], 1, 1),
+            Some(vec![30, 20, 10, 128])
+        );
     }
 
     #[test]

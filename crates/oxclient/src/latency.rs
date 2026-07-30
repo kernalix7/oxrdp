@@ -33,8 +33,15 @@
 //!
 //! A mean hides the stalls, and the stalls are what a remote desktop feels like. p50 says what
 //! it is usually like; p99 and the maximum say what makes someone complain.
+//!
+//! # Percentiles have no time in them
+//!
+//! `encode->arrival p50 955, p99 35693` is the same report whether one frame in twenty is late
+//! all run long or every late frame landed inside the same second. Those are different findings
+//! and different next moves, so the instrument keeps a per-frame timeline as well as the
+//! percentiles, and [`LatencyMonitor::report`] slices it by time — see [`Completed`].
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, VecDeque};
 
 use oxproto::latency::Samples;
 
@@ -55,6 +62,46 @@ const MAX_IN_FLIGHT: usize = 256;
 /// Used only to label samples: at or above this, the agent was waiting on this client rather
 /// than the other way round.
 const AGENT_IN_FLIGHT_BUDGET: usize = 2;
+
+/// Which percentile of `encode->arrival` counts as the tail being localised.
+///
+/// p95 rather than p99 because the count is the whole measurement: p95 of a hundred frames is
+/// five outliers, which can be seen to cluster or not, while p99 is one and cannot. It also makes
+/// the expected rate a stated quantity — one frame in twenty — so a bucket holding more than that
+/// is a deviation from something rather than from an impression.
+const OUTLIER_PERCENTILE: u8 = 95;
+
+/// Frames needed before the tail is localised at all.
+///
+/// Below this the threshold is a nearest-rank percentile of too few samples, so "over the p95"
+/// means "the largest one or two", and bucketing that says nothing.
+const MIN_LOCALISE_FRAMES: usize = 40;
+
+/// Bucket widths the timeline may be sliced at, finest first.
+///
+/// Deliberately not the reporting interval: reports are ten seconds apart, and a stage whose
+/// median is a millisecond cannot have a 35 ms spike localised inside a ten-second bucket. The
+/// finest width that keeps the table within [`MAX_TAIL_ROWS`] is used, so a short run gets
+/// per-second resolution and a long one stays readable.
+const TAIL_BUCKETS_US: [u64; 7] = [
+    1_000_000,
+    2_000_000,
+    5_000_000,
+    10_000_000,
+    30_000_000,
+    60_000_000,
+    300_000_000,
+];
+
+/// Most rows the timeline table may print. A table nobody reads localises nothing.
+const MAX_TAIL_ROWS: usize = 16;
+
+/// How many slow frames are named for joining against the agent's log.
+///
+/// The threshold makes one frame in twenty an outlier, so a full window's worth would be a hundred
+/// ids. These are named worst first, because the point is to pick a few to look up rather than to
+/// enumerate them.
+const MAX_NAMED_OUTLIERS: usize = 12;
 
 /// One frame's journey, in microseconds.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -101,6 +148,20 @@ struct Partial {
     arrived_us: u64,
     decoded_us: Option<u64>,
     keyframe: bool,
+    bytes: u64,
+    /// Agent clock: since the previous frame of this window finished encoding. `None` for the
+    /// first frame of a window.
+    ///
+    /// The difference between two readings of the agent's clock, so it is exact, and — the point
+    /// of recording it — it cannot contain this frame's own lateness. A large one means the agent
+    /// had nothing new to send, which is what an idle stream looks like from here.
+    encode_gap_us: Option<u64>,
+    /// Client clock: since the previous frame of this window arrived. `None` for the first frame.
+    ///
+    /// This one *does* contain the frame's own lateness, since a frame that arrives 35 ms late
+    /// opens a 35 ms larger gap behind it. Kept next to `encode_gap_us` because the difference
+    /// between the two is exactly that lateness.
+    arrival_gap_us: Option<u64>,
     /// How many frames this client had received but not yet presented when this one arrived.
     ///
     /// The agent may hold only `max_in_flight` unacknowledged frames (`OXPROTO.md` §12, default
@@ -159,6 +220,47 @@ impl WindowLatency {
     }
 }
 
+/// One finished frame, kept so the run can be sliced by time after the fact.
+///
+/// The `Samples` above answer "how slow was this stage"; they cannot answer "was it slow at one
+/// moment or throughout", because a percentile discards the order the samples arrived in. This
+/// keeps that order, for the most recent [`SAMPLE_WINDOW`] frames, and every field is here because
+/// a bucket of them has to be able to answer one question:
+///
+/// - `presented_us` — which bucket the frame belongs to.
+/// - the four stages and the total — what the *rest* of the pipeline was doing in that bucket. A
+///   spike in one stage while everything else is normal is a different animal from the whole
+///   pipeline stalling together, and only a per-bucket view of all of them tells those apart.
+/// - `bytes` and `keyframe` — whether the slow frames were the big ones. If they were, that is
+///   transmission time; if size is flat across the outliers, it is a stall that did not care what
+///   was in the frame.
+/// - the two gaps — whether the stream was idle rather than stalled.
+///
+/// Kept across windows rather than per window on purpose: "did everything stall at this moment"
+/// is a question about the run, and a bucket where *both* windows went slow is stronger evidence
+/// of a moment than one where only one did.
+#[derive(Debug, Clone, Copy)]
+struct Completed {
+    /// Which frame this was, so the slow ones can be named.
+    ///
+    /// The agent logs its own pre-wire span against `window_id`/`frame_id`. Naming the outliers
+    /// here is what turns "the agent's span is small on average and ours is large" — a comparison
+    /// between two distributions from two runs — into "for *this* frame, the agent's span was
+    /// small and ours was 36 ms", which is the same claim without the inference.
+    window_id: u32,
+    frame_id: u64,
+    presented_us: u64,
+    capture_to_encode_us: u64,
+    encode_to_arrival_us: u64,
+    arrival_to_decode_us: u64,
+    decode_to_present_us: u64,
+    total_us: u64,
+    bytes: u64,
+    keyframe: bool,
+    encode_gap_us: Option<u64>,
+    arrival_gap_us: Option<u64>,
+}
+
 /// One reporting interval's summary, kept so a run's own variation is visible.
 ///
 /// A single set of percentiles over a whole run invites treating it as *the* number for that
@@ -202,6 +304,13 @@ pub struct LatencyMonitor {
     /// is. A benchmark whose frame rate wanders makes every other number wander with it.
     arrival_gaps: Samples,
     last_arrival_us: HashMap<u32, u64>,
+    last_encoded_us: HashMap<u32, u64>,
+    /// The most recent finished frames, in the order they finished. What makes the tail
+    /// localisable in time rather than only measurable in aggregate; see [`Completed`].
+    timeline: VecDeque<Completed>,
+    /// Frames pushed out of `timeline` by newer ones. Non-zero means the earliest bucket is only
+    /// partly represented, which the report has to say rather than quietly under-count it.
+    timeline_evicted: u64,
     /// How many times this client stopped reading the wire because a decode queue was full, and
     /// for how long in total. While it is stopped, frames sit unread in the socket and their
     /// measured encode-to-arrival grows — so a transport-shaped tail with a large figure here is
@@ -214,27 +323,21 @@ impl LatencyMonitor {
     /// A monitor that records nothing.
     #[must_use]
     pub fn disabled() -> Self {
-        Self {
-            windows: HashMap::new(),
-            enabled: false,
-            interval_transit: Samples::new(SAMPLE_WINDOW),
-            interval_total: Samples::new(SAMPLE_WINDOW),
-            interval_frames: 0,
-            interval_started_us: 0,
-            history: Vec::new(),
-            arrival_gaps: Samples::new(SAMPLE_WINDOW),
-            last_arrival_us: HashMap::new(),
-            read_stalls: 0,
-            read_stalled_us: 0,
-        }
+        Self::with_recording(false)
     }
 
     /// A monitor that records.
     #[must_use]
     pub fn enabled() -> Self {
+        Self::with_recording(true)
+    }
+
+    /// The two constructors differ in one flag, so they share one body: a field added to a
+    /// monitor that records and forgotten on the one that does not is a bug that compiles.
+    fn with_recording(enabled: bool) -> Self {
         Self {
             windows: HashMap::new(),
-            enabled: true,
+            enabled,
             interval_transit: Samples::new(SAMPLE_WINDOW),
             interval_total: Samples::new(SAMPLE_WINDOW),
             interval_frames: 0,
@@ -242,6 +345,9 @@ impl LatencyMonitor {
             history: Vec::new(),
             arrival_gaps: Samples::new(SAMPLE_WINDOW),
             last_arrival_us: HashMap::new(),
+            last_encoded_us: HashMap::new(),
+            timeline: VecDeque::new(),
+            timeline_evicted: 0,
             read_stalls: 0,
             read_stalled_us: 0,
         }
@@ -267,13 +373,20 @@ impl LatencyMonitor {
         if !self.enabled {
             return;
         }
-        if let Some(previous) = self
+        let arrival_gap_us = self
             .last_arrival_us
             .insert(frame.window_id, frame.arrived_us)
-        {
-            self.arrival_gaps
-                .push(frame.arrived_us.saturating_sub(previous));
+            .map(|previous| frame.arrived_us.saturating_sub(previous));
+        if let Some(gap) = arrival_gap_us {
+            self.arrival_gaps.push(gap);
         }
+        // The same gap on the agent's clock. Both readings are the agent's, so this is exact and
+        // carries no offset error — and unlike the arrival gap it cannot contain this frame's own
+        // lateness, which is what makes it able to distinguish an idle stream from a stalled one.
+        let encode_gap_us = self
+            .last_encoded_us
+            .insert(frame.window_id, frame.encoded_us)
+            .map(|previous| frame.encoded_us.saturating_sub(previous));
         let window = self
             .windows
             .entry(frame.window_id)
@@ -292,6 +405,9 @@ impl LatencyMonitor {
                 arrived_us: frame.arrived_us,
                 decoded_us: None,
                 keyframe: frame.keyframe,
+                bytes: frame.bytes as u64,
+                encode_gap_us,
+                arrival_gap_us,
                 backlog,
             },
         );
@@ -363,6 +479,26 @@ impl LatencyMonitor {
         self.interval_transit.push(stages.encode_to_arrival_us);
         self.interval_total.push(stages.total_us);
         self.interval_frames += 1;
+
+        // Kept in finishing order, so the report can ask *when* rather than only *how much*.
+        if self.timeline.len() == SAMPLE_WINDOW {
+            self.timeline.pop_front();
+            self.timeline_evicted += 1;
+        }
+        self.timeline.push_back(Completed {
+            window_id,
+            frame_id,
+            presented_us,
+            capture_to_encode_us: stages.capture_to_encode_us,
+            encode_to_arrival_us: stages.encode_to_arrival_us,
+            arrival_to_decode_us: stages.arrival_to_decode_us,
+            decode_to_present_us: stages.decode_to_present_us,
+            total_us: stages.total_us,
+            bytes: partial.bytes,
+            keyframe: partial.keyframe,
+            encode_gap_us: partial.encode_gap_us,
+            arrival_gap_us: partial.arrival_gap_us,
+        });
         Some(stages)
     }
 
@@ -379,8 +515,13 @@ impl LatencyMonitor {
     }
 
     /// Stop tracking a window.
+    ///
+    /// The gap state goes too: a window id the guest reuses would otherwise measure its first gap
+    /// against a frame from the window that previously held that id.
     pub fn forget(&mut self, window_id: u32) {
         self.windows.remove(&window_id);
+        self.last_arrival_us.remove(&window_id);
+        self.last_encoded_us.remove(&window_id);
     }
 
     /// Whether any window has completed frames to report on.
@@ -500,6 +641,8 @@ impl LatencyMonitor {
             ));
         }
 
+        out.push_str(&self.localise_tail());
+
         // The anti-mistake line. One run's percentiles look like a measurement of a
         // configuration; they are one sample of a noisy process, and this is its noise.
         if self.history.len() >= 2 {
@@ -546,6 +689,194 @@ impl LatencyMonitor {
                 "    ^ this is the noise floor: a difference between two configurations \
                  smaller than\n      the variation within one of them is not a finding.\n",
             );
+        }
+        out
+    }
+
+    /// Where the `encode->arrival` tail sits *in time*, and what the rest of the pipeline was
+    /// doing while it was there.
+    ///
+    /// The whole section exists to separate two findings a percentile cannot:
+    ///
+    /// - **A moment.** The outliers pile into one or two buckets. Something *happened* — a guest
+    ///   scheduler event, a compositor stall, a host hiccup — and the next step is to find out
+    ///   what, at that time, in something other than this process.
+    /// - **A distribution.** They spread across buckets at the threshold's own rate. The stage is
+    ///   simply heavy-tailed, nothing happened, and the next step is splitting the stage finer.
+    ///
+    /// Every other stage is printed for the same bucket because the two shapes above have a third
+    /// sibling: the whole pipeline stalling together, which looks like a transport spike if you
+    /// only print the transport row.
+    fn localise_tail(&self) -> String {
+        let mut out = String::new();
+        if self.timeline.len() < MIN_LOCALISE_FRAMES {
+            out.push_str(&format!(
+                "  localising the encode->arrival tail needs {MIN_LOCALISE_FRAMES} finished \
+                 frames; {} so far\n",
+                self.timeline.len()
+            ));
+            return out;
+        }
+        let Some(threshold) = samples_of(self.timeline.iter().map(|c| c.encode_to_arrival_us))
+            .percentile(OUTLIER_PERCENTILE)
+        else {
+            return out;
+        };
+
+        // Bucketed on absolute client-clock time rather than on position in the timeline, so a
+        // bucket keeps its label between reports and two reports can be compared row by row.
+        let earliest = self
+            .timeline
+            .iter()
+            .map(|c| c.presented_us)
+            .min()
+            .unwrap_or(0);
+        let latest = self
+            .timeline
+            .iter()
+            .map(|c| c.presented_us)
+            .max()
+            .unwrap_or(0);
+        let bucket_us = tail_bucket_us(latest.saturating_sub(earliest));
+        let mut buckets: BTreeMap<u64, Vec<&Completed>> = BTreeMap::new();
+        for record in &self.timeline {
+            buckets
+                .entry(record.presented_us / bucket_us)
+                .or_default()
+                .push(record);
+        }
+        // One definition of "outlier", counted once per bucket and reused by the table and the
+        // summary below, so the two can never disagree about which frames they are talking about.
+        let is_outlier = |record: &Completed| record.encode_to_arrival_us > threshold;
+        let counted: Vec<(u64, &Vec<&Completed>, usize)> = buckets
+            .iter()
+            .map(|(bucket, records)| {
+                (
+                    *bucket,
+                    records,
+                    records.iter().filter(|c| is_outlier(c)).count(),
+                )
+            })
+            .collect();
+
+        out.push_str(&format!(
+            "  localising the encode->arrival tail: {} frames in {} buckets of {} s\n",
+            self.timeline.len(),
+            buckets.len(),
+            bucket_us / 1_000_000,
+        ));
+        out.push_str(&format!(
+            "    an outlier is over {threshold} us, this timeline's p{OUTLIER_PERCENTILE}, so \
+             about 1 frame in {} is one by\n    construction. Piled into one or two buckets means \
+             something happened at a moment; spread\n    at that rate means one distribution's \
+             tail, and the next move is splitting the stage finer.\n",
+            100 / u32::from(100 - OUTLIER_PERCENTILE),
+        ));
+        if self.timeline_evicted > 0 {
+            out.push_str(&format!(
+                "    {} earlier frames have aged out of this timeline, so the first bucket below \
+                 is partial\n",
+                self.timeline_evicted
+            ));
+        }
+
+        out.push_str(&format!(
+            "    {:>5}  {:>6}  {:>4}  {:>9}  {:>9}  {:>9}  {:>9}  {:>9}  {:>9}\n",
+            "t/s",
+            "frames",
+            "out",
+            "e->a p50",
+            "e->a max",
+            "c->e p50",
+            "a->d p50",
+            "d->p p50",
+            "total p50",
+        ));
+        for (bucket, records, outliers) in &counted {
+            let stage = |pick: fn(&Completed) -> u64, p: u8| {
+                show(samples_of(records.iter().map(|c| pick(c))).percentile(p))
+            };
+            out.push_str(&format!(
+                "    {:>5}  {:>6}  {:>4}  {:>9}  {:>9}  {:>9}  {:>9}  {:>9}  {:>9}\n",
+                bucket * bucket_us / 1_000_000,
+                records.len(),
+                outliers,
+                stage(|c| c.encode_to_arrival_us, 50),
+                stage(|c| c.encode_to_arrival_us, 100),
+                stage(|c| c.capture_to_encode_us, 50),
+                stage(|c| c.arrival_to_decode_us, 50),
+                stage(|c| c.decode_to_present_us, 50),
+                stage(|c| c.total_us, 50),
+            ));
+        }
+
+        let (outliers, rest): (Vec<&Completed>, Vec<&Completed>) =
+            self.timeline.iter().partition(|c| is_outlier(c));
+        out.push_str(&format!(
+            "    {} outliers, in {} of {} buckets; the heaviest holds {}\n",
+            outliers.len(),
+            counted.iter().filter(|(_, _, count)| *count > 0).count(),
+            counted.len(),
+            counted
+                .iter()
+                .map(|(_, _, count)| *count)
+                .max()
+                .unwrap_or(0),
+        ));
+
+        // What the slow frames *were*. Large frames being the slow ones is transmission time;
+        // size flat across the split is a stall that did not care what was in the frame.
+        out.push_str(&format!(
+            "    {:>4}  {:>5}  {:>12}  {:>9}  {:>14}  {:>15}\n",
+            "", "n", "median bytes", "keyframes", "encode gap p50", "arrival gap p50",
+        ));
+        for (label, group) in [("out", &outliers), ("rest", &rest)] {
+            if group.is_empty() {
+                continue;
+            }
+            out.push_str(&format!(
+                "    {:>4}  {:>5}  {:>12}  {:>9}  {:>14}  {:>15}\n",
+                label,
+                group.len(),
+                show(samples_of(group.iter().map(|c| c.bytes)).percentile(50)),
+                group.iter().filter(|c| c.keyframe).count(),
+                show(samples_of(group.iter().filter_map(|c| c.encode_gap_us)).percentile(50)),
+                show(samples_of(group.iter().filter_map(|c| c.arrival_gap_us)).percentile(50)),
+            ));
+        }
+        out.push_str(
+            "    The encode gap is between two of the agent's own clock readings, so it is exact \
+             and cannot\n    contain this frame's lateness: a large one means the agent had \
+             nothing new to send, which is\n    an idle stream and not a stalled one. The arrival \
+             gap does contain it, so the difference\n    between the two columns is the lateness \
+             itself.\n",
+        );
+
+        // The slow frames, by name and worst first. The agent logs its own pre-wire span against
+        // these same ids, so this is the join: comparing the two spans for one frame is a stronger
+        // claim than comparing their distributions across two runs.
+        if !outliers.is_empty() {
+            let mut worst: Vec<&Completed> = outliers.clone();
+            worst.sort_unstable_by_key(|c| std::cmp::Reverse(c.encode_to_arrival_us));
+            let named: Vec<String> = worst
+                .iter()
+                .take(MAX_NAMED_OUTLIERS)
+                .map(|c| {
+                    format!(
+                        "w{}/f{} {}",
+                        c.window_id, c.frame_id, c.encode_to_arrival_us
+                    )
+                })
+                .collect();
+            out.push_str(&format!(
+                "    slowest frames, for joining against the agent's own pre-wire span: {}{}\n",
+                named.join(", "),
+                if worst.len() > MAX_NAMED_OUTLIERS {
+                    format!(", and {} more", worst.len() - MAX_NAMED_OUTLIERS)
+                } else {
+                    String::new()
+                },
+            ));
         }
         out
     }
@@ -619,6 +950,28 @@ fn percentiles(samples: &Samples) -> String {
 
 fn show(value: Option<u64>) -> String {
     value.map_or_else(|| "-".to_string(), |v| v.to_string())
+}
+
+/// Collects values into a [`Samples`] sized exactly to them.
+///
+/// Every percentile in this report goes through `Samples` rather than a second implementation, so
+/// that "p50" means one thing everywhere in it — the timeline's ad-hoc slices included.
+fn samples_of(values: impl IntoIterator<Item = u64>) -> Samples {
+    let values: Vec<u64> = values.into_iter().collect();
+    let mut samples = Samples::new(values.len());
+    for value in values {
+        samples.push(value);
+    }
+    samples
+}
+
+/// The finest bucket width that keeps the timeline table within [`MAX_TAIL_ROWS`] rows.
+fn tail_bucket_us(span_us: u64) -> u64 {
+    let fits = |width: u64| usize::try_from(span_us / width).unwrap_or(usize::MAX) < MAX_TAIL_ROWS;
+    TAIL_BUCKETS_US
+        .into_iter()
+        .find(|width| fits(*width))
+        .unwrap_or_else(|| TAIL_BUCKETS_US[TAIL_BUCKETS_US.len() - 1])
 }
 
 /// Moves an agent timestamp onto the client's clock.
@@ -1002,6 +1355,299 @@ mod tests {
             !wider_report.contains("p95     =max"),
             "at n=20 a real p95 exists: {wider_report}"
         );
+    }
+
+    /// Feeds one window a run of frames, one per `period_us`, with `transit_us` giving each
+    /// frame's encode-to-arrival and `bytes` its encoded size. Returns the report.
+    ///
+    /// The agent's clock is taken as equal to the client's, so encode-to-arrival is exactly what
+    /// `transit_us` says and the test is not also testing the offset arithmetic. Capture-to-encode
+    /// is a flat 6 ms and arrival-to-decode 3 ms, so a bucket row's other columns have known
+    /// values to be checked against.
+    fn run_with(period_us: u64, transit_us: &[u64], bytes: &[usize]) -> String {
+        assert_eq!(transit_us.len(), bytes.len(), "one size per frame");
+        let mut monitor = LatencyMonitor::enabled();
+        for (index, transit) in transit_us.iter().enumerate() {
+            let frame_id = index as u64;
+            let encoded_us = frame_id * period_us;
+            let arrived_us = encoded_us + transit;
+            monitor.on_arrival(ArrivedFrame {
+                window_id: 1,
+                frame_id,
+                captured_us: encoded_us.saturating_sub(6_000),
+                encoded_us,
+                arrived_us,
+                keyframe: index % 30 == 0,
+                bytes: bytes[index],
+            });
+            monitor.on_decoded(1, frame_id, arrived_us + 3_000);
+            monitor.on_presented(1, frame_id, arrived_us + 4_000, 0);
+        }
+        monitor.report(
+            transit_us.len() as u64 * period_us + 1_000_000,
+            Some(100),
+            Some(0),
+        )
+    }
+
+    /// The share of frames the p95 threshold makes outliers by construction: six of a hundred and
+    /// twenty. Tests that want a *detectable* cluster must not exceed it — thirty slow frames out
+    /// of a hundred and twenty pushes the p95 above them and finds nothing.
+    const SLOW_FRAMES: usize = 6;
+    const RUN_FRAMES: usize = 120;
+
+    /// The question the whole timeline exists to answer, posed twice with the *same* percentiles.
+    ///
+    /// Both runs below have identical stage distributions — same frames, same transit values, only
+    /// the order differs — so every percentile in the rest of the report is identical between them.
+    /// If the section cannot separate them, it is not doing anything.
+    #[test]
+    fn the_tail_is_localised_to_a_moment_or_spread_across_the_run() {
+        // A frame every 100 ms, so a one-second bucket holds ten and the run spans twelve.
+        let period = 100_000;
+        let fast = 900;
+        let slow = 40_000;
+        let sizes = vec![5_000; RUN_FRAMES];
+
+        // Clustered: every slow frame inside the same second.
+        let mut clustered = vec![fast; RUN_FRAMES];
+        for frame in clustered.iter_mut().skip(30).take(SLOW_FRAMES) {
+            *frame = slow;
+        }
+        let report = run_with(period, &clustered, &sizes);
+        assert!(
+            report.contains("localising the encode->arrival tail"),
+            "{report}"
+        );
+        assert!(
+            report.contains("6 outliers, in 1 of 12 buckets; the heaviest holds 6"),
+            "all six slow frames fell in one second and the report must say so: {report}"
+        );
+
+        // Spread: the same six slow frames, one every other second.
+        let mut spread = vec![fast; RUN_FRAMES];
+        for frame in spread.iter_mut().step_by(20).take(SLOW_FRAMES) {
+            *frame = slow;
+        }
+        let spread_report = run_with(period, &spread, &sizes);
+        assert!(
+            spread_report.contains("6 outliers, in 6 of 12 buckets; the heaviest holds 1"),
+            "the same six frames spread one per bucket: {spread_report}"
+        );
+
+        // Named worst first, so the agent's own span can be looked up for those exact frames
+        // rather than compared distribution-to-distribution across two runs.
+        assert!(
+            report.contains("w1/f30 40000"),
+            "the slow frames have to be named to be joinable: {report}"
+        );
+
+        // The discrimination is the point: the aggregate percentiles cannot tell these apart.
+        let line = |report: &str| {
+            report
+                .lines()
+                .find(|line| line.trim_start().starts_with("encode->arrival "))
+                .unwrap_or_default()
+                .to_string()
+        };
+        assert_eq!(
+            line(&report),
+            line(&spread_report),
+            "identical distributions, so only the timeline can separate them"
+        );
+    }
+
+    /// A bucket showing every stage, not just the one being chased. A transport spike with a
+    /// normal pipeline around it is a different finding from the whole pipeline stalling, and the
+    /// row has to carry enough to tell.
+    #[test]
+    fn a_bucket_reports_every_other_stage_too() {
+        let report = run_with(100_000, &[900; RUN_FRAMES], &[5_000; RUN_FRAMES]);
+
+        let header = report
+            .lines()
+            .find(|line| line.contains("t/s"))
+            .expect("the timeline table has a header");
+        for column in [
+            "frames", "out", "e->a p50", "e->a max", "c->e p50", "a->d p50", "d->p p50",
+        ] {
+            assert!(header.contains(column), "{column} missing from {header}");
+        }
+        // capture->encode is 6 ms and arrival->decode 3 ms for every frame in `run_with`, so the
+        // per-bucket figures for the other stages have to show up as those.
+        let row = report
+            .lines()
+            .find(|line| line.trim_start().starts_with('0'))
+            .expect("a bucket row for the first second");
+        assert!(
+            row.contains("6000") && row.contains("3000"),
+            "the other stages' medians belong in the row: {row}"
+        );
+    }
+
+    /// Whether the slow frames were the big ones. Large frames being slow is transmission time;
+    /// size flat across the split is a stall that did not care what the frame contained.
+    #[test]
+    fn outliers_are_correlated_with_frame_size() {
+        // Six frames are both large and slow; every other frame is small and fast.
+        let mut transit = vec![900u64; RUN_FRAMES];
+        let mut sizes = vec![5_000usize; RUN_FRAMES];
+        for index in (0..RUN_FRAMES).step_by(20).take(SLOW_FRAMES) {
+            transit[index] = 40_000;
+            sizes[index] = 80_000;
+        }
+        let report = run_with(100_000, &transit, &sizes);
+
+        let row = |label: &str| {
+            report
+                .lines()
+                .find(|line| line.trim_start().starts_with(label))
+                .unwrap_or_default()
+                .to_string()
+        };
+        assert!(
+            row("out").contains("80000"),
+            "the slow frames were the 80 KB ones: {}",
+            row("out")
+        );
+        assert!(
+            row("rest").contains("5000"),
+            "and the rest were the small ones: {}",
+            row("rest")
+        );
+    }
+
+    /// The idle-versus-stalled distinction, which is why both gaps are recorded.
+    ///
+    /// Here the stream goes quiet — the agent encodes nothing for two seconds — and then sends a
+    /// frame whose transit is entirely ordinary. The encode gap must show the silence while the
+    /// frame is *not* counted as an outlier, because waiting for content to change cannot inflate
+    /// a duration that starts at encode.
+    #[test]
+    fn an_idle_stream_is_distinguishable_from_a_stalled_one() {
+        let mut monitor = LatencyMonitor::enabled();
+        let mut encoded_us = 0u64;
+        for frame_id in 0..60u64 {
+            // A two-second silence in the middle, and no frame here is ever slow.
+            encoded_us += if frame_id == 30 { 2_000_000 } else { 100_000 };
+            let arrived_us = encoded_us + 900;
+            monitor.on_arrival(ArrivedFrame {
+                window_id: 1,
+                frame_id,
+                captured_us: encoded_us.saturating_sub(6_000),
+                encoded_us,
+                arrived_us,
+                keyframe: false,
+                bytes: 5_000,
+            });
+            monitor.on_decoded(1, frame_id, arrived_us + 3_000);
+            monitor.on_presented(1, frame_id, arrived_us + 4_000, 0);
+        }
+
+        let report = monitor.report(encoded_us + 1_000_000, Some(100), Some(0));
+
+        // The silence is visible as a gap, and it is the largest one.
+        let gaps: Vec<Option<u64>> = monitor
+            .timeline
+            .iter()
+            .map(|record| record.encode_gap_us)
+            .collect();
+        assert_eq!(gaps[0], None, "the first frame of a window has no gap");
+        assert_eq!(gaps[30], Some(2_000_000), "the idle stretch");
+        // And it did not make anything an outlier: nothing was actually slow.
+        assert!(
+            report.contains("0 outliers"),
+            "an idle stream is not a stalled one: {report}"
+        );
+        assert!(
+            report.contains("encode gap"),
+            "the gap has to be printed for the reader to see the idleness: {report}"
+        );
+    }
+
+    /// The bucket width follows the run's length, because a stage whose median is a millisecond
+    /// cannot have a 35 ms spike localised inside a ten-second bucket — and a four-hundred-row
+    /// table localises nothing either.
+    #[test]
+    fn the_bucket_width_keeps_the_table_readable_at_any_run_length() {
+        assert_eq!(
+            tail_bucket_us(10_000_000),
+            1_000_000,
+            "10 s run, 1 s buckets"
+        );
+        assert_eq!(
+            tail_bucket_us(20_000_000),
+            2_000_000,
+            "20 s run, 2 s buckets"
+        );
+        assert_eq!(tail_bucket_us(300_000_000), 30_000_000, "5 min run");
+        // Every width exhausted: the coarsest is used rather than printing thousands of rows.
+        assert_eq!(tail_bucket_us(u64::MAX), 300_000_000);
+
+        for span_us in [0, 1, 999_999, 1_000_000, 47_000_000, 3_600_000_000] {
+            let width = tail_bucket_us(span_us);
+            assert!(
+                usize::try_from(span_us / width).unwrap() < MAX_TAIL_ROWS,
+                "span {span_us} at width {width} overflows the table"
+            );
+        }
+    }
+
+    /// A threshold that is a percentile of too few samples means "the largest one or two", and
+    /// bucketing that would invite reading noise as a moment.
+    #[test]
+    fn the_tail_is_not_localised_from_too_few_frames() {
+        let mut monitor = LatencyMonitor::enabled();
+        for frame_id in 0..10u64 {
+            monitor.on_arrival(arrived(1, frame_id, 0, 0, 1_000));
+            monitor.on_decoded(1, frame_id, 1_000);
+            monitor.on_presented(1, frame_id, 2_000, 0);
+        }
+
+        let report = monitor.report(10_000_000, Some(100), Some(0));
+
+        assert!(
+            report.contains("needs 40 finished frames; 10 so far"),
+            "{report}"
+        );
+        assert!(
+            !report.contains("t/s"),
+            "no table from ten frames: {report}"
+        );
+    }
+
+    /// The timeline is bounded, and says so rather than quietly under-counting its first bucket.
+    #[test]
+    fn the_timeline_is_bounded_and_admits_what_it_dropped() {
+        let mut monitor = LatencyMonitor::enabled();
+        for frame_id in 0..(SAMPLE_WINDOW as u64 + 25) {
+            monitor.on_arrival(arrived(1, frame_id, 0, 0, 1_000));
+            monitor.on_decoded(1, frame_id, 1_000);
+            monitor.on_presented(1, frame_id, 2_000 + frame_id, 0);
+        }
+
+        assert_eq!(monitor.timeline.len(), SAMPLE_WINDOW);
+        assert_eq!(monitor.timeline_evicted, 25);
+        let report = monitor.report(10_000_000, Some(100), Some(0));
+        assert!(
+            report.contains("25 earlier frames have aged out"),
+            "{report}"
+        );
+    }
+
+    /// A window id the guest reuses must not measure its first gap against the previous tenant's
+    /// last frame — which would report a gap of however long the id sat unused.
+    #[test]
+    fn forgetting_a_window_forgets_its_gap_state() {
+        let mut monitor = LatencyMonitor::enabled();
+        monitor.on_arrival(arrived(1, 1, 0, 5_000, 6_000));
+        monitor.forget(1);
+        monitor.on_arrival(arrived(1, 2, 0, 900_000, 901_000));
+
+        let window = monitor.windows.get(&1).expect("the id is in use again");
+        let partial = window.in_flight.get(&2).expect("the new frame is tracked");
+        assert_eq!(partial.encode_gap_us, None, "not 895000");
+        assert_eq!(partial.arrival_gap_us, None, "not 895000");
     }
 
     #[test]
