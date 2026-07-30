@@ -40,14 +40,16 @@ use windows::Win32::Foundation::{E_POINTER, HMODULE, HWND};
 use windows::Win32::Graphics::Direct3D::{D3D_DRIVER_TYPE_HARDWARE, D3D_DRIVER_TYPE_WARP};
 use windows::Win32::Graphics::Direct3D11::{
     D3D11CreateDevice, ID3D11Device, ID3D11DeviceContext, ID3D11Texture2D, D3D11_CPU_ACCESS_READ,
-    D3D11_CREATE_DEVICE_BGRA_SUPPORT, D3D11_MAPPED_SUBRESOURCE, D3D11_MAP_READ, D3D11_SDK_VERSION,
-    D3D11_TEXTURE2D_DESC, D3D11_USAGE_STAGING,
+    D3D11_CREATE_DEVICE_BGRA_SUPPORT, D3D11_CREATE_DEVICE_VIDEO_SUPPORT, D3D11_MAPPED_SUBRESOURCE,
+    D3D11_MAP_READ, D3D11_SDK_VERSION, D3D11_TEXTURE2D_DESC, D3D11_USAGE_STAGING,
 };
 use windows::Win32::Graphics::Dxgi::IDXGIDevice;
 use windows::Win32::System::WinRT::Direct3D11::{
     CreateDirect3D11DeviceFromDXGIDevice, IDirect3DDxgiInterfaceAccess,
 };
 use windows::Win32::System::WinRT::Graphics::Capture::IGraphicsCaptureItemInterop;
+
+use crate::serve::CaptureIntent;
 
 /// Number of buffers in the capture frame pool. Two is the low-latency choice: enough to
 /// avoid stalling the compositor, few enough that a frame cannot sit queued for long.
@@ -62,7 +64,38 @@ pub struct Frame {
     pub height: u32,
     /// Tightly packed BGRA8 pixels, top-down.
     pub bgra: Vec<u8>,
+    /// Original D3D11 texture when H.264 can consume the frame on the GPU.
+    pub gpu_frame: Option<GpuFrame>,
 }
+
+/// A WGC frame's D3D11 texture plus the device/context that created it.
+#[derive(Clone)]
+pub struct GpuFrame {
+    pub width: u32,
+    pub height: u32,
+    pub device: ID3D11Device,
+    pub context: ID3D11DeviceContext,
+    pub texture: ID3D11Texture2D,
+}
+
+impl std::fmt::Debug for GpuFrame {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("GpuFrame")
+            .field("width", &self.width)
+            .field("height", &self.height)
+            .finish_non_exhaustive()
+    }
+}
+
+impl PartialEq for GpuFrame {
+    fn eq(&self, other: &Self) -> bool {
+        self.width == other.width
+            && self.height == other.height
+            && self.texture.as_raw() == other.texture.as_raw()
+    }
+}
+
+impl Eq for GpuFrame {}
 
 /// Whether this guest supports Windows.Graphics.Capture at all (Windows 10 1903+).
 pub fn is_supported() -> bool {
@@ -151,7 +184,7 @@ impl WindowCapture {
     }
 
     /// Try to take the next frame. Returns `Ok(None)` when no new frame is queued.
-    pub fn try_next_frame(&mut self) -> WinResult<Option<Frame>> {
+    pub fn try_next_frame(&mut self, intent: CaptureIntent) -> WinResult<Option<Frame>> {
         // An empty pool is not an error, but windows-rs still reports it as one: the WinRT call
         // succeeds with `S_OK` and hands back a *null* frame, and the generated binding turns any
         // null return into `Err` — carrying the original, successful `S_OK` (some builds use
@@ -194,6 +227,29 @@ impl WindowCapture {
         let mut desc = D3D11_TEXTURE2D_DESC::default();
         // SAFETY: `texture` is valid and `desc` is a valid out-pointer.
         unsafe { texture.GetDesc(&mut desc) };
+
+        if intent == CaptureIntent::GpuNv12Preferred {
+            if self.frames_seen < DIAGNOSTIC_FRAME_LIMIT {
+                self.frames_seen += 1;
+                eprintln!(
+                    "oxagent: capture: window={:#x} frame={} pool_acquire_us={pool_acquire_us} \
+                     copy_resource_us=0 map_us=0 readback_copy_us=0 total_capture_us={pool_acquire_us}",
+                    self.handle, self.frames_seen
+                );
+            }
+            return Ok(Some(Frame {
+                width: desc.Width,
+                height: desc.Height,
+                bgra: Vec::new(),
+                gpu_frame: Some(GpuFrame {
+                    width: desc.Width,
+                    height: desc.Height,
+                    device: self.device.clone(),
+                    context: self.context.clone(),
+                    texture,
+                }),
+            }));
+        }
 
         let staging = self.staging_texture(&desc)?;
         let copy_start = std::time::Instant::now();
@@ -250,6 +306,7 @@ impl WindowCapture {
             width: desc.Width,
             height: desc.Height,
             bgra,
+            gpu_frame: None,
         }))
     }
 
@@ -284,30 +341,37 @@ impl WindowCapture {
 fn create_d3d_device() -> WinResult<(ID3D11Device, ID3D11DeviceContext)> {
     let mut last = None;
     for driver in [D3D_DRIVER_TYPE_HARDWARE, D3D_DRIVER_TYPE_WARP] {
-        let mut device: Option<ID3D11Device> = None;
-        let mut context: Option<ID3D11DeviceContext> = None;
-        // SAFETY: out-parameters are valid; no adapter/software module is supplied.
-        let result = unsafe {
-            D3D11CreateDevice(
-                None,
-                driver,
-                HMODULE::default(),
-                // BGRA support is required for interop with WinRT/Direct2D surfaces.
-                D3D11_CREATE_DEVICE_BGRA_SUPPORT,
-                None,
-                D3D11_SDK_VERSION,
-                Some(&mut device),
-                None,
-                Some(&mut context),
-            )
-        };
-        match result {
-            Ok(()) => {
-                if let (Some(device), Some(context)) = (device, context) {
-                    return Ok((device, context));
+        for flags in [
+            D3D11_CREATE_DEVICE_BGRA_SUPPORT | D3D11_CREATE_DEVICE_VIDEO_SUPPORT,
+            D3D11_CREATE_DEVICE_BGRA_SUPPORT,
+        ] {
+            let mut device: Option<ID3D11Device> = None;
+            let mut context: Option<ID3D11DeviceContext> = None;
+            // SAFETY: out-parameters are valid; no adapter/software module is supplied.
+            let result = unsafe {
+                D3D11CreateDevice(
+                    None,
+                    driver,
+                    HMODULE::default(),
+                    // BGRA support is required for WGC; VIDEO_SUPPORT enables the D3D11 video
+                    // processor used by the GPU NV12 path, with BGRA-only fallback for guests
+                    // whose device creation rejects that flag.
+                    flags,
+                    None,
+                    D3D11_SDK_VERSION,
+                    Some(&mut device),
+                    None,
+                    Some(&mut context),
+                )
+            };
+            match result {
+                Ok(()) => {
+                    if let (Some(device), Some(context)) = (device, context) {
+                        return Ok((device, context));
+                    }
                 }
+                Err(e) => last = Some(e),
             }
-            Err(e) => last = Some(e),
         }
     }
     Err(last.unwrap_or_else(windows::core::Error::from_win32))

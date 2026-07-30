@@ -61,6 +61,13 @@ pub trait FrameEncoder {
     /// GPU/hardware resources it holds) does not outlive the window.
     fn forget(&mut self, handle: isize);
 
+    /// Whether the next capture for `handle` at this resolution should include CPU BGRA
+    /// instead of a GPU-only texture. Windows uses this after D3D11 input setup is refused but
+    /// the same encoder can still run through the existing CPU NV12 path.
+    fn wants_cpu_frame(&self, _handle: isize, _width: u16, _height: u16) -> bool {
+        false
+    }
+
     /// Whether `handle` has given up on this codec permanently at its current resolution — not
     /// "nothing ready this tick" (`poll` returning `None` already covers that), but "this window
     /// will not produce output from this encoder no matter what is submitted to it next". A

@@ -24,7 +24,7 @@ use windows::Win32::UI::HiDpi::{
 
 use crate::config::AgentConfig;
 use crate::handshake::RAW_BGRA_ONLY;
-use crate::serve::{run_session, SessionParams};
+use crate::serve::{run_session, CaptureIntent, SessionParams};
 use capture::WindowCapture;
 use encode::{probe_h264_support, EncoderKind, WinFrameEncoder};
 use enumerate::enumerate_windows;
@@ -386,7 +386,11 @@ impl crate::serve::WindowSource for WinWindowSource {
             .collect()
     }
 
-    fn next_frame(&mut self, handle: isize) -> Option<crate::serve::SourceFrame> {
+    fn next_frame(
+        &mut self,
+        handle: isize,
+        intent: CaptureIntent,
+    ) -> Option<crate::serve::SourceFrame> {
         let capture = match self.captures.entry(handle) {
             std::collections::hash_map::Entry::Occupied(e) => e.into_mut(),
             std::collections::hash_map::Entry::Vacant(e) => {
@@ -401,11 +405,12 @@ impl crate::serve::WindowSource for WinWindowSource {
             }
         };
 
-        match capture.try_next_frame() {
+        match capture.try_next_frame(intent) {
             Ok(Some(frame)) => Some(crate::serve::SourceFrame {
                 width: frame.width.min(u32::from(u16::MAX)) as u16,
                 height: frame.height.min(u32::from(u16::MAX)) as u16,
                 data: frame.bgra,
+                gpu_frame: frame.gpu_frame,
             }),
             Ok(None) => None,
             Err(err) => {

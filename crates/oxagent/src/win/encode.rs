@@ -124,22 +124,38 @@ use std::collections::HashMap;
 use std::ffi::c_void;
 
 use windows::core::{Interface, Result as WinResult, GUID, VARIANT};
-use windows::Win32::Foundation::E_FAIL;
+use windows::Win32::Foundation::{BOOL, E_FAIL};
+use windows::Win32::Graphics::Direct3D11::{
+    ID3D11Device, ID3D11Texture2D, ID3D11VideoContext, ID3D11VideoContext1, ID3D11VideoDevice,
+    ID3D11VideoProcessor, ID3D11VideoProcessorEnumerator, ID3D11VideoProcessorEnumerator1,
+    D3D11_BIND_RENDER_TARGET, D3D11_TEX2D_VPIV, D3D11_TEX2D_VPOV, D3D11_TEXTURE2D_DESC,
+    D3D11_USAGE_DEFAULT, D3D11_VIDEO_FRAME_FORMAT_PROGRESSIVE, D3D11_VIDEO_PROCESSOR_CONTENT_DESC,
+    D3D11_VIDEO_PROCESSOR_FORMAT_SUPPORT_INPUT, D3D11_VIDEO_PROCESSOR_FORMAT_SUPPORT_OUTPUT,
+    D3D11_VIDEO_PROCESSOR_INPUT_VIEW_DESC, D3D11_VIDEO_PROCESSOR_INPUT_VIEW_DESC_0,
+    D3D11_VIDEO_PROCESSOR_OUTPUT_VIEW_DESC, D3D11_VIDEO_PROCESSOR_OUTPUT_VIEW_DESC_0,
+    D3D11_VIDEO_PROCESSOR_STREAM, D3D11_VIDEO_USAGE_PLAYBACK_NORMAL,
+    D3D11_VPIV_DIMENSION_TEXTURE2D, D3D11_VPOV_DIMENSION_TEXTURE2D,
+};
+use windows::Win32::Graphics::Dxgi::Common::{
+    DXGI_COLOR_SPACE_RGB_FULL_G22_NONE_P709, DXGI_COLOR_SPACE_YCBCR_FULL_G22_LEFT_P601,
+    DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_FORMAT_NV12, DXGI_RATIONAL,
+};
 use windows::Win32::Media::MediaFoundation::{
     eAVEncCommonRateControlMode_LowDelayVBR, eAVEncH264VProfile_ConstrainedBase,
     CODECAPI_AVEncCommonMeanBitRate, CODECAPI_AVEncCommonRateControlMode,
     CODECAPI_AVEncMPVDefaultBPictureCount, CODECAPI_AVEncMPVGOPSize, CODECAPI_AVEncMPVProfile,
     CODECAPI_AVEncVideoForceKeyFrame, CODECAPI_AVEncVideoMaxNumRefFrame,
     CODECAPI_AVEncVideoTemporalLayerCount, CODECAPI_AVLowLatencyMode, ICodecAPI, IMFActivate,
-    IMFMediaBuffer, IMFSample, IMFTransform, MFCreateMediaType, MFCreateMemoryBuffer,
-    MFCreateSample, MFMediaType_Video, MFStartup, MFTEnumEx, MFVideoFormat_H264,
-    MFVideoFormat_NV12, MFVideoInterlace_Progressive, MFSTARTUP_FULL, MFT_CATEGORY_VIDEO_ENCODER,
+    IMFDXGIDeviceManager, IMFMediaBuffer, IMFSample, IMFTransform, MFCreateDXGIDeviceManager,
+    MFCreateDXGISurfaceBuffer, MFCreateMediaType, MFCreateMemoryBuffer, MFCreateSample,
+    MFMediaType_Video, MFStartup, MFTEnumEx, MFVideoFormat_H264, MFVideoFormat_NV12,
+    MFVideoInterlace_Progressive, MFSTARTUP_FULL, MFT_CATEGORY_VIDEO_ENCODER,
     MFT_ENUM_FLAG_HARDWARE, MFT_ENUM_FLAG_SORTANDFILTER, MFT_ENUM_FLAG_SYNCMFT,
-    MFT_MESSAGE_NOTIFY_BEGIN_STREAMING, MFT_MESSAGE_NOTIFY_START_OF_STREAM, MFT_OUTPUT_DATA_BUFFER,
-    MFT_OUTPUT_STREAM_PROVIDES_SAMPLES, MFT_REGISTER_TYPE_INFO, MF_E_TRANSFORM_NEED_MORE_INPUT,
-    MF_MT_AVG_BITRATE, MF_MT_FRAME_RATE, MF_MT_FRAME_SIZE, MF_MT_INTERLACE_MODE, MF_MT_MAJOR_TYPE,
-    MF_MT_MAX_KEYFRAME_SPACING, MF_MT_MPEG2_PROFILE, MF_MT_SUBTYPE, MF_TRANSFORM_ASYNC,
-    MF_TRANSFORM_ASYNC_UNLOCK, MF_VERSION,
+    MFT_MESSAGE_NOTIFY_BEGIN_STREAMING, MFT_MESSAGE_NOTIFY_START_OF_STREAM,
+    MFT_MESSAGE_SET_D3D_MANAGER, MFT_OUTPUT_DATA_BUFFER, MFT_OUTPUT_STREAM_PROVIDES_SAMPLES,
+    MFT_REGISTER_TYPE_INFO, MF_E_TRANSFORM_NEED_MORE_INPUT, MF_MT_AVG_BITRATE, MF_MT_FRAME_RATE,
+    MF_MT_FRAME_SIZE, MF_MT_INTERLACE_MODE, MF_MT_MAJOR_TYPE, MF_MT_MAX_KEYFRAME_SPACING,
+    MF_MT_MPEG2_PROFILE, MF_MT_SUBTYPE, MF_TRANSFORM_ASYNC, MF_TRANSFORM_ASYNC_UNLOCK, MF_VERSION,
 };
 use windows::Win32::System::Com::CoTaskMemFree;
 
@@ -147,6 +163,7 @@ use crate::encode::{EncodedFrame, FrameEncoder};
 use crate::h264;
 use crate::nv12::bgra_to_nv12;
 use crate::serve::SourceFrame;
+use crate::win::capture::GpuFrame;
 
 /// Target bitrate. Fixed for v1 rather than driven by `QualityHint` (`OXPROTO.md` §12, not yet
 /// wired to the encoder) — high enough to keep screen text and UI edges legible, an order of
@@ -333,6 +350,56 @@ fn get_u32_property(api: &ICodecAPI, property: &GUID) -> Option<u32> {
     u32::try_from(&value).ok()
 }
 
+fn create_unlocked_transform(kind: EncoderKind) -> WinResult<IMFTransform> {
+    let transform = create_transform(kind)?;
+    // Hardware MFTs are commonly asynchronous; unlock synchronous driving rather than
+    // implement the `IMFMediaEventGenerator` event loop — see the module doc.
+    let attrs = unsafe { transform.GetAttributes()? };
+    let is_async = unsafe { attrs.GetUINT32(&MF_TRANSFORM_ASYNC) }.unwrap_or(0) != 0;
+    if is_async {
+        unsafe {
+            let _ = attrs.SetUINT32(&MF_TRANSFORM_ASYNC_UNLOCK, 1);
+        }
+    }
+    Ok(transform)
+}
+
+fn set_media_types(
+    transform: &IMFTransform,
+    width: u32,
+    height: u32,
+    target_fps: u16,
+) -> WinResult<()> {
+    // Output type first: encoder MFTs commonly need it set before they will accept an input
+    // type at all, since the input type negotiation can depend on the chosen output.
+    let output_type = unsafe { MFCreateMediaType()? };
+    unsafe {
+        output_type.SetGUID(&MF_MT_MAJOR_TYPE, &MFMediaType_Video)?;
+        output_type.SetGUID(&MF_MT_SUBTYPE, &MFVideoFormat_H264)?;
+        output_type.SetUINT64(&MF_MT_FRAME_SIZE, pack_u64(width, height))?;
+        output_type.SetUINT64(&MF_MT_FRAME_RATE, pack_u64(u32::from(target_fps.max(1)), 1))?;
+        output_type.SetUINT32(&MF_MT_INTERLACE_MODE, MFVideoInterlace_Progressive.0 as u32)?;
+        output_type.SetUINT32(&MF_MT_AVG_BITRATE, TARGET_BITRATE_BPS)?;
+        output_type.SetUINT32(
+            &MF_MT_MPEG2_PROFILE,
+            eAVEncH264VProfile_ConstrainedBase.0 as u32,
+        )?;
+        output_type.SetUINT32(&MF_MT_MAX_KEYFRAME_SPACING, MAX_KEYFRAME_SPACING_FRAMES)?;
+        transform.SetOutputType(0, &output_type, 0)?;
+    }
+
+    // Input type: discovered from what the transform itself advertises as acceptable for
+    // NV12, then customized with this window's actual size/rate, rather than constructed
+    // from scratch.
+    let input_type = find_nv12_input_type(transform)?;
+    unsafe {
+        input_type.SetUINT64(&MF_MT_FRAME_SIZE, pack_u64(width, height))?;
+        input_type.SetUINT64(&MF_MT_FRAME_RATE, pack_u64(u32::from(target_fps.max(1)), 1))?;
+        transform.SetInputType(0, &input_type, 0)?;
+    }
+    Ok(())
+}
+
 /// One `submit`ted frame's bookkeeping, kept until the matching `poll` drains it — see
 /// `WindowEncoder::pending`'s doc for why a queue rather than a single slot.
 struct PendingSubmission {
@@ -345,6 +412,234 @@ struct PendingSubmission {
     process_input_us: u64,
 }
 
+enum InputPath {
+    Cpu,
+    Gpu {
+        converter: GpuNv12Converter,
+        _device_manager: IMFDXGIDeviceManager,
+    },
+}
+
+/// D3D11 video-processor state for BGRA texture -> NV12 texture conversion.
+///
+/// Colour convention: WGC's BGRA texture is treated as full-range RGB with the DXGI
+/// `RGB_FULL_G22_NONE_P709` transfer/primaries convention. The NV12 output is explicitly
+/// `YCBCR_FULL_G22_LEFT_P601` because `crate::nv12::bgra_to_nv12` uses full-range BT.601
+/// coefficients. This matches the CPU path in range and matrix approximately; the video
+/// processor may filter chroma while the CPU reference point-samples the top-left pixel of each
+/// 2x2 block, so exact byte-for-byte equality is not expected.
+struct GpuNv12Converter {
+    video_context: ID3D11VideoContext,
+    video_context1: ID3D11VideoContext1,
+    video_device: ID3D11VideoDevice,
+    enumerator: ID3D11VideoProcessorEnumerator,
+    processor: ID3D11VideoProcessor,
+    width: u32,
+    height: u32,
+}
+
+impl GpuNv12Converter {
+    fn new(gpu_frame: &GpuFrame, width: u32, height: u32, target_fps: u16) -> WinResult<Self> {
+        let video_device: ID3D11VideoDevice = gpu_frame.device.cast()?;
+        let video_context: ID3D11VideoContext = gpu_frame.context.cast()?;
+        let video_context1: ID3D11VideoContext1 = gpu_frame.context.cast()?;
+        let fps = u32::from(target_fps.max(1));
+        let desc = D3D11_VIDEO_PROCESSOR_CONTENT_DESC {
+            InputFrameFormat: D3D11_VIDEO_FRAME_FORMAT_PROGRESSIVE,
+            InputFrameRate: DXGI_RATIONAL {
+                Numerator: fps,
+                Denominator: 1,
+            },
+            InputWidth: gpu_frame.width,
+            InputHeight: gpu_frame.height,
+            OutputFrameRate: DXGI_RATIONAL {
+                Numerator: fps,
+                Denominator: 1,
+            },
+            OutputWidth: width,
+            OutputHeight: height,
+            Usage: D3D11_VIDEO_USAGE_PLAYBACK_NORMAL,
+        };
+        let enumerator = unsafe { video_device.CreateVideoProcessorEnumerator(&desc)? };
+        let input_support =
+            unsafe { enumerator.CheckVideoProcessorFormat(DXGI_FORMAT_B8G8R8A8_UNORM)? };
+        if input_support & D3D11_VIDEO_PROCESSOR_FORMAT_SUPPORT_INPUT.0 as u32 == 0 {
+            return Err(windows::core::Error::from(E_FAIL));
+        }
+        let output_support = unsafe { enumerator.CheckVideoProcessorFormat(DXGI_FORMAT_NV12)? };
+        if output_support & D3D11_VIDEO_PROCESSOR_FORMAT_SUPPORT_OUTPUT.0 as u32 == 0 {
+            return Err(windows::core::Error::from(E_FAIL));
+        }
+        if let Ok(enumerator1) = enumerator.cast::<ID3D11VideoProcessorEnumerator1>() {
+            let conversion_supported = unsafe {
+                enumerator1.CheckVideoProcessorFormatConversion(
+                    DXGI_FORMAT_B8G8R8A8_UNORM,
+                    DXGI_COLOR_SPACE_RGB_FULL_G22_NONE_P709,
+                    DXGI_FORMAT_NV12,
+                    DXGI_COLOR_SPACE_YCBCR_FULL_G22_LEFT_P601,
+                )?
+            };
+            if !conversion_supported.as_bool() {
+                return Err(windows::core::Error::from(E_FAIL));
+            }
+        }
+        let processor = unsafe { video_device.CreateVideoProcessor(&enumerator, 0)? };
+        Ok(Self {
+            video_context,
+            video_context1,
+            video_device,
+            enumerator,
+            processor,
+            width,
+            height,
+        })
+    }
+
+    fn build_sample(&mut self, gpu_frame: &GpuFrame) -> WinResult<IMFSample> {
+        if gpu_frame.width > self.width || gpu_frame.height > self.height {
+            return Err(windows::core::Error::from(E_FAIL));
+        }
+
+        let input_desc = D3D11_VIDEO_PROCESSOR_INPUT_VIEW_DESC {
+            FourCC: 0,
+            ViewDimension: D3D11_VPIV_DIMENSION_TEXTURE2D,
+            Anonymous: D3D11_VIDEO_PROCESSOR_INPUT_VIEW_DESC_0 {
+                Texture2D: D3D11_TEX2D_VPIV {
+                    MipSlice: 0,
+                    ArraySlice: 0,
+                },
+            },
+        };
+        let mut input_view = None;
+        unsafe {
+            self.video_device.CreateVideoProcessorInputView(
+                &gpu_frame.texture,
+                &self.enumerator,
+                &input_desc,
+                Some(&mut input_view),
+            )?;
+        }
+        let input_view = input_view.ok_or_else(|| windows::core::Error::from(E_FAIL))?;
+
+        let output_texture =
+            create_nv12_output_texture(&gpu_frame.device, self.width, self.height)?;
+        let output_desc = D3D11_VIDEO_PROCESSOR_OUTPUT_VIEW_DESC {
+            ViewDimension: D3D11_VPOV_DIMENSION_TEXTURE2D,
+            Anonymous: D3D11_VIDEO_PROCESSOR_OUTPUT_VIEW_DESC_0 {
+                Texture2D: D3D11_TEX2D_VPOV { MipSlice: 0 },
+            },
+        };
+        let mut output_view = None;
+        unsafe {
+            self.video_device.CreateVideoProcessorOutputView(
+                &output_texture,
+                &self.enumerator,
+                &output_desc,
+                Some(&mut output_view),
+            )?;
+        }
+        let output_view = output_view.ok_or_else(|| windows::core::Error::from(E_FAIL))?;
+
+        let mut stream = D3D11_VIDEO_PROCESSOR_STREAM {
+            Enable: BOOL(1),
+            OutputIndex: 0,
+            InputFrameOrField: 0,
+            PastFrames: 0,
+            FutureFrames: 0,
+            ppPastSurfaces: std::ptr::null_mut(),
+            pInputSurface: std::mem::ManuallyDrop::new(Some(input_view)),
+            ppFutureSurfaces: std::ptr::null_mut(),
+            ppPastSurfacesRight: std::ptr::null_mut(),
+            pInputSurfaceRight: std::mem::ManuallyDrop::new(None),
+            ppFutureSurfacesRight: std::ptr::null_mut(),
+        };
+
+        unsafe {
+            // Match the CPU converter: full-range BT.601 YCbCr output from full-range BGRA.
+            self.video_context1.VideoProcessorSetStreamColorSpace1(
+                &self.processor,
+                0,
+                DXGI_COLOR_SPACE_RGB_FULL_G22_NONE_P709,
+            );
+            self.video_context1.VideoProcessorSetOutputColorSpace1(
+                &self.processor,
+                DXGI_COLOR_SPACE_YCBCR_FULL_G22_LEFT_P601,
+            );
+        }
+        let blt_result = unsafe {
+            self.video_context.VideoProcessorBlt(
+                &self.processor,
+                &output_view,
+                0,
+                std::slice::from_ref(&stream),
+            )
+        };
+        unsafe {
+            drop(std::mem::ManuallyDrop::take(&mut stream.pInputSurface));
+            drop(std::mem::ManuallyDrop::take(&mut stream.pInputSurfaceRight));
+        }
+        blt_result?;
+
+        let buffer = unsafe {
+            MFCreateDXGISurfaceBuffer(&ID3D11Texture2D::IID, &output_texture, 0, BOOL(0))?
+        };
+        let sample = unsafe { MFCreateSample()? };
+        unsafe { sample.AddBuffer(&buffer)? };
+        Ok(sample)
+    }
+}
+
+fn create_nv12_output_texture(
+    device: &ID3D11Device,
+    width: u32,
+    height: u32,
+) -> WinResult<ID3D11Texture2D> {
+    let desc = D3D11_TEXTURE2D_DESC {
+        Width: width,
+        Height: height,
+        MipLevels: 1,
+        ArraySize: 1,
+        Format: DXGI_FORMAT_NV12,
+        SampleDesc: windows::Win32::Graphics::Dxgi::Common::DXGI_SAMPLE_DESC {
+            Count: 1,
+            Quality: 0,
+        },
+        Usage: D3D11_USAGE_DEFAULT,
+        BindFlags: D3D11_BIND_RENDER_TARGET.0 as u32,
+        CPUAccessFlags: 0,
+        MiscFlags: 0,
+    };
+    let mut texture = None;
+    unsafe { device.CreateTexture2D(&desc, None, Some(&mut texture))? };
+    texture.ok_or_else(|| windows::core::Error::from(E_FAIL))
+}
+
+fn setup_gpu_input(
+    transform: &IMFTransform,
+    frame: &GpuFrame,
+    width: u32,
+    height: u32,
+    target_fps: u16,
+) -> WinResult<InputPath> {
+    let mut reset_token = 0;
+    let mut device_manager = None;
+    unsafe { MFCreateDXGIDeviceManager(&mut reset_token, &mut device_manager)? };
+    let device_manager = device_manager.ok_or_else(|| windows::core::Error::from(E_FAIL))?;
+
+    unsafe {
+        device_manager.ResetDevice(&frame.device, reset_token)?;
+        transform.ProcessMessage(
+            MFT_MESSAGE_SET_D3D_MANAGER,
+            device_manager.as_raw() as usize,
+        )?;
+    }
+
+    Ok(InputPath::Gpu {
+        converter: GpuNv12Converter::new(frame, width, height, target_fps)?,
+        _device_manager: device_manager,
+    })
+}
+
 /// One window's live Media Foundation H.264 encoder stream.
 struct WindowEncoder {
     /// Native handle, kept only for `DIAGNOSTIC_FRAME_LIMIT` logging — nothing in this struct's
@@ -355,6 +650,7 @@ struct WindowEncoder {
     frames_seen: u32,
     transform: IMFTransform,
     codec_api: Option<ICodecAPI>,
+    input_path: InputPath,
     /// Coded picture size this transform was configured for (after [`pad_even`]). A later
     /// resolution change rebuilds the whole `WindowEncoder` rather than reconfiguring this one
     /// live, so this never changes for the lifetime of a given instance.
@@ -402,77 +698,40 @@ impl WindowEncoder {
         width: u16,
         height: u16,
         target_fps: u16,
+        gpu_frame: Option<&GpuFrame>,
     ) -> WinResult<Self> {
         let width = u32::from(pad_even(width)).max(2);
         let height = u32::from(pad_even(height)).max(2);
-        let transform = create_transform(kind)?;
-
-        // Hardware MFTs are commonly asynchronous; unlock synchronous driving rather than
-        // implement the `IMFMediaEventGenerator` event loop — see the module doc.
-        // SAFETY: `transform` is a live `IMFTransform` this function just obtained.
-        let attrs = unsafe { transform.GetAttributes()? };
-        // SAFETY: `attrs` is a live `IMFAttributes` this function just obtained.
-        let is_async = unsafe { attrs.GetUINT32(&MF_TRANSFORM_ASYNC) }.unwrap_or(0) != 0;
-        if is_async {
-            // SAFETY: `attrs` is a live `IMFAttributes`; failure here is non-fatal — later calls
-            // will simply fail loudly if the unlock did not take, rather than silently.
-            unsafe {
-                let _ = attrs.SetUINT32(&MF_TRANSFORM_ASYNC_UNLOCK, 1);
-            }
-        }
-
-        // Output type first: encoder MFTs commonly need it set before they will accept an input
-        // type at all, since the input type negotiation can depend on the chosen output.
-        // SAFETY: no preconditions beyond Media Foundation being started (`probe_h264_support`
-        // already called `MFStartup` before any `WindowEncoder` can exist).
-        let output_type = unsafe { MFCreateMediaType()? };
-        // SAFETY: `output_type` was just created by this function and is fully owned here.
-        unsafe {
-            output_type.SetGUID(&MF_MT_MAJOR_TYPE, &MFMediaType_Video)?;
-            output_type.SetGUID(&MF_MT_SUBTYPE, &MFVideoFormat_H264)?;
-            output_type.SetUINT64(&MF_MT_FRAME_SIZE, pack_u64(width, height))?;
-            output_type.SetUINT64(&MF_MT_FRAME_RATE, pack_u64(u32::from(target_fps.max(1)), 1))?;
-            output_type.SetUINT32(&MF_MT_INTERLACE_MODE, MFVideoInterlace_Progressive.0 as u32)?;
-            output_type.SetUINT32(&MF_MT_AVG_BITRATE, TARGET_BITRATE_BPS)?;
-            // Constrained Baseline, on the *media type* rather than only through `ICodecAPI`
-            // (`CODECAPI_AVEncMPVProfile`, still set best-effort below). A guest run proved two
-            // other `ICodecAPI` properties on this exact encoder are accepted by `SetValue` and
-            // then ignored — including the no-B-frames one, which is how the client ended up
-            // decoding actual B-pictures under a stream this crate believed was violating
-            // nothing. A media-type attribute is not the same kind of promise: `SetOutputType`
-            // negotiates it, so the transform either accepts Constrained Baseline here (this `?`
-            // succeeds) or this function fails loudly instead of silently building an encoder
-            // that emits Main or High anyway. `MF_MT_MPEG2_PROFILE` is Media Foundation's actual
-            // attribute for signalling H.264 profile on the output type — the "MPEG2" in the name
-            // is legacy, not a mistake; there is no separate H.264-named attribute for this.
-            output_type.SetUINT32(
-                &MF_MT_MPEG2_PROFILE,
-                eAVEncH264VProfile_ConstrainedBase.0 as u32,
-            )?;
-            // See `MAX_KEYFRAME_SPACING_FRAMES`: the same media-type-level attempt at the same
-            // problem `CODECAPI_AVEncMPVGOPSize` already failed to solve. Bundled into the same
-            // `SetOutputType` call, and the same hard `?`, as the profile constraint above —
-            // `WinFrameEncoder`'s per-window `RAW_BGRA` fallback exists precisely so a transform
-            // that rejects this attribute degrades one window gracefully rather than taking the
-            // whole session down.
-            output_type.SetUINT32(&MF_MT_MAX_KEYFRAME_SPACING, MAX_KEYFRAME_SPACING_FRAMES)?;
-        }
-        // SAFETY: `transform` is a live `IMFTransform`; `output_type` was just fully configured
-        // above.
-        unsafe { transform.SetOutputType(0, &output_type, 0)? };
-
-        // Input type: discovered from what the transform itself advertises as acceptable for
-        // NV12, then customized with this window's actual size/rate, rather than constructed
-        // from scratch — an encoder MFT's input type can carry required attributes this file
-        // has no way to know about in advance.
-        let input_type = find_nv12_input_type(&transform)?;
-        // SAFETY: `input_type` came from the transform's own `GetInputAvailableType`.
-        unsafe {
-            input_type.SetUINT64(&MF_MT_FRAME_SIZE, pack_u64(width, height))?;
-            input_type.SetUINT64(&MF_MT_FRAME_RATE, pack_u64(u32::from(target_fps.max(1)), 1))?;
-        }
-        // SAFETY: `transform` is a live `IMFTransform`; `input_type` was just configured above.
-        unsafe { transform.SetInputType(0, &input_type, 0)? };
+        let transform = create_unlocked_transform(kind)?;
+        let gpu_input = match gpu_frame {
+            Some(frame) => match setup_gpu_input(&transform, frame, width, height, target_fps) {
+                Ok(gpu_input) => match set_media_types(&transform, width, height, target_fps) {
+                    Ok(()) => Some(gpu_input),
+                    Err(err) => {
+                        eprintln!(
+                            "oxagent: h264: window={handle:#x} D3D11 NV12 input type refused: {err}; \
+                             using CPU BGRA->NV12 fallback for this window size"
+                        );
+                        None
+                    }
+                },
+                Err(err) => {
+                    eprintln!(
+                        "oxagent: h264: window={handle:#x} D3D11 input setup refused: {err}; \
+                         using CPU BGRA->NV12 fallback for this window size"
+                    );
+                    None
+                }
+            },
+            None => None,
+        };
+        let transform = if gpu_input.is_some() {
+            transform
+        } else {
+            let transform = create_unlocked_transform(kind)?;
+            set_media_types(&transform, width, height, target_fps)?;
+            transform
+        };
 
         // `ICodecAPI` is optional: not every encoder MFT implements it, and the properties set
         // through it are best-effort even when it does — see the module doc's caveat about
@@ -555,6 +814,7 @@ impl WindowEncoder {
             frames_seen: 0,
             transform,
             codec_api,
+            input_path: gpu_input.unwrap_or(InputPath::Cpu),
             width,
             height,
             provides_output_samples,
@@ -575,7 +835,14 @@ impl WindowEncoder {
             && u32::from(pad_even(frame.height)) == self.height
     }
 
+    fn uses_cpu_input(&self) -> bool {
+        matches!(self.input_path, InputPath::Cpu)
+    }
+
     fn submit(&mut self, frame: &SourceFrame, force_keyframe: bool) {
+        if self.uses_cpu_input() && frame.data.is_empty() {
+            return;
+        }
         if force_keyframe {
             if let Some(api) = &self.codec_api {
                 // SAFETY: `api` is a live `ICodecAPI` on `self.transform`.
@@ -614,6 +881,21 @@ impl WindowEncoder {
     /// `IMFMediaBuffer` lock/copy below (Media-Foundation plumbing overhead, a different cost
     /// than colour conversion) — see `PendingSubmission::convert_us`.
     fn build_input_sample(&mut self, frame: &SourceFrame) -> WinResult<(IMFSample, u64)> {
+        if let InputPath::Gpu { converter, .. } = &mut self.input_path {
+            let Some(gpu_frame) = frame.gpu_frame.as_ref() else {
+                return Err(windows::core::Error::from(E_FAIL));
+            };
+            let convert_start = std::time::Instant::now();
+            let sample = converter.build_sample(gpu_frame)?;
+            let convert_us = convert_start.elapsed().as_micros() as u64;
+            unsafe {
+                sample.SetSampleTime(self.next_sample_time_hns)?;
+                sample.SetSampleDuration(self.frame_duration_hns)?;
+            }
+            self.next_sample_time_hns += self.frame_duration_hns;
+            return Ok((sample, convert_us));
+        }
+
         // The captured frame may be smaller than `self.width`/`self.height` by exactly the
         // padding `pad_even` added; `bgra_to_nv12` needs an even-sized buffer, so pad here by
         // reusing the last valid row/column — edge-replication, not resampling.
@@ -937,10 +1219,15 @@ impl FrameEncoder for WinFrameEncoder {
                 frame.width,
                 frame.height,
                 self.target_fps,
+                frame.gpu_frame.as_ref(),
             ) {
                 Ok(enc) => {
+                    let uses_cpu_input = enc.uses_cpu_input();
                     self.encoders.insert(handle, enc);
                     self.failed.remove(&handle);
+                    if uses_cpu_input && frame.data.is_empty() {
+                        return;
+                    }
                 }
                 Err(err) => {
                     eprintln!(
@@ -969,6 +1256,14 @@ impl FrameEncoder for WinFrameEncoder {
     fn forget(&mut self, handle: isize) {
         self.encoders.remove(&handle);
         self.failed.remove(&handle);
+    }
+
+    fn wants_cpu_frame(&self, handle: isize, width: u16, height: u16) -> bool {
+        self.encoders.get(&handle).is_some_and(|enc| {
+            enc.uses_cpu_input()
+                && enc.width == u32::from(pad_even(width))
+                && enc.height == u32::from(pad_even(height))
+        })
     }
 
     fn failed(&self, handle: isize) -> bool {

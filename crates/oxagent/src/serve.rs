@@ -82,8 +82,35 @@ pub struct SourceFrame {
     pub width: u16,
     /// Frame height in pixels.
     pub height: u16,
-    /// Pixel bytes in the session's codec (`RAW_BGRA` today).
+    /// Tightly-packed BGRA bytes when the capture path needed CPU pixels. Empty on Windows
+    /// H.264 frames that stayed on the GPU.
     pub data: Vec<u8>,
+    /// Original WGC D3D11 texture, present only when Windows H.264 capture requested a GPU
+    /// frame. Kept Windows-only so the portable driver tests do not depend on Windows COM
+    /// types.
+    #[cfg(windows)]
+    pub gpu_frame: Option<crate::win::capture::GpuFrame>,
+}
+
+impl SourceFrame {
+    pub fn bgra(width: u16, height: u16, data: Vec<u8>) -> Self {
+        Self {
+            width,
+            height,
+            data,
+            #[cfg(windows)]
+            gpu_frame: None,
+        }
+    }
+}
+
+/// Which representation the driver wants from the platform for this poll.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CaptureIntent {
+    /// The caller needs CPU BGRA bytes, either for `RAW_BGRA` or for CPU-side H.264 fallback.
+    CpuBgra,
+    /// The caller can consume the captured D3D11 texture directly; CPU BGRA is avoided.
+    GpuNv12Preferred,
 }
 
 /// What the session driver needs from the platform.
@@ -95,7 +122,7 @@ pub trait WindowSource {
     fn live_windows(&mut self) -> Vec<SourceWindow>;
 
     /// The next frame for a window, or `None` when nothing new has been captured.
-    fn next_frame(&mut self, handle: isize) -> Option<SourceFrame>;
+    fn next_frame(&mut self, handle: isize, intent: CaptureIntent) -> Option<SourceFrame>;
 }
 
 /// Tunables for one session.
@@ -823,7 +850,16 @@ where
             // rather than queueing this one behind it.
         }
         let tick_to_capture_us = tick_started.elapsed().as_micros() as u64;
-        let Some(frame) = source.next_frame(stream.handle) else {
+        let (_, _, window_width, window_height) = stream.geometry;
+        let intent = if codec == oxproto::codec::H264
+            && !encoder.failed(stream.handle)
+            && !encoder.wants_cpu_frame(stream.handle, window_width, window_height)
+        {
+            CaptureIntent::GpuNv12Preferred
+        } else {
+            CaptureIntent::CpuBgra
+        };
+        let Some(frame) = source.next_frame(stream.handle, intent) else {
             continue;
         };
         let captured_us = elapsed_us(started);
@@ -870,7 +906,7 @@ where
                     encoded.data,
                     elapsed_us(started),
                 )
-            } else {
+            } else if !frame.data.is_empty() {
                 // `RAW_BGRA`, either because the session negotiated it outright or because this
                 // one window's encoder just reported `failed` (see this function's doc) —
                 // either way this window's own pixels, sent uncoded. Every frame is trivially a
@@ -884,6 +920,12 @@ where
                     frame.data,
                     captured_us,
                 )
+            } else {
+                // This can happen only on the Windows GPU-preferred H.264 path when setup was
+                // refused after capture. The encoder records CPU fallback for this window, and
+                // the next tick asks capture for BGRA instead; never send an empty RAW_BGRA
+                // payload as the fallback frame.
+                continue;
             };
 
         let frame_id = stream.budget.on_captured();
@@ -1054,16 +1096,12 @@ mod tests {
             self.windows.clone()
         }
 
-        fn next_frame(&mut self, _handle: isize) -> Option<SourceFrame> {
+        fn next_frame(&mut self, _handle: isize, _intent: CaptureIntent) -> Option<SourceFrame> {
             if self.frames_left == 0 {
                 return None;
             }
             self.frames_left -= 1;
-            Some(SourceFrame {
-                width: 4,
-                height: 1,
-                data: vec![0xAB; 16],
-            })
+            Some(SourceFrame::bgra(4, 1, vec![0xAB; 16]))
         }
     }
 
@@ -1097,7 +1135,7 @@ mod tests {
             vec![self.0.lock().unwrap().clone()]
         }
 
-        fn next_frame(&mut self, _handle: isize) -> Option<SourceFrame> {
+        fn next_frame(&mut self, _handle: isize, _intent: CaptureIntent) -> Option<SourceFrame> {
             None
         }
     }
@@ -1202,16 +1240,12 @@ mod tests {
             vec![self.0.lock().unwrap().clone()]
         }
 
-        fn next_frame(&mut self, _handle: isize) -> Option<SourceFrame> {
+        fn next_frame(&mut self, _handle: isize, _intent: CaptureIntent) -> Option<SourceFrame> {
             let w = self.0.lock().unwrap();
             if w.minimized {
                 return None;
             }
-            Some(SourceFrame {
-                width: w.width,
-                height: w.height,
-                data: vec![0xAB; 4],
-            })
+            Some(SourceFrame::bgra(w.width, w.height, vec![0xAB; 4]))
         }
     }
 
@@ -1652,7 +1686,11 @@ mod tests {
             fn live_windows(&mut self) -> Vec<SourceWindow> {
                 panic!("the source must not be polled for an unauthenticated peer")
             }
-            fn next_frame(&mut self, _handle: isize) -> Option<SourceFrame> {
+            fn next_frame(
+                &mut self,
+                _handle: isize,
+                _intent: CaptureIntent,
+            ) -> Option<SourceFrame> {
                 panic!("the source must not be polled for an unauthenticated peer")
             }
         }
@@ -1707,7 +1745,11 @@ mod tests {
                     Vec::new()
                 }
             }
-            fn next_frame(&mut self, _handle: isize) -> Option<SourceFrame> {
+            fn next_frame(
+                &mut self,
+                _handle: isize,
+                _intent: CaptureIntent,
+            ) -> Option<SourceFrame> {
                 None
             }
         }
@@ -2294,16 +2336,16 @@ mod tests {
             fn live_windows(&mut self) -> Vec<SourceWindow> {
                 vec![self.0.lock().unwrap().clone()]
             }
-            fn next_frame(&mut self, _handle: isize) -> Option<SourceFrame> {
+            fn next_frame(
+                &mut self,
+                _handle: isize,
+                _intent: CaptureIntent,
+            ) -> Option<SourceFrame> {
                 assert!(
                     !self.0.lock().unwrap().minimized,
                     "next_frame must never be called for a minimized window"
                 );
-                Some(SourceFrame {
-                    width: 1,
-                    height: 1,
-                    data: vec![0xAB],
-                })
+                Some(SourceFrame::bgra(1, 1, vec![0xAB]))
             }
         }
 
