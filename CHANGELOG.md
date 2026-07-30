@@ -63,6 +63,38 @@ where the same setup previously produced twelve to twenty-eight rejections. The 
 log carries the direct proof that B-frames are gone — every delta slice now reports
 `ref_idc=3`, where the rejected frames had been `ref_idc=0` non-reference pictures.
 
+### Sends off the tick loop, and the tail is the VM's port forward (2026-07-30)
+
+`drive()` handled each tick in one task, awaiting socket writes, so a blocked send delayed the
+next capture for every window. Writes now go to their own task over a bounded channel through
+`ChunkWriter`. Measured on the guest, release both sides:
+
+```
+                    before          after
+capture->encode     p95 19,623      p95  5,955     p99 43,690 -> 6,935
+encode->arrival     p50  6,943      p50  1,522
+END TO END          p50 24,856      p50 10,411
+```
+
+The stage that was three quarters unexplained a day ago is now tight, and the end-to-end median
+halved. The property that had to survive did: a frame reserves its send slot **before** it is
+captured and encoded, so no frame is ever encoded and then dropped — which would corrupt every
+frame after it until the next keyframe, with no way for a client to ask for one. `ChunkWriter`'s
+cancel-safety, added when nothing could yet cancel a write mid-chunk, is load-bearing now.
+
+**What did not move is the answer to the rest.** `encode->arrival` p95 stayed at 44 ms with the
+writer on its own thread, and five explanations inside our own code have now been eliminated:
+keyframe size, flow-control backlog, the client's read pauses, Nagle alone, and the agent's send
+path. The evidence was already in the reports: **ping/pong round trips, which are tiny control
+messages with no payload for any of those mechanisms to act on, ranged from 1.0 ms to 21 ms
+across runs, and once implied ~100 ms.**
+
+So the tail belongs to the path — loopback through this VM's port forward — not to the protocol.
+That also explains why every candidate inside the code died: there was nothing there to find.
+Measuring oxrdp's own transport latency needs a path that is not a QEMU port forward, and until
+then `encode->arrival` and the end-to-end total should be read as bounded below by our code and
+above by the environment.
+
 ### The capture-to-encode stage, fully accounted for (2026-07-30)
 
 The agent now times every piece of the largest stage. On the guest, release, one run:
