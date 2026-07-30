@@ -106,7 +106,7 @@ fn model_changes_drive_headless_backend_in_order() {
                     window_id: 1,
                     width: 1,
                     height: 1,
-                    argb: vec![255, 1, 2, 3],
+                    bgra: vec![255, 1, 2, 3],
                 }),
                 ..window(1, 0)
             }),

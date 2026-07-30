@@ -175,7 +175,7 @@ fn every_known_type_round_trips_through_the_registry() {
             window_id: 1,
             width: 1,
             height: 1,
-            argb: vec![0, 0, 0, 0],
+            bgra: vec![0, 0, 0, 0],
         }),
         Message::FrameAck(FrameAck {
             window_id: 1,

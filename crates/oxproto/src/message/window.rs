@@ -289,23 +289,23 @@ pub struct WindowIcon {
     /// Icon pixels, **BGRA8 in memory order** (byte 0 = blue), straight — *not*
     /// premultiplied — alpha, top-down, tightly packed at `width * 4` bytes per row.
     ///
-    /// The field name is historical. Every pixel payload in this protocol is named by memory
-    /// order (`RAW_BGRA`, `CursorShape`'s `BGRA_PREMUL`), and this one is no exception: it is
-    /// what `GetDIBits` hands back on Windows, so the agent copies it without reordering.
-    /// Note the difference from `CursorShape`, whose alpha *is* premultiplied.
-    pub argb: Vec<u8>,
+    /// Named by memory order, like every other pixel payload in this protocol (`RAW_BGRA`,
+    /// `CursorShape`'s `BGRA_PREMUL`): it is what `GetDIBits` hands back on Windows, so the agent
+    /// copies it without reordering. Note the difference from `CursorShape`, whose alpha *is*
+    /// premultiplied.
+    pub bgra: Vec<u8>,
 }
 
 impl Encode for WindowIcon {
     fn size(&self) -> usize {
-        4 + 2 + 2 + 4 + self.argb.len()
+        4 + 2 + 2 + 4 + self.bgra.len()
     }
 
     fn encode(&self, dst: &mut WriteCursor<'_>) -> EncodeResult<()> {
         dst.write_u32_le(self.window_id, "WindowIcon.window_id")?;
         dst.write_u16_le(self.width, "WindowIcon.width")?;
         dst.write_u16_le(self.height, "WindowIcon.height")?;
-        write_blob(dst, &self.argb, "WindowIcon.argb")?;
+        write_blob(dst, &self.bgra, "WindowIcon.bgra")?;
         Ok(())
     }
 }
@@ -316,7 +316,7 @@ impl<'de> Decode<'de> for WindowIcon {
             window_id: src.read_u32_le("WindowIcon.window_id")?,
             width: src.read_u16_le("WindowIcon.width")?,
             height: src.read_u16_le("WindowIcon.height")?,
-            argb: read_blob(src, "WindowIcon.argb")?.to_vec(),
+            bgra: read_blob(src, "WindowIcon.bgra")?.to_vec(),
         })
     }
 }
@@ -496,7 +496,7 @@ mod tests {
             window_id: 42,
             width: 2,
             height: 2,
-            argb: vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16],
+            bgra: vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16],
         };
         assert_eq!(encode_vec(&i).unwrap().len(), i.size());
         assert_eq!(decode::<WindowIcon>(&encode_vec(&i).unwrap()).unwrap(), i);

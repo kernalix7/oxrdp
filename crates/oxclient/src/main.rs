@@ -989,7 +989,7 @@ fn print_event(event: &ClientEvent, frame_counts: &mut HashMap<u32, u64>) {
             i.window_id,
             i.width,
             i.height,
-            i.argb.len()
+            i.bgra.len()
         ),
         ClientEvent::WindowClosed(c) => println!("window closed: id={}", c.window_id),
         ClientEvent::CursorShape(c) => println!(
